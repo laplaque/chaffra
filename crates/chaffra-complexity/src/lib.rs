@@ -56,6 +56,12 @@ pub fn compute_file_metrics(
     match language {
         Language::Go => collect_go_functions(root, source, file, &mut metrics),
         Language::Python => collect_python_functions(root, source, file, &mut metrics),
+        Language::TypeScript | Language::JavaScript => {
+            collect_js_functions(root, source, file, &mut metrics);
+        }
+        Language::Java => {
+            collect_java_functions(root, source, file, &mut metrics);
+        }
     }
 
     Ok(metrics)
@@ -357,6 +363,247 @@ fn compute_cognitive_python(node: Node<'_>, nesting: u32) -> u32 {
     total
 }
 
+// --- JavaScript/TypeScript complexity ---
+
+fn collect_js_functions(
+    root: Node<'_>,
+    source: &[u8],
+    file: &str,
+    metrics: &mut Vec<FunctionMetrics>,
+) {
+    collect_js_functions_recursive(root, source, file, metrics);
+}
+
+fn collect_js_functions_recursive(
+    node: Node<'_>,
+    source: &[u8],
+    file: &str,
+    metrics: &mut Vec<FunctionMetrics>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_owned();
+                    let body = child.child_by_field_name("body");
+                    let cyclomatic = body.map(|b| compute_cyclomatic_js(b)).unwrap_or(1);
+                    let cognitive = body.map(|b| compute_cognitive_js(b, 0)).unwrap_or(0);
+                    let max_nesting = body.map(|b| compute_max_nesting(b, 0)).unwrap_or(0);
+                    let lines = (child.end_position().row - child.start_position().row + 1) as u32;
+                    metrics.push(FunctionMetrics {
+                        name,
+                        file: file.to_owned(),
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        cyclomatic,
+                        cognitive,
+                        lines,
+                        max_nesting,
+                    });
+                }
+            }
+            "export_statement" => {
+                collect_js_functions_recursive(child, source, file, metrics);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn compute_cyclomatic_js(node: Node<'_>) -> u32 {
+    let mut complexity = 1;
+    add_cyclomatic_js(node, &mut complexity);
+    complexity
+}
+
+fn add_cyclomatic_js(node: Node<'_>, complexity: &mut u32) {
+    match node.kind() {
+        "if_statement" | "for_statement" | "for_in_statement" | "while_statement"
+        | "do_statement" | "switch_case" | "catch_clause" => {
+            *complexity += 1;
+        }
+        "binary_expression" | "logical_expression" => {
+            if let Some(op) = node.child_by_field_name("operator") {
+                let op_text = op.kind();
+                if op_text == "&&" || op_text == "||" {
+                    *complexity += 1;
+                }
+            }
+        }
+        "ternary_expression" => {
+            *complexity += 1;
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        add_cyclomatic_js(child, complexity);
+    }
+}
+
+fn compute_cognitive_js(node: Node<'_>, nesting: u32) -> u32 {
+    let mut total = 0;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "if_statement" | "for_statement" | "for_in_statement" | "while_statement"
+            | "do_statement" => {
+                total += 1 + nesting;
+                total += compute_cognitive_js(child, nesting + 1);
+            }
+            "switch_statement" => {
+                total += 1 + nesting;
+                total += compute_cognitive_js(child, nesting + 1);
+            }
+            "catch_clause" => {
+                total += 1 + nesting;
+                total += compute_cognitive_js(child, nesting + 1);
+            }
+            "binary_expression" | "logical_expression" => {
+                if let Some(op) = child.child_by_field_name("operator") {
+                    let op_text = op.kind();
+                    if op_text == "&&" || op_text == "||" {
+                        total += 1;
+                    }
+                }
+                total += compute_cognitive_js(child, nesting);
+            }
+            _ => {
+                total += compute_cognitive_js(child, nesting);
+            }
+        }
+    }
+    total
+}
+
+// --- Java complexity ---
+
+fn collect_java_functions(
+    root: Node<'_>,
+    source: &[u8],
+    file: &str,
+    metrics: &mut Vec<FunctionMetrics>,
+) {
+    collect_java_functions_recursive(root, source, file, metrics);
+}
+
+fn collect_java_functions_recursive(
+    node: Node<'_>,
+    source: &[u8],
+    file: &str,
+    metrics: &mut Vec<FunctionMetrics>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "method_declaration" | "constructor_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_owned();
+                    let body = child.child_by_field_name("body");
+                    let cyclomatic = body.map(|b| compute_cyclomatic_java(b)).unwrap_or(1);
+                    let cognitive = body.map(|b| compute_cognitive_java(b, 0)).unwrap_or(0);
+                    let max_nesting = body.map(|b| compute_max_nesting(b, 0)).unwrap_or(0);
+                    let lines = (child.end_position().row - child.start_position().row + 1) as u32;
+                    metrics.push(FunctionMetrics {
+                        name,
+                        file: file.to_owned(),
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        cyclomatic,
+                        cognitive,
+                        lines,
+                        max_nesting,
+                    });
+                }
+            }
+            "class_declaration" | "interface_declaration" | "enum_declaration" => {
+                // Recurse into class body for methods.
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_java_functions_recursive(body, source, file, metrics);
+                }
+            }
+            _ => {
+                collect_java_functions_recursive(child, source, file, metrics);
+            }
+        }
+    }
+}
+
+fn compute_cyclomatic_java(node: Node<'_>) -> u32 {
+    let mut complexity = 1;
+    add_cyclomatic_java(node, &mut complexity);
+    complexity
+}
+
+fn add_cyclomatic_java(node: Node<'_>, complexity: &mut u32) {
+    match node.kind() {
+        "if_statement"
+        | "for_statement"
+        | "enhanced_for_statement"
+        | "while_statement"
+        | "do_statement"
+        | "switch_expression_arm"
+        | "catch_clause" => {
+            *complexity += 1;
+        }
+        "binary_expression" => {
+            if let Some(op) = node.child_by_field_name("operator") {
+                let op_text = op.kind();
+                if op_text == "&&" || op_text == "||" {
+                    *complexity += 1;
+                }
+            }
+        }
+        "ternary_expression" => {
+            *complexity += 1;
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        add_cyclomatic_java(child, complexity);
+    }
+}
+
+fn compute_cognitive_java(node: Node<'_>, nesting: u32) -> u32 {
+    let mut total = 0;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "if_statement"
+            | "for_statement"
+            | "enhanced_for_statement"
+            | "while_statement"
+            | "do_statement" => {
+                total += 1 + nesting;
+                total += compute_cognitive_java(child, nesting + 1);
+            }
+            "switch_expression" => {
+                total += 1 + nesting;
+                total += compute_cognitive_java(child, nesting + 1);
+            }
+            "catch_clause" => {
+                total += 1 + nesting;
+                total += compute_cognitive_java(child, nesting + 1);
+            }
+            "binary_expression" => {
+                if let Some(op) = child.child_by_field_name("operator") {
+                    let op_text = op.kind();
+                    if op_text == "&&" || op_text == "||" {
+                        total += 1;
+                    }
+                }
+                total += compute_cognitive_java(child, nesting);
+            }
+            _ => {
+                total += compute_cognitive_java(child, nesting);
+            }
+        }
+    }
+    total
+}
+
 // --- Shared helpers ---
 
 fn compute_max_nesting(node: Node<'_>, current: u32) -> u32 {
@@ -381,13 +628,8 @@ fn compute_max_nesting(node: Node<'_>, current: u32) -> u32 {
 }
 
 fn detect_language(path: &str) -> Option<Language> {
-    if path.ends_with(".go") {
-        Some(Language::Go)
-    } else if path.ends_with(".py") {
-        Some(Language::Python)
-    } else {
-        None
-    }
+    let ext = path.rsplit('.').next()?;
+    Language::from_extension(ext)
 }
 
 impl AnalysisModule for ComplexityModule {
@@ -396,7 +638,13 @@ impl AnalysisModule for ComplexityModule {
             id: "complexity".to_owned(),
             name: "Complexity & Health Scoring".to_owned(),
             version: "0.1.0".to_owned(),
-            languages: vec!["go".to_owned(), "python".to_owned()],
+            languages: vec![
+                "go".to_owned(),
+                "python".to_owned(),
+                "typescript".to_owned(),
+                "javascript".to_owned(),
+                "java".to_owned(),
+            ],
             capabilities: vec![
                 "analyze".to_owned(),
                 "explain".to_owned(),
@@ -921,8 +1169,10 @@ mod tests {
     fn test_detect_language_fn() {
         assert_eq!(detect_language("foo.go"), Some(Language::Go));
         assert_eq!(detect_language("bar.py"), Some(Language::Python));
+        assert_eq!(detect_language("app.js"), Some(Language::JavaScript));
+        assert_eq!(detect_language("app.ts"), Some(Language::TypeScript));
+        assert_eq!(detect_language("Main.java"), Some(Language::Java));
         assert_eq!(detect_language("baz.rs"), None);
-        assert_eq!(detect_language("test.js"), None);
     }
 
     #[test]

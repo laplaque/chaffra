@@ -71,7 +71,13 @@ impl AnalysisModule for DeadCodeModule {
             id: "dead-code".to_owned(),
             name: "Dead Code Detection".to_owned(),
             version: "0.1.0".to_owned(),
-            languages: vec!["go".to_owned(), "python".to_owned()],
+            languages: vec![
+                "go".to_owned(),
+                "python".to_owned(),
+                "typescript".to_owned(),
+                "javascript".to_owned(),
+                "java".to_owned(),
+            ],
             capabilities: vec!["analyze".to_owned(), "explain".to_owned(), "fix".to_owned()],
             rules: RULES
                 .iter()
@@ -196,15 +202,30 @@ impl AnalysisModule for DeadCodeModule {
                     }
                     Language::Python => {
                         if imp.names.is_empty() {
-                            // import X / import X as alias -- check alias first, then basename
                             let used_name = imp.alias.as_deref().unwrap_or_else(|| {
                                 imp.path.rsplit('.').next().unwrap_or(&imp.path)
                             });
                             all_refs.contains(used_name)
                         } else {
-                            // from X import Y / from X import Y as Z
-                            // names already contain the locally-used name (alias when present)
                             imp.names.iter().any(|n| all_refs.contains(n))
+                        }
+                    }
+                    Language::TypeScript | Language::JavaScript => {
+                        // Named imports: check each name.
+                        if imp.names.is_empty() {
+                            let base = imp.path.rsplit('/').next().unwrap_or(&imp.path);
+                            all_refs.contains(base)
+                        } else {
+                            imp.names.iter().any(|n| all_refs.contains(n))
+                        }
+                    }
+                    Language::Java => {
+                        // Java imports: last segment of the path is the type name.
+                        let type_name = imp.path.rsplit('.').next().unwrap_or(&imp.path);
+                        if type_name == "*" {
+                            true // Wildcard imports are conservatively considered used.
+                        } else {
+                            all_refs.contains(type_name)
                         }
                     }
                 };
@@ -468,37 +489,50 @@ fn compute_alive_symbols(
 fn is_entry_point(sym: &Symbol, lang: Language, file: &str) -> bool {
     match lang {
         Language::Go => {
-            // main and init functions are always entry points.
             if sym.name == "main" || sym.name == "init" {
                 return true;
             }
-            // Test* and Benchmark* functions are entry points.
             if sym.name.starts_with("Test") || sym.name.starts_with("Benchmark") {
                 return true;
             }
-            // Exported names in non-main packages are alive (public API).
-            // We detect main package by checking if file has "main" in the path
-            // or by checking the first line. For simplicity, exported = alive in Go.
             if sym.exported && sym.kind == SymbolKind::Function {
                 return true;
             }
-            // Exported types are entry points too.
             if sym.exported && sym.kind == SymbolKind::Type {
                 return true;
             }
             false
         }
         Language::Python => {
-            // __init__.py files have all top-level symbols as entry points.
             if file.ends_with("__init__.py") {
                 return true;
             }
-            // test_* functions are entry points.
             if sym.name.starts_with("test_") {
                 return true;
             }
+            if sym.exported {
+                return true;
+            }
+            false
+        }
+        Language::TypeScript | Language::JavaScript => {
+            // Exported symbols are entry points.
+            if sym.exported {
+                return true;
+            }
+            // Test functions (jest/mocha naming conventions).
+            if sym.name.starts_with("test") || sym.name.starts_with("Test") {
+                return true;
+            }
+            false
+        }
+        Language::Java => {
             // Public symbols are entry points.
             if sym.exported {
+                return true;
+            }
+            // main method is an entry point.
+            if sym.name == "main" {
                 return true;
             }
             false
@@ -526,13 +560,8 @@ fn is_directly_referenced(name: &str, graph: &ImportGraph, defining_file: &str) 
 }
 
 fn detect_language(path: &str) -> Option<Language> {
-    if path.ends_with(".go") {
-        Some(Language::Go)
-    } else if path.ends_with(".py") {
-        Some(Language::Python)
-    } else {
-        None
-    }
+    let ext = path.rsplit('.').next()?;
+    Language::from_extension(ext)
 }
 
 #[cfg(test)]
