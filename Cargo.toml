@@ -10,6 +10,7 @@ members = [
     "crates/chaffra-arch",
     "crates/chaffra-hotspot",
     "crates/chaffra-audit",
+    "crates/chaffra-security",
     "crates/chaffra-output",
     "crates/chaffra-mcp",
     "crates/chaffra-plugin",
@@ -38,6 +39,7 @@ gix = { version = "0.72", default-features = false, features = ["max-performance
 tonic = "0.14"
 prost = "0.14"
 glob = "0.3"
+regex = "1"
 
 chaffra-core = { path = "crates/chaffra-core" }
 chaffra-parse = { path = "crates/chaffra-parse" }
@@ -51,3 +53,4 @@ chaffra-audit = { path = "crates/chaffra-audit" }
 chaffra-output = { path = "crates/chaffra-output" }
 chaffra-mcp = { path = "crates/chaffra-mcp" }
 chaffra-plugin = { path = "crates/chaffra-plugin" }
+chaffra-security = { path = "crates/chaffra-security" }
