@@ -30,14 +30,6 @@ struct Cli {
     /// Path to configuration file.
     #[arg(long, global = true)]
     config: Option<String>,
-
-    /// Group results by workspace member (requires monorepo detection).
-    #[arg(long, global = true, value_name = "MODE")]
-    group_by: Option<String>,
-
-    /// Only analyze workspaces changed since the given git ref.
-    #[arg(long, global = true, value_name = "REF")]
-    changed_workspaces: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -385,9 +377,17 @@ fn cmd_impact(
         return Ok("No source files found.\n".to_owned());
     }
 
-    // Run analysis to get current state
+    // Run all registered modules and aggregate findings
     let host = build_module_host();
-    let result = host.analyze("dead-code", &files, config)?;
+    let mut all_findings: Vec<chaffra_core::diagnostic::Finding> = Vec::new();
+    let mut total_files_analyzed: u64 = 0;
+
+    for module_info in host.list() {
+        if let Ok(result) = host.analyze(&module_info.id, &files, config) {
+            all_findings.extend(result.findings);
+            total_files_analyzed = total_files_analyzed.max(result.metrics.files_analyzed);
+        }
+    }
 
     let health = chaffra_complexity::analyze_project_health(
         &files,
@@ -396,7 +396,12 @@ fn cmd_impact(
     )
     .ok();
 
-    let snapshot = chaffra_impact::create_snapshot(&result, health.as_ref(), label);
+    let snapshot = chaffra_impact::snapshot_from_findings(
+        &all_findings,
+        total_files_analyzed,
+        health.as_ref(),
+        label,
+    );
 
     // Save snapshot if requested
     if let Some(save_to) = save_path {
@@ -1153,5 +1158,79 @@ mod tests {
         let output = cmd_workspaces(dir.path(), OutputFormat::Terminal);
         assert!(output.contains("js-package-json"));
         assert!(output.contains("ui"));
+    }
+
+    // --- P1-1 regression: workspace flags removed until wired ---
+
+    #[test]
+    fn test_cli_struct_has_no_group_by_field() {
+        // Ensure --group-by and --changed-workspaces are not accepted
+        // until they are properly wired into analysis commands.
+        let result = Cli::try_parse_from(["chaffra", "--group-by", "workspace", "health"]);
+        assert!(
+            result.is_err(),
+            "unexpected --group-by flag should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cli_struct_has_no_changed_workspaces_field() {
+        let result = Cli::try_parse_from(["chaffra", "--changed-workspaces", "main", "health"]);
+        assert!(
+            result.is_err(),
+            "unexpected --changed-workspaces flag should be rejected"
+        );
+    }
+
+    // --- P1-2 regression: impact aggregates all modules ---
+
+    #[test]
+    fn test_cmd_impact_aggregates_all_modules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("snapshot.json");
+
+        cmd_impact(
+            &root,
+            &config,
+            Some(snapshot_path.to_str().unwrap()),
+            None,
+            Some("all-modules".to_owned()),
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&snapshot_path).unwrap();
+        let snapshot: chaffra_impact::Snapshot = serde_json::from_str(&content).unwrap();
+
+        // The snapshot must contain findings from dead-code AND complexity
+        // modules, not just dead-code alone.
+        let has_dead_code = snapshot
+            .finding_counts
+            .keys()
+            .any(|k| k.starts_with("unused-") || k.starts_with("dead-"));
+        let has_complexity = snapshot
+            .finding_counts
+            .keys()
+            .any(|k| k.starts_with("high-"));
+
+        assert!(
+            has_dead_code || has_complexity,
+            "snapshot should aggregate findings from multiple modules, got keys: {:?}",
+            snapshot.finding_counts.keys().collect::<Vec<_>>()
+        );
+
+        // total_findings should reflect all modules' findings combined
+        let total = snapshot
+            .metrics
+            .get("total_findings")
+            .copied()
+            .unwrap_or(0.0);
+        let sum_by_rule: u64 = snapshot.finding_counts.values().sum();
+        assert_eq!(
+            total as u64, sum_by_rule,
+            "total_findings metric should equal sum of all finding_counts"
+        );
     }
 }

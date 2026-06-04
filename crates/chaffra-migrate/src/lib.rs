@@ -105,8 +105,20 @@ pub fn migrate(tool: SourceTool, config_dir: &Path) -> Result<MigrationResult, M
             SourceTool::Knip => {
                 let alt = config_dir.join("package.json");
                 if alt.exists() {
-                    std::fs::read_to_string(&alt)
-                        .map_err(|e| MigrateError::ReadError(e.to_string()))?
+                    let raw = std::fs::read_to_string(&alt)
+                        .map_err(|e| MigrateError::ReadError(e.to_string()))?;
+                    // Extract the nested "knip" object from package.json
+                    let pkg: serde_json::Value = serde_json::from_str(&raw)
+                        .map_err(|e| MigrateError::ParseError(e.to_string()))?;
+                    if let Some(knip_obj) = pkg.get("knip") {
+                        serde_json::to_string(knip_obj)
+                            .map_err(|e| MigrateError::ParseError(e.to_string()))?
+                    } else {
+                        return Err(MigrateError::ConfigNotFound(format!(
+                            "no \"knip\" key in {}",
+                            alt.display()
+                        )));
+                    }
                 } else {
                     return Err(MigrateError::ConfigNotFound(
                         config_path.display().to_string(),
@@ -133,6 +145,7 @@ pub fn migrate(tool: SourceTool, config_dir: &Path) -> Result<MigrationResult, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_source_tool_from_str_loose() {
@@ -202,5 +215,86 @@ mod tests {
 
         let err = MigrateError::ConfigNotFound("bar.json".to_owned());
         assert_eq!(err.to_string(), "config file not found: bar.json");
+    }
+
+    // --- P1-3 regression: extract knip from nested package.json ---
+
+    #[test]
+    fn test_migrate_knip_from_package_json_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        // No knip.json, so the fallback reads package.json.
+        // The knip config is nested under "knip" key.
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "my-app",
+                "version": "1.0.0",
+                "knip": {
+                    "entry": ["src/main.ts"],
+                    "ignore": ["build/**"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = migrate(SourceTool::Knip, dir.path()).unwrap();
+        assert!(
+            result.toml_content.contains("src/main.ts"),
+            "should extract entry from nested knip object: {}",
+            result.toml_content
+        );
+        assert!(
+            result.toml_content.contains("build/**"),
+            "should extract ignore from nested knip object: {}",
+            result.toml_content
+        );
+    }
+
+    #[test]
+    fn test_migrate_knip_from_package_json_no_knip_key() {
+        let dir = tempfile::tempdir().unwrap();
+        // No knip.json, and package.json has no "knip" key.
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "my-app", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let result = migrate(SourceTool::Knip, dir.path());
+        assert!(
+            result.is_err(),
+            "should error when package.json has no knip key"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MigrateError::ConfigNotFound(_)),
+            "should be ConfigNotFound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_migrate_knip_standalone_file_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both knip.json and package.json exist; knip.json should be used.
+        fs::write(
+            dir.path().join("knip.json"),
+            r#"{"entry": ["from-knip.ts"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "x", "knip": {"entry": ["from-pkg.ts"]}}"#,
+        )
+        .unwrap();
+
+        let result = migrate(SourceTool::Knip, dir.path()).unwrap();
+        assert!(
+            result.toml_content.contains("from-knip.ts"),
+            "standalone knip.json should take precedence"
+        );
+        assert!(
+            !result.toml_content.contains("from-pkg.ts"),
+            "package.json knip should not be used when knip.json exists"
+        );
     }
 }
