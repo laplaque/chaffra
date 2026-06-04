@@ -1,0 +1,29 @@
+[package]
+name = "chaffra-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for chaffra codebase intelligence"
+
+[[bin]]
+name = "chaffra"
+path = "src/main.rs"
+
+[dependencies]
+chaffra-core = { workspace = true }
+chaffra-parse = { workspace = true }
+chaffra-deadcode = { workspace = true }
+chaffra-complexity = { workspace = true }
+chaffra-health = { workspace = true }
+chaffra-duplication = { workspace = true }
+chaffra-arch = { workspace = true }
+chaffra-hotspot = { workspace = true }
+chaffra-audit = { workspace = true }
+chaffra-output = { workspace = true }
+chaffra-mcp = { workspace = true }
+chaffra-plugin = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

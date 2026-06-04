@@ -1,0 +1,12 @@
+[package]
+name = "chaffra-deadcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Dead code detection engine for unreachable functions, types, imports, and files"
+
+[dependencies]
+chaffra-core = { workspace = true }
+chaffra-parse = { workspace = true }

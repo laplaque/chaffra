@@ -1,0 +1,13 @@
+[package]
+name = "chaffra-hotspot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Hotspot ranking by combining git churn history (via gix) with complexity scores"
+
+[dependencies]
+chaffra-core = { workspace = true }
+chaffra-complexity = { workspace = true }
+gix = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "chaffra-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "tree-sitter integration and per-language AST walkers"
+
+[dependencies]
+chaffra-core = { workspace = true }
+tree-sitter = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "chaffra-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "gRPC plugin host and protocol definitions for third-party framework extensions"
+
+[dependencies]
+chaffra-core = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }

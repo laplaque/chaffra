@@ -1,0 +1,12 @@
+[package]
+name = "chaffra-duplication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Clone detection using suffix-tree algorithms with four sensitivity modes"
+
+[dependencies]
+chaffra-core = { workspace = true }
+chaffra-parse = { workspace = true }
