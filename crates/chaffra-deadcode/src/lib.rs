@@ -744,4 +744,194 @@ mod tests {
             "from os.path import join as pj should not be flagged when pj is used"
         );
     }
+
+    #[test]
+    fn test_default() {
+        let module = DeadCodeModule::default();
+        let info = module.describe();
+        assert_eq!(info.id, "dead-code");
+    }
+
+    #[test]
+    fn test_explain_unused_type() {
+        let module = DeadCodeModule::new();
+        let explanation = module.explain("unused-type").unwrap();
+        assert_eq!(explanation.rule_id, "unused-type");
+        assert!(!explanation.description.is_empty());
+        assert!(!explanation.rationale.is_empty());
+        assert!(explanation.default_severity == Severity::Warning);
+    }
+
+    #[test]
+    fn test_explain_unused_import() {
+        let module = DeadCodeModule::new();
+        let explanation = module.explain("unused-import").unwrap();
+        assert_eq!(explanation.rule_id, "unused-import");
+        assert!(!explanation.description.is_empty());
+        assert!(!explanation.examples.is_empty());
+    }
+
+    #[test]
+    fn test_explain_unused_file() {
+        let module = DeadCodeModule::new();
+        let explanation = module.explain("unused-file").unwrap();
+        assert_eq!(explanation.rule_id, "unused-file");
+        assert_eq!(explanation.default_severity, Severity::Info);
+        assert!(explanation.examples.is_empty());
+    }
+
+    #[test]
+    fn test_explain_stale_suppression() {
+        let module = DeadCodeModule::new();
+        let explanation = module.explain("stale-suppression").unwrap();
+        assert_eq!(explanation.rule_id, "stale-suppression");
+        assert_eq!(explanation.default_severity, Severity::Info);
+        assert_eq!(explanation.suppression_syntax, "N/A");
+    }
+
+    #[test]
+    fn test_fix_non_dry_run() {
+        let module = DeadCodeModule::new();
+        let findings = vec![Finding {
+            rule_id: "unused-function".to_owned(),
+            message: "unused".to_owned(),
+            severity: Severity::Warning,
+            location: Location {
+                file: "test.go".to_owned(),
+                start_line: 5,
+                end_line: 7,
+                start_column: 0,
+                end_column: 0,
+            },
+            confidence: 1.0,
+            actions: vec![Action {
+                description: "Remove function".to_owned(),
+                auto_fixable: true,
+                edits: vec![TextEdit {
+                    file: "test.go".to_owned(),
+                    start_line: 5,
+                    end_line: 7,
+                    new_text: String::new(),
+                }],
+            }],
+            metadata: HashMap::new(),
+        }];
+        let results = module.fix(&findings, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].applied);
+        assert_eq!(results[0].reason, "applied");
+        assert!(!results[0].edits.is_empty());
+    }
+
+    #[test]
+    fn test_fix_no_actions() {
+        let module = DeadCodeModule::new();
+        let findings = vec![Finding {
+            rule_id: "unused-file".to_owned(),
+            message: "unused file".to_owned(),
+            severity: Severity::Info,
+            location: Location {
+                file: "orphan.go".to_owned(),
+                start_line: 1,
+                end_line: 1,
+                start_column: 0,
+                end_column: 0,
+            },
+            confidence: 0.8,
+            actions: vec![],
+            metadata: HashMap::new(),
+        }];
+        let results = module.fix(&findings, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].applied);
+        assert_eq!(results[0].reason, "no auto-fix available");
+    }
+
+    #[test]
+    fn test_directly_referenced_lowers_confidence() {
+        // Create two files: A defines `helper`, B references `helper` but `helper`
+        // is also in A which is not an entry file.
+        // helper should still be flagged (if not alive) but with lower confidence
+        // because it is directly referenced.
+        let module = DeadCodeModule::new();
+        let files = vec![
+            make_file("lib.go", "package lib\n\nfunc helper() {}\n"),
+            make_file(
+                "caller.go",
+                "package lib\n\nfunc unused() {\n\thelper()\n}\n",
+            ),
+        ];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let helper_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.message.contains("helper"))
+            .collect();
+        // helper is referenced from caller.go, so if it is flagged, confidence should be 0.8
+        for f in &helper_findings {
+            if f.rule_id == "unused-function" {
+                assert!(
+                    (f.confidence - 0.8).abs() < 0.01,
+                    "directly referenced symbol should have confidence 0.8, got {}",
+                    f.confidence
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_language() {
+        assert_eq!(detect_language("foo.go"), Some(Language::Go));
+        assert_eq!(detect_language("bar.py"), Some(Language::Python));
+        assert_eq!(detect_language("baz.rs"), None);
+    }
+
+    #[test]
+    fn test_is_entry_file() {
+        assert!(is_entry_file("cmd/main.go"));
+        assert!(is_entry_file("pkg/__init__.py"));
+        assert!(is_entry_file("app/__main__.py"));
+        assert!(!is_entry_file("lib.go"));
+        assert!(!is_entry_file("utils.py"));
+    }
+
+    #[test]
+    fn test_go_unused_type() {
+        let module = DeadCodeModule::new();
+        let files = vec![make_file(
+            "types.go",
+            "package types\n\ntype usedType struct{}\n\ntype unusedType struct{}\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        // usedType and unusedType are unexported, not entry points.
+        let type_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "unused-type")
+            .collect();
+        assert!(
+            !type_findings.is_empty(),
+            "should find unused types in non-main package"
+        );
+    }
+
+    #[test]
+    fn test_unused_file_detection() {
+        let module = DeadCodeModule::new();
+        // A file with only unexported, unreferenced symbols.
+        let files = vec![make_file(
+            "orphan.go",
+            "package orphan\n\nfunc helper() {}\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let file_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "unused-file")
+            .collect();
+        assert!(
+            !file_findings.is_empty(),
+            "should flag file with no used symbols as unused"
+        );
+    }
 }

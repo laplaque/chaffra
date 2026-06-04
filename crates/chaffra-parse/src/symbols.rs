@@ -546,4 +546,150 @@ mod tests {
         assert!(has_fmt, "should reference fmt");
         assert!(has_println, "should reference Println");
     }
+
+    #[test]
+    fn test_extract_go_struct_type() {
+        let src = b"package main\n\ntype MyStruct struct {\n\tName string\n\tAge int\n}\n";
+        let tree = parser::parse(src, Language::Go).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Go, "main.go");
+        let my_struct = symbols.iter().find(|s| s.name == "MyStruct").unwrap();
+        assert_eq!(my_struct.kind, SymbolKind::Type);
+        assert!(my_struct.exported);
+    }
+
+    #[test]
+    fn test_extract_go_method_declaration() {
+        let src = b"package main\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n\nfunc (s *Server) stop() {}\n";
+        let tree = parser::parse(src, Language::Go).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Go, "main.go");
+        let start = symbols.iter().find(|s| s.name == "Start").unwrap();
+        assert_eq!(start.kind, SymbolKind::Function);
+        assert!(start.exported);
+        let stop = symbols.iter().find(|s| s.name == "stop").unwrap();
+        assert_eq!(stop.kind, SymbolKind::Function);
+        assert!(!stop.exported);
+    }
+
+    #[test]
+    fn test_extract_go_exported_check() {
+        let src = b"package pkg\n\nfunc ExportedFunc() {}\nfunc unexportedFunc() {}\ntype ExportedType int\ntype unexportedType int\n";
+        let tree = parser::parse(src, Language::Go).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Go, "pkg.go");
+        for sym in &symbols {
+            if sym.name.starts_with(char::is_uppercase) {
+                assert!(sym.exported, "{} should be exported", sym.name);
+            } else {
+                assert!(!sym.exported, "{} should not be exported", sym.name);
+            }
+        }
+        assert_eq!(symbols.len(), 4);
+    }
+
+    #[test]
+    fn test_extract_python_class_basic() {
+        let src = b"class Animal:\n    def speak(self):\n        pass\n\nclass _PrivateClass:\n    pass\n";
+        let tree = parser::parse(src, Language::Python).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Python, "models.py");
+        let animal = symbols.iter().find(|s| s.name == "Animal").unwrap();
+        assert_eq!(animal.kind, SymbolKind::Type);
+        assert!(animal.exported);
+        let private = symbols.iter().find(|s| s.name == "_PrivateClass").unwrap();
+        assert_eq!(private.kind, SymbolKind::Type);
+        assert!(!private.exported);
+    }
+
+    #[test]
+    fn test_extract_python_decorated_class() {
+        let src = b"import dataclasses\n\n@dataclasses.dataclass\nclass Config:\n    name: str\n    value: int\n";
+        let tree = parser::parse(src, Language::Python).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Python, "config.py");
+        let config = symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert_eq!(config.kind, SymbolKind::Type);
+        assert!(config.exported);
+    }
+
+    #[test]
+    fn test_extract_python_decorated_function() {
+        let src =
+            b"def decorator(f):\n    return f\n\n@decorator\ndef decorated_func():\n    pass\n";
+        let tree = parser::parse(src, Language::Python).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Python, "app.py");
+        let decorated = symbols.iter().find(|s| s.name == "decorated_func");
+        assert!(decorated.is_some(), "should find decorated function");
+        assert_eq!(decorated.unwrap().kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_extract_python_multiple_classes_and_functions() {
+        let src = b"class Foo:\n    pass\n\nclass Bar:\n    pass\n\ndef baz():\n    pass\n";
+        let tree = parser::parse(src, Language::Python).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Python, "mixed.py");
+        assert_eq!(symbols.len(), 3);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Foo" && s.kind == SymbolKind::Type)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Bar" && s.kind == SymbolKind::Type)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "baz" && s.kind == SymbolKind::Function)
+        );
+    }
+
+    #[test]
+    fn test_extract_go_multiple_types_and_methods() {
+        let src = b"package main\n\ntype Foo struct{}\n\ntype Bar interface{}\n\nfunc (f Foo) Method() {}\n";
+        let tree = parser::parse(src, Language::Go).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Go, "main.go");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Foo" && s.kind == SymbolKind::Type)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Bar" && s.kind == SymbolKind::Type)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Method" && s.kind == SymbolKind::Function)
+        );
+    }
+
+    #[test]
+    fn test_extract_go_import_with_alias() {
+        let src = b"package main\n\nimport (\n\tf \"fmt\"\n)\n";
+        let tree = parser::parse(src, Language::Go).unwrap();
+        let imports = extract_imports(&tree, src, Language::Go);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].path, "fmt");
+        assert_eq!(imports[0].alias.as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn test_extract_python_references() {
+        let src = b"import os\n\ndef main():\n    path = os.getcwd()\n    print(path)\n";
+        let tree = parser::parse(src, Language::Python).unwrap();
+        let refs = extract_references(&tree, src, Language::Python, "app.py");
+        let has_os = refs.iter().any(|r| r.name == "os");
+        let has_print = refs.iter().any(|r| r.name == "print");
+        assert!(has_os, "should reference os");
+        assert!(has_print, "should reference print");
+    }
+
+    #[test]
+    fn test_symbol_kind_display() {
+        assert_eq!(SymbolKind::Function.to_string(), "function");
+        assert_eq!(SymbolKind::Type.to_string(), "type");
+        assert_eq!(SymbolKind::Import.to_string(), "import");
+        assert_eq!(SymbolKind::Variable.to_string(), "variable");
+    }
 }

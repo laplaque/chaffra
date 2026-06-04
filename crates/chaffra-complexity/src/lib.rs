@@ -814,4 +814,161 @@ mod tests {
         let health = analyze_project_health(&files, 20, 15).unwrap();
         assert!(health.score >= 80);
     }
+
+    #[test]
+    fn test_analyze_project_health_empty() {
+        let files: Vec<FileInfo> = vec![];
+        let health = analyze_project_health(&files, 20, 15).unwrap();
+        assert_eq!(health.score, 100);
+    }
+
+    #[test]
+    fn test_analyze_skips_unsupported_language() {
+        let module = ComplexityModule::new();
+        let files = vec![make_file("test.rs", "fn main() {}")];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_finds_high_cognitive() {
+        let module = ComplexityModule::new();
+        let mut config = HashMap::new();
+        config.insert("max-cognitive".to_owned(), "0".to_owned());
+        config.insert("max-cyclomatic".to_owned(), "100".to_owned());
+
+        let files = vec![make_file(
+            "nested.go",
+            "package main\n\nfunc nested(x int) {\n\tif x > 0 {\n\t\tif x > 1 {\n\t\t\t_ = x\n\t\t}\n\t}\n}\n",
+        )];
+        let result = module.analyze(&files, &config).unwrap();
+        let cognitive_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "high-cognitive")
+            .collect();
+        assert!(
+            !cognitive_findings.is_empty(),
+            "should find high-cognitive with threshold 0"
+        );
+    }
+
+    #[test]
+    fn test_analyze_finds_low_health_score() {
+        let module = ComplexityModule::new();
+        let mut config = HashMap::new();
+        config.insert("min-score".to_owned(), "100".to_owned());
+        config.insert("max-cyclomatic".to_owned(), "1".to_owned());
+        config.insert("max-cognitive".to_owned(), "0".to_owned());
+
+        let files = vec![make_file(
+            "complex.go",
+            "package main\n\nfunc complex(x int, y int) int {\n\tif x > 0 {\n\t\tif y > 0 {\n\t\t\treturn x + y\n\t\t}\n\t\treturn x\n\t}\n\treturn y\n}\n",
+        )];
+        let result = module.analyze(&files, &config).unwrap();
+        let health_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "low-health-score")
+            .collect();
+        assert!(
+            !health_findings.is_empty(),
+            "should find low-health-score with threshold 100"
+        );
+    }
+
+    #[test]
+    fn test_fix_returns_empty() {
+        let module = ComplexityModule::new();
+        let results = module.fix(&[], false).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_python_complexity_with_nesting() {
+        let src = b"def deep(x):\n    if x > 0:\n        for i in range(x):\n            if i > 5:\n                while i > 0:\n                    i -= 1\n";
+        let metrics = compute_file_metrics(src, Language::Python, "deep.py").unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!(
+            metrics[0].cyclomatic >= 4,
+            "deeply nested should have high cyclomatic: {}",
+            metrics[0].cyclomatic
+        );
+        assert!(
+            metrics[0].cognitive > 0,
+            "deeply nested should have non-zero cognitive"
+        );
+        assert!(
+            metrics[0].max_nesting >= 3,
+            "deeply nested should have max_nesting >= 3: {}",
+            metrics[0].max_nesting
+        );
+    }
+
+    #[test]
+    fn test_go_switch_complexity() {
+        let src = b"package main\n\nfunc sw(x int) int {\n\tswitch x {\n\tcase 1:\n\t\treturn 1\n\tcase 2:\n\t\treturn 2\n\tdefault:\n\t\treturn 0\n\t}\n}\n";
+        let metrics = compute_file_metrics(src, Language::Go, "sw.go").unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!(
+            metrics[0].cyclomatic >= 3,
+            "switch with cases should have cyclomatic >= 3: {}",
+            metrics[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn test_detect_language_fn() {
+        assert_eq!(detect_language("foo.go"), Some(Language::Go));
+        assert_eq!(detect_language("bar.py"), Some(Language::Python));
+        assert_eq!(detect_language("baz.rs"), None);
+        assert_eq!(detect_language("test.js"), None);
+    }
+
+    #[test]
+    fn test_python_decorated_function_metrics() {
+        let src = b"def decorator(f):\n    return f\n\n@decorator\ndef decorated():\n    if True:\n        pass\n";
+        let metrics = compute_file_metrics(src, Language::Python, "deco.py").unwrap();
+        // Should find the top-level decorator function.
+        assert!(
+            !metrics.is_empty(),
+            "should extract metrics from decorated function"
+        );
+    }
+
+    #[test]
+    fn test_go_method_complexity() {
+        let src = b"package main\n\ntype S struct{}\n\nfunc (s S) Method(x int) {\n\tif x > 0 {\n\t\t_ = x\n\t}\n}\n";
+        let metrics = compute_file_metrics(src, Language::Go, "method.go").unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "Method");
+        assert!(metrics[0].cyclomatic >= 2);
+    }
+
+    #[test]
+    fn test_analyze_with_default_config() {
+        let module = ComplexityModule::new();
+        let files = vec![make_file(
+            "simple.go",
+            "package main\n\nfunc simple() {\n\tx := 1\n\t_ = x\n}\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        assert!(
+            result.findings.is_empty(),
+            "simple function should have no findings with default thresholds"
+        );
+        assert_eq!(result.metrics.files_analyzed, 1);
+    }
+
+    #[test]
+    fn test_python_try_except_complexity() {
+        let src = b"def risky():\n    try:\n        x = 1\n    except ValueError:\n        x = 2\n    except Exception:\n        x = 3\n";
+        let metrics = compute_file_metrics(src, Language::Python, "risky.py").unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!(
+            metrics[0].cyclomatic >= 3,
+            "function with try/except should have cyclomatic >= 3: {}",
+            metrics[0].cyclomatic
+        );
+    }
 }

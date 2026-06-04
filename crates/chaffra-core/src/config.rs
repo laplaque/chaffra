@@ -340,4 +340,32 @@ threshold = "10"
         // Template has all values commented out, so defaults apply
         assert_eq!(config.health.max_cyclomatic, 20);
     }
+
+    #[test]
+    fn test_load_from_dir_with_file() {
+        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "[health]\nmax-cyclomatic = 25\n",
+        )
+        .unwrap();
+        let config = ChaffraConfig::load_from_dir(&dir).unwrap();
+        assert_eq!(config.health.max_cyclomatic, 25);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_module_config_non_string_value() {
+        let toml = r#"
+[modules.complexity]
+max-cyclomatic = 30
+verbose = true
+"#;
+        let config = ChaffraConfig::parse(toml).unwrap();
+        let mc = config.module_config("complexity");
+        assert_eq!(mc.get("max-cyclomatic").map(String::as_str), Some("30"));
+        assert_eq!(mc.get("verbose").map(String::as_str), Some("true"));
+    }
 }
