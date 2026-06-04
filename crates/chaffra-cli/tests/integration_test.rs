@@ -1,12 +1,14 @@
-//! Integration tests for chaffra Phase 1 modules.
+//! Integration tests for chaffra modules.
 //!
-//! Tests use Go and Python fixtures under `tests/fixtures/`.
+//! Tests use Go, Python, TypeScript, and Java fixtures under `tests/fixtures/`.
 
+use chaffra_arch::ArchitectureModule;
 use chaffra_complexity::{ComplexityModule, analyze_project_health};
 use chaffra_core::config::ChaffraConfig;
 use chaffra_core::diagnostic::{FileInfo, HealthGrade};
 use chaffra_core::module::{AnalysisModule, ModuleHost};
 use chaffra_deadcode::DeadCodeModule;
+use chaffra_duplication::DuplicationModule;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -295,4 +297,221 @@ fn test_terminal_output() {
     let text = formatter.format_findings(&result.findings);
     // Should contain severity indicators.
     assert!(text.contains("[W]") || text.contains("No issues found"));
+}
+
+// --- Phase 2: Duplication integration tests ---
+
+#[test]
+fn test_go_duplication_detects_clones() {
+    let module = DuplicationModule::new();
+    let files = load_fixture_files("go/clones");
+    assert!(files.len() >= 2, "should find Go clone fixture files");
+
+    let mut config = HashMap::new();
+    config.insert("min-tokens".to_owned(), "10".to_owned());
+    config.insert("mode".to_owned(), "mild".to_owned());
+
+    let result = module.analyze(&files, &config).unwrap();
+    assert!(
+        !result.findings.is_empty(),
+        "should detect duplicate blocks in handler_a.go / handler_b.go"
+    );
+
+    // Every finding should have a family_id.
+    for finding in &result.findings {
+        assert!(
+            finding.metadata.contains_key("family_id"),
+            "finding should have family_id"
+        );
+        assert!(
+            finding.metadata["family_id"].starts_with("dup:"),
+            "family_id should start with dup:"
+        );
+    }
+}
+
+#[test]
+fn test_python_duplication_detects_clones() {
+    let module = DuplicationModule::new();
+    let files = load_fixture_files("python/clones");
+    assert!(files.len() >= 2, "should find Python clone fixture files");
+
+    let mut config = HashMap::new();
+    config.insert("min-tokens".to_owned(), "10".to_owned());
+    config.insert("mode".to_owned(), "mild".to_owned());
+
+    let result = module.analyze(&files, &config).unwrap();
+    assert!(
+        !result.findings.is_empty(),
+        "should detect duplicate blocks in processor_a.py / processor_b.py"
+    );
+}
+
+#[test]
+fn test_duplication_module_via_host() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(DuplicationModule::new())).unwrap();
+
+    let files = load_fixture_files("go/clones");
+    let config = ChaffraConfig::default();
+    let result = host.analyze("duplication", &files, &config).unwrap();
+    assert_eq!(result.metrics.files_analyzed, files.len() as u64);
+}
+
+#[test]
+fn test_duplication_explain_rules() {
+    let module = DuplicationModule::new();
+    let explanation = module.explain("duplicate-block").unwrap();
+    assert_eq!(explanation.rule_id, "duplicate-block");
+    assert!(!explanation.description.is_empty());
+
+    let explanation = module.explain("duplicate-function").unwrap();
+    assert_eq!(explanation.rule_id, "duplicate-function");
+}
+
+// --- Phase 2: Architecture integration tests ---
+
+#[test]
+fn test_architecture_module_presets() {
+    let module = ArchitectureModule::new();
+    let info = module.describe();
+    assert_eq!(info.id, "architecture");
+    assert!(info.rules.len() >= 2);
+
+    // Load preset configurations.
+    for preset in &["layered", "hexagonal", "feature-sliced", "clean"] {
+        let (zones, rules) = chaffra_arch::load_preset(preset);
+        assert!(!zones.is_empty(), "preset {preset} should have zones");
+        assert!(!rules.is_empty(), "preset {preset} should have rules");
+    }
+}
+
+#[test]
+fn test_architecture_analyze_boundaries() {
+    let module = ArchitectureModule::new();
+    let files = load_fixture_files("go/boundaries");
+    assert!(!files.is_empty(), "should find Go boundary fixture files");
+
+    let mut config = HashMap::new();
+    config.insert("preset".to_owned(), "layered".to_owned());
+
+    let result = module.analyze(&files, &config).unwrap();
+    // Even if no violations are found, the analysis should succeed.
+    assert!(result.metrics.files_analyzed > 0);
+}
+
+#[test]
+fn test_architecture_module_via_host() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(ArchitectureModule::new())).unwrap();
+
+    let files = load_fixture_files("go/boundaries");
+    let toml = r#"
+[modules.architecture]
+preset = "layered"
+"#;
+    let config = ChaffraConfig::parse(toml).unwrap();
+    let result = host.analyze("architecture", &files, &config).unwrap();
+    assert_eq!(result.metrics.files_analyzed, files.len() as u64);
+}
+
+#[test]
+fn test_architecture_explain_rules() {
+    let module = ArchitectureModule::new();
+    let explanation = module.explain("boundary-violation").unwrap();
+    assert_eq!(explanation.rule_id, "boundary-violation");
+    assert!(!explanation.description.is_empty());
+
+    let explanation = module.explain("circular-dependency").unwrap();
+    assert_eq!(explanation.rule_id, "circular-dependency");
+}
+
+// --- Phase 2: SARIF output integration test ---
+
+#[test]
+fn test_sarif_output_valid() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Sarif);
+    let sarif_str = formatter.format_findings(&result.findings);
+
+    let parsed: serde_json::Value = serde_json::from_str(&sarif_str).unwrap();
+    assert_eq!(parsed["version"], "2.1.0");
+    assert!(parsed["$schema"].as_str().unwrap().contains("sarif"));
+    assert!(parsed["runs"][0]["results"].as_array().is_some());
+}
+
+// --- Phase 2: TypeScript/JavaScript fixture tests ---
+
+#[test]
+fn test_typescript_dead_code() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("typescript/simple");
+    assert!(!files.is_empty(), "should find TypeScript fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+    // Should find unused helper function.
+    let unused_funcs: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "unused-function")
+        .collect();
+    assert!(
+        !unused_funcs.is_empty(),
+        "should find unused TypeScript functions"
+    );
+}
+
+#[test]
+fn test_typescript_complexity() {
+    let module = ComplexityModule::new();
+    let files = load_fixture_files("typescript/simple");
+    assert!(!files.is_empty());
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+    assert_eq!(result.metrics.files_analyzed, files.len() as u64);
+}
+
+// --- Phase 2: Java fixture tests ---
+
+#[test]
+fn test_java_dead_code() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("java/simple");
+    assert!(!files.is_empty(), "should find Java fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+    assert_eq!(result.metrics.files_analyzed, files.len() as u64);
+}
+
+#[test]
+fn test_java_complexity() {
+    let module = ComplexityModule::new();
+    let files = load_fixture_files("java/simple");
+    assert!(!files.is_empty());
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+    assert_eq!(result.metrics.files_analyzed, files.len() as u64);
+}
+
+// --- Phase 2: Full module host with all 4 modules ---
+
+#[test]
+fn test_full_module_host_registration() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(DeadCodeModule::new())).unwrap();
+    host.register(Box::new(ComplexityModule::new())).unwrap();
+    host.register(Box::new(DuplicationModule::new())).unwrap();
+    host.register(Box::new(ArchitectureModule::new())).unwrap();
+
+    let modules = host.list();
+    assert_eq!(modules.len(), 4);
+
+    let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"dead-code"));
+    assert!(ids.contains(&"complexity"));
+    assert!(ids.contains(&"duplication"));
+    assert!(ids.contains(&"architecture"));
 }
