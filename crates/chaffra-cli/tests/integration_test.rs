@@ -1,4 +1,4 @@
-//! Integration tests for chaffra Phase 1 modules.
+//! Integration tests for chaffra modules.
 //!
 //! Tests use Go and Python fixtures under `tests/fixtures/`.
 
@@ -7,6 +7,7 @@ use chaffra_core::config::ChaffraConfig;
 use chaffra_core::diagnostic::{FileInfo, HealthGrade};
 use chaffra_core::module::{AnalysisModule, ModuleHost};
 use chaffra_deadcode::DeadCodeModule;
+use chaffra_frameworks::FrameworksModule;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -295,4 +296,265 @@ fn test_terminal_output() {
     let text = formatter.format_findings(&result.findings);
     // Should contain severity indicators.
     assert!(text.contains("[W]") || text.contains("No issues found"));
+}
+
+// --- Framework detection integration tests ---
+
+#[test]
+fn test_gin_framework_detection() {
+    let module = FrameworksModule::new();
+    let files = load_fixture_files("go/gin");
+    assert!(!files.is_empty(), "should find gin fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    // Should detect gin entry points.
+    let entry_points: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-entry-point")
+        .collect();
+    assert!(
+        entry_points.len() >= 4,
+        "should detect multiple gin handlers: {entry_points:?}"
+    );
+    assert!(
+        entry_points
+            .iter()
+            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "gin")),
+        "all entries should be gin framework"
+    );
+
+    // Should detect the gin framework.
+    let framework_findings: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-detected")
+        .collect();
+    assert!(
+        framework_findings.iter().any(|f| f.message.contains("gin")),
+        "should detect gin framework"
+    );
+}
+
+#[test]
+fn test_echo_framework_detection() {
+    let module = FrameworksModule::new();
+    let files = load_fixture_files("go/echo");
+    assert!(!files.is_empty(), "should find echo fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let entry_points: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-entry-point")
+        .collect();
+    assert!(
+        entry_points.len() >= 2,
+        "should detect echo handlers: {entry_points:?}"
+    );
+    assert!(
+        entry_points
+            .iter()
+            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "echo")),
+        "all entries should be echo framework"
+    );
+}
+
+#[test]
+fn test_cobra_framework_detection() {
+    let module = FrameworksModule::new();
+    let files = load_fixture_files("go/cobra");
+    assert!(!files.is_empty(), "should find cobra fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let entry_points: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-entry-point")
+        .collect();
+    assert!(
+        !entry_points.is_empty(),
+        "should detect cobra commands: {entry_points:?}"
+    );
+    assert!(
+        entry_points
+            .iter()
+            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "cobra")),
+        "all entries should be cobra framework"
+    );
+}
+
+#[test]
+fn test_fastapi_framework_detection() {
+    let module = FrameworksModule::new();
+    let files = load_fixture_files("python/fastapi");
+    assert!(!files.is_empty(), "should find FastAPI fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let entry_points: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-entry-point")
+        .collect();
+    assert!(
+        entry_points.len() >= 4,
+        "should detect FastAPI routes: {entry_points:?}"
+    );
+    assert!(
+        entry_points.iter().all(|f| f
+            .metadata
+            .get("framework")
+            .map_or(false, |v| v == "fastapi")),
+        "all entries should be fastapi framework"
+    );
+}
+
+#[test]
+fn test_django_framework_detection() {
+    let module = FrameworksModule::new();
+    let files = load_fixture_files("python/django");
+    assert!(!files.is_empty(), "should find Django fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    // Should detect class-based views and URL patterns.
+    let entry_points: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-entry-point")
+        .collect();
+    assert!(
+        !entry_points.is_empty(),
+        "should detect Django views or URL patterns: {entry_points:?}"
+    );
+    assert!(
+        entry_points
+            .iter()
+            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "django")),
+        "all entries should be django framework"
+    );
+}
+
+#[test]
+fn test_flask_framework_detection() {
+    let module = FrameworksModule::new();
+    let files = load_fixture_files("python/flask");
+    assert!(!files.is_empty(), "should find Flask fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let entry_points: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "framework-entry-point")
+        .collect();
+    assert!(
+        entry_points.len() >= 3,
+        "should detect Flask routes: {entry_points:?}"
+    );
+    assert!(
+        entry_points
+            .iter()
+            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "flask")),
+        "all entries should be flask framework"
+    );
+}
+
+#[test]
+fn test_frameworks_module_registration() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(DeadCodeModule::new())).unwrap();
+    host.register(Box::new(ComplexityModule::new())).unwrap();
+    host.register(Box::new(FrameworksModule::new())).unwrap();
+
+    let modules = host.list();
+    assert_eq!(modules.len(), 3);
+
+    let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"frameworks"));
+}
+
+#[test]
+fn test_frameworks_explain_via_host() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(FrameworksModule::new())).unwrap();
+
+    let explanation = host.explain("frameworks:framework-entry-point").unwrap();
+    assert_eq!(explanation.rule_id, "framework-entry-point");
+    assert!(!explanation.examples.is_empty());
+}
+
+#[test]
+fn test_alive_entry_points_utility() {
+    let files = load_fixture_files("go/gin");
+    let entries = chaffra_frameworks::get_alive_entry_points(&files);
+    assert!(
+        !entries.is_empty(),
+        "should return alive entry points for gin fixtures"
+    );
+    assert!(entries.iter().all(|e| e.framework == "gin"));
+}
+
+#[test]
+fn test_grpc_client_mock_connection_failure() {
+    // Verify the gRPC client gracefully handles connection failures.
+    use chaffra_plugin::config::{ExternalModuleConfig, TransportMode};
+    use chaffra_plugin::host::ExternalModule;
+
+    let config = ExternalModuleConfig {
+        id: "test-external".to_owned(),
+        mode: TransportMode::Grpc,
+        command: None,
+        endpoint: Some("http://127.0.0.1:59999".to_owned()),
+        image: None,
+        port: None,
+    };
+    let module = ExternalModule::new(config);
+
+    // describe() should fall back to config-based info.
+    let info = module.describe();
+    assert_eq!(info.id, "test-external");
+    assert!(info.name.contains("external"));
+
+    // analyze() should return an error.
+    let result = module.analyze(&[], &HashMap::new());
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_external_module_config_parsing() {
+    use chaffra_plugin::config::{TransportMode, parse_external_modules};
+
+    let toml = r#"
+[[external_modules]]
+id = "gin"
+command = "chaffra-module-gin"
+
+[[external_modules]]
+id = "fastapi"
+mode = "grpc"
+endpoint = "http://localhost:50051"
+
+[[external_modules]]
+id = "django"
+mode = "container"
+image = "chaffra/module-django:latest"
+port = 50052
+"#;
+    let modules = parse_external_modules(toml).unwrap();
+    assert_eq!(modules.len(), 3);
+
+    assert_eq!(modules[0].id, "gin");
+    assert_eq!(modules[0].mode, TransportMode::Command);
+
+    assert_eq!(modules[1].id, "fastapi");
+    assert_eq!(modules[1].mode, TransportMode::Grpc);
+
+    assert_eq!(modules[2].id, "django");
+    assert_eq!(modules[2].mode, TransportMode::Container);
+    assert_eq!(modules[2].port, Some(50052));
 }
