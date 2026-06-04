@@ -196,11 +196,14 @@ impl AnalysisModule for DeadCodeModule {
                     }
                     Language::Python => {
                         if imp.names.is_empty() {
-                            // import X -- check if X is used
-                            let module_name = imp.path.rsplit('.').next().unwrap_or(&imp.path);
-                            all_refs.contains(module_name)
+                            // import X / import X as alias -- check alias first, then basename
+                            let used_name = imp.alias.as_deref().unwrap_or_else(|| {
+                                imp.path.rsplit('.').next().unwrap_or(&imp.path)
+                            });
+                            all_refs.contains(used_name)
                         } else {
-                            // from X import Y -- check if Y is used
+                            // from X import Y / from X import Y as Z
+                            // names already contain the locally-used name (alias when present)
                             imp.names.iter().any(|n| all_refs.contains(n))
                         }
                     }
@@ -687,5 +690,58 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].applied);
         assert_eq!(results[0].reason, "dry run");
+    }
+
+    #[test]
+    fn test_python_import_alias_not_flagged() {
+        let cases = vec![
+            (
+                "import numpy as np\n\narr = np.array([1])\n",
+                "numpy",
+                false,
+            ),
+            ("import os\n\nx = 1\n", "os", true),
+        ];
+        let module = DeadCodeModule::new();
+        for (code, import_path, should_flag) in &cases {
+            let files = vec![make_file("test.py", code)];
+            let result = module.analyze(&files, &HashMap::new()).unwrap();
+            let needle = format!("`{import_path}`");
+            let flagged: Vec<_> = result
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "unused-import" && f.message.contains(&needle))
+                .collect();
+            if *should_flag {
+                assert!(
+                    !flagged.is_empty(),
+                    "import {import_path} should be flagged in: {code}"
+                );
+            } else {
+                assert!(
+                    flagged.is_empty(),
+                    "import {import_path} should NOT be flagged in: {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_python_from_import_alias_not_flagged() {
+        let module = DeadCodeModule::new();
+        let files = vec![make_file(
+            "test.py",
+            "from os.path import join as pj\n\nx = pj(\"/tmp\", \"f\")\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let flagged: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "unused-import" && f.message.contains("os.path"))
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "from os.path import join as pj should not be flagged when pj is used"
+        );
     }
 }

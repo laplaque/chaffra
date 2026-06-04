@@ -346,7 +346,22 @@ fn extract_python_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
                         }
                     } else {
                         // After "import" keyword -- imported names.
-                        if inner.kind() == "dotted_name" || inner.kind() == "identifier" {
+                        if inner.kind() == "aliased_import" {
+                            // from X import Y as Z — use Z (the alias) as the local name
+                            let mut orig = String::new();
+                            let mut alias_name = None;
+                            let mut alias_inner = inner.walk();
+                            for a in inner.children(&mut alias_inner) {
+                                if a.kind() == "dotted_name" || a.kind() == "identifier" {
+                                    if orig.is_empty() {
+                                        orig = node_text(a, source);
+                                    } else {
+                                        alias_name = Some(node_text(a, source));
+                                    }
+                                }
+                            }
+                            names.push(alias_name.unwrap_or(orig));
+                        } else if inner.kind() == "dotted_name" || inner.kind() == "identifier" {
                             names.push(node_text(inner, source));
                         }
                     }
@@ -368,6 +383,17 @@ fn extract_python_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
 
 // --- Identifier collection for reference tracking ---
 
+fn is_import_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "import_statement"
+            | "import_from_statement"
+            | "import_declaration"
+            | "import_spec"
+            | "import_spec_list"
+    )
+}
+
 fn collect_identifiers(
     node: Node<'_>,
     source: &[u8],
@@ -375,7 +401,10 @@ fn collect_identifiers(
     language: Language,
     refs: &mut Vec<Reference>,
 ) {
-    // Collect identifier nodes that represent references (not definitions).
+    if is_import_node(node.kind()) {
+        return;
+    }
+
     match node.kind() {
         "identifier" | "type_identifier" | "field_identifier"
             if !is_definition_name(node, language) =>

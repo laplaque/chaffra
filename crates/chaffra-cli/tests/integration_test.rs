@@ -108,6 +108,48 @@ fn test_python_dead_code_finds_unused() {
     );
 }
 
+#[test]
+fn test_python_aliased_imports_not_flagged() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("python/aliases");
+    assert!(!files.is_empty(), "should find Python alias fixture files");
+
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    // `import numpy as np` with `np.array(...)` usage — should NOT be flagged.
+    let flagged_np: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "unused-import" && f.message.contains("numpy"))
+        .collect();
+    assert!(
+        flagged_np.is_empty(),
+        "import numpy as np should not be flagged when np is used"
+    );
+
+    // `from os.path import join as path_join` with `path_join(...)` usage — should NOT be flagged.
+    let flagged_ospath: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "unused-import" && f.message.contains("os.path"))
+        .collect();
+    assert!(
+        flagged_ospath.is_empty(),
+        "from os.path import join as path_join should not be flagged when path_join is used"
+    );
+
+    // `import os` without any `os.` usage — SHOULD be flagged.
+    let flagged_os: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "unused-import" && f.message.contains("`os`"))
+        .collect();
+    assert!(
+        !flagged_os.is_empty(),
+        "bare import os should be flagged as unused"
+    );
+}
+
 // --- Complexity/health integration tests ---
 
 #[test]
