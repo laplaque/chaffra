@@ -7,6 +7,7 @@ use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::module::ModuleHost;
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_output::{OutputFormat, create_formatter};
+use chaffra_security::SecurityModule;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
@@ -57,6 +58,12 @@ enum Command {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Run security analysis: SAST, secret scanning, and dependency CVE checks.
+    Security {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
     /// Watch for file changes and re-run analysis incrementally.
     Watch {
         /// Path to the repository root (defaults to current directory).
@@ -85,6 +92,7 @@ fn build_module_host() -> ModuleHost {
     // Register built-in modules.
     let _ = host.register(Box::new(DeadCodeModule::new()));
     let _ = host.register(Box::new(ComplexityModule::new()));
+    let _ = host.register(Box::new(SecurityModule::new()));
     host
 }
 
@@ -139,6 +147,43 @@ fn cmd_dead_code(
     }
     let host = build_module_host();
     let result = host.analyze("dead-code", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_security(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let mut files = discover_and_read_files(root, config);
+
+    // Also discover manifest files (go.mod, requirements.txt, Cargo.lock, package-lock.json).
+    let manifest_names = [
+        "go.mod",
+        "requirements.txt",
+        "Cargo.lock",
+        "package-lock.json",
+    ];
+    for name in &manifest_names {
+        let manifest_path = root.join(name);
+        if manifest_path.exists() {
+            if let Ok(content) = std::fs::read(&manifest_path) {
+                // Only add if not already discovered.
+                if !files.iter().any(|f| f.path == *name) {
+                    files.push(FileInfo {
+                        path: name.to_string(),
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let result = host.analyze("security", &files, config)?;
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -232,6 +277,12 @@ async fn main() -> Result<()> {
             print!("{}", cmd_dead_code(&root, &config, formatter.as_ref())?);
         }
 
+        Command::Security { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_security(&root, &config, formatter.as_ref())?);
+        }
+
         Command::Dupes { .. } => {
             print!("{}", cmd_stub("dupes"));
         }
@@ -285,10 +336,11 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 2);
+        assert_eq!(modules.len(), 3);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
+        assert!(ids.contains(&"security"));
     }
 
     #[test]
@@ -499,8 +551,68 @@ mod tests {
             output.contains("complexity"),
             "should list complexity module"
         );
+        assert!(output.contains("security"), "should list security module");
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
         assert!(output.contains("Rules:"));
+    }
+
+    // --- cmd_security tests ---
+
+    #[test]
+    fn test_cmd_security_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    #[test]
+    fn test_cmd_security_with_fixtures() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/security/vulnerable");
+        if root.exists() {
+            let config = ChaffraConfig::default();
+            let formatter = create_formatter(OutputFormat::Terminal);
+            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            assert!(!output.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_cmd_security_json_format() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/security/vulnerable");
+        if root.exists() {
+            let config = ChaffraConfig::default();
+            let formatter = create_formatter(OutputFormat::Json);
+            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&output)
+                .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{output}"));
+            assert!(parsed.is_array() || parsed.is_object());
+        }
+    }
+
+    #[test]
+    fn test_cmd_explain_sql_injection() {
+        let output = cmd_explain("security:sql-injection").unwrap();
+        assert!(output.contains("SQL injection"));
+        assert!(output.contains("Rationale:"));
+        assert!(output.contains("Examples:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_hardcoded_secret() {
+        let output = cmd_explain("security:hardcoded-secret").unwrap();
+        assert!(output.contains("Hardcoded secret"));
+        assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_vulnerable_dependency() {
+        let output = cmd_explain("security:vulnerable-dependency").unwrap();
+        assert!(output.contains("Vulnerable dependency"));
+        assert!(output.contains("Rationale:"));
     }
 }
