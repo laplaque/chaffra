@@ -9,5 +9,5 @@ description = "PR risk assessment: baselines, new-only vs all-issues gating, and
 
 [dependencies]
 chaffra-core = { workspace = true }
-chaffra-health = { workspace = true }
-chaffra-deadcode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
