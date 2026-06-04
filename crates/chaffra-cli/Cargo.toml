@@ -26,6 +26,9 @@ chaffra-output = { workspace = true }
 chaffra-mcp = { workspace = true }
 chaffra-plugin = { workspace = true }
 chaffra-frameworks = { workspace = true }
+chaffra-monorepo = { workspace = true }
+chaffra-impact = { workspace = true }
+chaffra-migrate = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
