@@ -16,8 +16,6 @@ const HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Pre-commit hook: run chaffra analysis on staged files.
 # Installed by `chaffra hooks install`. Remove with `chaffra hooks uninstall`.
 
-set -e
-
 # Collect staged files.
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
@@ -25,13 +23,17 @@ if [ -z "$STAGED" ]; then
     exit 0
 fi
 
-# Run chaffra dead-code analysis scoped to staged files only.
+# Run chaffra dead-code analysis on each staged file individually.
+# dead-code accepts a single path argument, so we iterate to handle
+# multiple staged files correctly.
 if command -v chaffra >/dev/null 2>&1; then
     echo "chaffra: analyzing staged files..."
-    chaffra dead-code $STAGED --format terminal
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -ne 0 ]; then
-        echo "chaffra: analysis found issues. Commit blocked."
+    FAIL=0
+    for file in $STAGED; do
+        chaffra dead-code "$file" --format terminal || FAIL=1
+    done
+    if [ $FAIL -ne 0 ]; then
+        echo "chaffra: findings detected in staged files"
         exit 1
     fi
 else
@@ -176,7 +178,7 @@ mod tests {
 
         let content = fs::read_to_string(&hook).unwrap();
         assert!(content.contains(HOOK_MARKER));
-        assert!(content.contains("chaffra dead-code $STAGED"));
+        assert!(content.contains("chaffra dead-code \"$file\""));
 
         let meta = fs::metadata(&hook).unwrap();
         assert!(meta.permissions().mode() & 0o111 != 0);
@@ -273,23 +275,68 @@ mod tests {
 
     #[test]
     fn test_hook_script_scopes_to_staged_files() {
-        // The hook must pass $STAGED (the staged file list) to the analysis
-        // command instead of scanning the whole repo with ".".
+        // The hook must iterate staged files individually, passing each to
+        // `chaffra dead-code` as a single path argument.
         let script = hook_script();
 
-        // The command must reference $STAGED, NOT "." as the target.
+        // The command must iterate with `for file in $STAGED` and pass "$file".
         assert!(
-            script.contains("chaffra dead-code $STAGED"),
-            "hook must pass staged file list to analysis, not scan entire repo"
+            script.contains("for file in $STAGED"),
+            "hook must iterate over staged files individually"
+        );
+        assert!(
+            script.contains("chaffra dead-code \"$file\""),
+            "hook must pass each staged file individually to analysis"
         );
         assert!(
             !script.contains("chaffra dead-code ."),
             "hook must NOT run analysis on the entire repo root"
         );
+    }
 
-        // Unstaged/unrelated findings should never block: the hook only sees
-        // the staged file paths, so files not in $STAGED are excluded from
-        // analysis and cannot produce findings that block the commit.
+    #[test]
+    fn test_hook_handles_multiple_staged_files() {
+        // Regression test: the hook must handle multiple staged files
+        // without breaking. Previously `chaffra dead-code $STAGED` would
+        // expand to multiple arguments when multiple files were staged,
+        // but dead-code only accepts a single path argument.
+        let script = hook_script();
+
+        // The script must NOT pass $STAGED directly (unquoted expansion
+        // of multiple files as separate args to a single invocation).
+        assert!(
+            !script.contains("chaffra dead-code $STAGED"),
+            "must not pass $STAGED directly — breaks with multiple files"
+        );
+
+        // It must use a for-loop to iterate files one at a time.
+        assert!(
+            script.contains("for file in $STAGED"),
+            "must iterate staged files with a for loop"
+        );
+        assert!(
+            script.contains("chaffra dead-code \"$file\""),
+            "must invoke dead-code once per file with quoted path"
+        );
+
+        // It must aggregate failures: a non-zero exit from any file
+        // should ultimately cause the hook to exit non-zero.
+        assert!(
+            script.contains("FAIL=0"),
+            "must initialize failure accumulator"
+        );
+        assert!(script.contains("|| FAIL=1"), "must record per-file failure");
+        assert!(
+            script.contains("if [ $FAIL -ne 0 ]"),
+            "must check accumulated failures before exiting"
+        );
+
+        // The script must NOT use `set -e` since we need the for-loop
+        // to continue after a non-zero exit from chaffra.
+        assert!(
+            !script.contains("set -e"),
+            "must not use set -e — it would abort on first failure in the loop"
+        );
     }
 
     #[test]
