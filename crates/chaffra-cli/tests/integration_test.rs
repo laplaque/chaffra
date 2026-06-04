@@ -917,11 +917,11 @@ fn test_hook_script_scopes_to_staged_files_integration() {
     let script = chaffra_autofix::hooks::hook_script();
     assert!(
         script.contains("for file in $STAGED"),
-        "hook must iterate through staged files"
+        "hook must iterate staged files individually"
     );
     assert!(
         script.contains("chaffra dead-code \"$file\""),
-        "hook must scope analysis to each staged file path"
+        "hook must pass each staged file to chaffra dead-code"
     );
     assert!(
         !script.contains("chaffra dead-code ."),
