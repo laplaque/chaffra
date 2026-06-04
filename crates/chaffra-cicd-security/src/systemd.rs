@@ -146,12 +146,20 @@ fn check_hardening(
     }
 }
 
-fn find_line_number(content: &str, needle: &str) -> u32 {
-    if let Some(pos) = content.find(needle) {
+/// Find the 1-based line number of a substring in content, searching from `from` byte offset.
+fn find_line_number_from(content: &str, needle: &str, from: usize) -> u32 {
+    let search_start = from.min(content.len());
+    if let Some(pos) = content[search_start..].find(needle) {
+        content[..search_start + pos].matches('\n').count() as u32 + 1
+    } else if let Some(pos) = content.find(needle) {
         content[..pos].matches('\n').count() as u32 + 1
     } else {
         1
     }
+}
+
+fn find_line_number(content: &str, needle: &str) -> u32 {
+    find_line_number_from(content, needle, 0)
 }
 
 #[cfg(test)]

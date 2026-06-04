@@ -7,7 +7,7 @@
 
 use chaffra_core::diagnostic::{Finding, Location, Severity};
 use chaffra_core::error::Result;
-use serde_yaml::Value;
+use serde_yaml_ng::Value;
 use std::collections::HashMap;
 
 /// Sensitive host paths that should not be mounted.
@@ -24,7 +24,7 @@ const SENSITIVE_PATHS: &[&str] = &[
 
 /// Analyze a Docker Compose file.
 pub fn analyze(path: &str, content: &str, findings: &mut Vec<Finding>) -> Result<()> {
-    let doc: Value = serde_yaml::from_str(content)
+    let doc: Value = serde_yaml_ng::from_str(content)
         .map_err(|e| chaffra_core::error::ChaffraError::Parse(format!("YAML parse error: {e}")))?;
 
     let services = match doc.get("services") {
@@ -166,8 +166,18 @@ fn is_sensitive_path(host_path: &str) -> bool {
     })
 }
 
-fn find_line_for_service(content: &str, _service_name: &str, keyword: &str) -> u32 {
-    if let Some(pos) = content.find(keyword) {
+/// Find the 1-based line number of `keyword` within the scope of `service_name`.
+///
+/// Searches for `keyword` starting from the position of `service_name:` in the content,
+/// so that repeated keywords across different services resolve to the correct line.
+fn find_line_for_service(content: &str, service_name: &str, keyword: &str) -> u32 {
+    // Find the service definition (e.g. "  app:" or "  db:")
+    let service_marker = format!("{service_name}:");
+    let search_start = content.find(&service_marker).unwrap_or(0);
+    if let Some(pos) = content[search_start..].find(keyword) {
+        content[..search_start + pos].matches('\n').count() as u32 + 1
+    } else if let Some(pos) = content.find(keyword) {
+        // Fallback to global search
         content[..pos].matches('\n').count() as u32 + 1
     } else {
         1

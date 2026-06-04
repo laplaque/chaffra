@@ -8,12 +8,12 @@
 
 use chaffra_core::diagnostic::{Finding, Location, Severity};
 use chaffra_core::error::Result;
-use serde_yaml::Value;
+use serde_yaml_ng::Value;
 use std::collections::HashMap;
 
 /// Analyze a GitHub Actions workflow file.
 pub fn analyze(path: &str, content: &str, findings: &mut Vec<Finding>) -> Result<()> {
-    let doc: Value = serde_yaml::from_str(content)
+    let doc: Value = serde_yaml_ng::from_str(content)
         .map_err(|e| chaffra_core::error::ChaffraError::Parse(format!("YAML parse error: {e}")))?;
 
     check_dangerous_triggers(path, content, &doc, findings);
@@ -28,7 +28,7 @@ fn check_dangerous_triggers(path: &str, content: &str, doc: &Value, findings: &m
     let triggers = match doc.get("on") {
         Some(v) => v,
         None => match doc {
-            // serde_yaml 0.9 parses bare `on:` as boolean true key
+            // serde_yaml_ng 0.9 parses bare `on:` as boolean true key
             Value::Mapping(m) => match m.get(Value::Bool(true)) {
                 Some(v) => v,
                 None => return,
@@ -296,13 +296,22 @@ fn has_trigger(on_value: &Value, trigger: &str) -> bool {
     }
 }
 
-/// Find the 1-based line number of a substring in content.
-fn find_line_number(content: &str, needle: &str) -> u32 {
-    if let Some(pos) = content.find(needle) {
+/// Find the 1-based line number of a substring in content, searching from `from` byte offset.
+fn find_line_number_from(content: &str, needle: &str, from: usize) -> u32 {
+    let search_start = from.min(content.len());
+    if let Some(pos) = content[search_start..].find(needle) {
+        content[..search_start + pos].matches('\n').count() as u32 + 1
+    } else if let Some(pos) = content.find(needle) {
+        // Fallback to searching from the beginning
         content[..pos].matches('\n').count() as u32 + 1
     } else {
         1
     }
+}
+
+/// Find the 1-based line number of a substring in content (searches from beginning).
+fn find_line_number(content: &str, needle: &str) -> u32 {
+    find_line_number_from(content, needle, 0)
 }
 
 #[cfg(test)]
@@ -555,10 +564,10 @@ jobs:
 
     #[test]
     fn test_has_trigger_mapping() {
-        let mut map = serde_yaml::Mapping::new();
+        let mut map = serde_yaml_ng::Mapping::new();
         map.insert(
             Value::String("push".to_owned()),
-            Value::Mapping(serde_yaml::Mapping::new()),
+            Value::Mapping(serde_yaml_ng::Mapping::new()),
         );
         let val = Value::Mapping(map);
         assert!(has_trigger(&val, "push"));

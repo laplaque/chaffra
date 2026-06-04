@@ -494,11 +494,19 @@ fn collect_files(base: &Path, dir: &Path, ignore: &[String], out: &mut Vec<FileI
 
         if path.is_dir() {
             collect_files(base, &path, ignore, out);
-        } else if let Ok(content) = std::fs::read(&path) {
-            out.push(FileInfo {
-                path: rel_str.to_string(),
-                content,
-            });
+        } else {
+            // Check file type by path BEFORE reading content to avoid
+            // eagerly loading files we will never analyze.
+            let file_type = chaffra_cicd_security::detect::detect_file_type(&rel_str);
+            if file_type == chaffra_cicd_security::detect::CicdFileType::Unknown {
+                continue;
+            }
+            if let Ok(content) = std::fs::read(&path) {
+                out.push(FileInfo {
+                    path: rel_str.to_string(),
+                    content,
+                });
+            }
         }
     }
 }

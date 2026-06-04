@@ -8,12 +8,12 @@
 
 use chaffra_core::diagnostic::{Finding, Location, Severity};
 use chaffra_core::error::Result;
-use serde_yaml::Value;
+use serde_yaml_ng::Value;
 use std::collections::HashMap;
 
 /// Analyze a GitLab CI pipeline file.
 pub fn analyze(path: &str, content: &str, findings: &mut Vec<Finding>) -> Result<()> {
-    let doc: Value = serde_yaml::from_str(content)
+    let doc: Value = serde_yaml_ng::from_str(content)
         .map_err(|e| chaffra_core::error::ChaffraError::Parse(format!("YAML parse error: {e}")))?;
 
     check_includes(path, content, &doc, findings);
@@ -274,6 +274,10 @@ fn is_mutable_image(image: &str) -> bool {
 }
 
 fn is_gitlab_keyword(name: &str) -> bool {
+    // Dot-prefixed keys are hidden YAML anchor/template definitions, not jobs
+    if name.starts_with('.') {
+        return true;
+    }
     matches!(
         name,
         "image"
@@ -287,6 +291,23 @@ fn is_gitlab_keyword(name: &str) -> bool {
             | "after_script"
             | "cache"
             | "pages"
+            | "trigger"
+            | "rules"
+            | "artifacts"
+            | "needs"
+            | "extends"
+            | "retry"
+            | "interruptible"
+            | "timeout"
+            | "resource_group"
+            | "environment"
+            | "release"
+            | "secrets"
+            | "id_tokens"
+            | "when"
+            | "allow_failure"
+            | "parallel"
+            | "dependencies"
     )
 }
 
@@ -320,12 +341,20 @@ fn looks_like_secret(name: &str, value: &str) -> bool {
     value.len() >= 8
 }
 
-fn find_line_number(content: &str, needle: &str) -> u32 {
-    if let Some(pos) = content.find(needle) {
+/// Find the 1-based line number of a substring in content, searching from `from` byte offset.
+fn find_line_number_from(content: &str, needle: &str, from: usize) -> u32 {
+    let search_start = from.min(content.len());
+    if let Some(pos) = content[search_start..].find(needle) {
+        content[..search_start + pos].matches('\n').count() as u32 + 1
+    } else if let Some(pos) = content.find(needle) {
         content[..pos].matches('\n').count() as u32 + 1
     } else {
         1
     }
+}
+
+fn find_line_number(content: &str, needle: &str) -> u32 {
+    find_line_number_from(content, needle, 0)
 }
 
 #[cfg(test)]
@@ -533,6 +562,27 @@ test:
         assert!(is_gitlab_keyword("image"));
         assert!(is_gitlab_keyword("stages"));
         assert!(is_gitlab_keyword("variables"));
+        assert!(is_gitlab_keyword("trigger"));
+        assert!(is_gitlab_keyword("rules"));
+        assert!(is_gitlab_keyword("artifacts"));
+        assert!(is_gitlab_keyword("needs"));
+        assert!(is_gitlab_keyword("extends"));
+        assert!(is_gitlab_keyword("retry"));
+        assert!(is_gitlab_keyword("interruptible"));
+        assert!(is_gitlab_keyword("timeout"));
+        assert!(is_gitlab_keyword("resource_group"));
+        assert!(is_gitlab_keyword("environment"));
+        assert!(is_gitlab_keyword("release"));
+        assert!(is_gitlab_keyword("secrets"));
+        assert!(is_gitlab_keyword("id_tokens"));
+        assert!(is_gitlab_keyword("when"));
+        assert!(is_gitlab_keyword("allow_failure"));
+        assert!(is_gitlab_keyword("parallel"));
+        assert!(is_gitlab_keyword("dependencies"));
+        // Dot-prefixed hidden keys (YAML anchors/templates)
+        assert!(is_gitlab_keyword(".template-base"));
+        assert!(is_gitlab_keyword(".shared-config"));
+        // Actual job names
         assert!(!is_gitlab_keyword("my-job"));
         assert!(!is_gitlab_keyword("deploy"));
     }

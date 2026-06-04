@@ -11,4 +11,4 @@ description = "CI/CD configuration security analysis: GitHub Actions, GitLab CI,
 chaffra-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml_ng = { workspace = true }

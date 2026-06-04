@@ -4,7 +4,7 @@ include:
   - remote: 'https://example.com/ci-templates/base.yml'
 
 variables:
-  API_KEY: "sk-1234567890abcdef1234567890abcdef"
+  API_KEY: "FAKE_KEY_FOR_TESTING_ONLY"
   APP_NAME: "my-app"
 
 stages:
