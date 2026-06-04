@@ -45,6 +45,9 @@ impl Severity {
 pub enum Language {
     Go,
     Python,
+    TypeScript,
+    JavaScript,
+    Java,
 }
 
 impl fmt::Display for Language {
@@ -52,6 +55,9 @@ impl fmt::Display for Language {
         match self {
             Language::Go => write!(f, "go"),
             Language::Python => write!(f, "python"),
+            Language::TypeScript => write!(f, "typescript"),
+            Language::JavaScript => write!(f, "javascript"),
+            Language::Java => write!(f, "java"),
         }
     }
 }
@@ -62,6 +68,9 @@ impl Language {
         match ext {
             "go" => Some(Language::Go),
             "py" => Some(Language::Python),
+            "ts" | "tsx" => Some(Language::TypeScript),
+            "js" | "jsx" => Some(Language::JavaScript),
+            "java" => Some(Language::Java),
             _ => None,
         }
     }
@@ -301,6 +310,9 @@ mod tests {
     fn test_language_display() {
         assert_eq!(Language::Go.to_string(), "go");
         assert_eq!(Language::Python.to_string(), "python");
+        assert_eq!(Language::TypeScript.to_string(), "typescript");
+        assert_eq!(Language::JavaScript.to_string(), "javascript");
+        assert_eq!(Language::Java.to_string(), "java");
     }
 
     #[test]
@@ -308,8 +320,13 @@ mod tests {
         let cases = vec![
             ("go", Some(Language::Go)),
             ("py", Some(Language::Python)),
+            ("ts", Some(Language::TypeScript)),
+            ("tsx", Some(Language::TypeScript)),
+            ("js", Some(Language::JavaScript)),
+            ("jsx", Some(Language::JavaScript)),
+            ("java", Some(Language::Java)),
             ("rs", None),
-            ("js", None),
+            ("rb", None),
         ];
         for (ext, expected) in cases {
             assert_eq!(Language::from_extension(ext), expected, "ext: {ext}");

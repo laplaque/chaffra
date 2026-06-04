@@ -1,4 +1,4 @@
-//! Tree-sitter parser wrapper supporting Go and Python.
+//! Tree-sitter parser wrapper supporting Go, Python, TypeScript, JavaScript, and Java.
 
 use chaffra_core::diagnostic::Language;
 use chaffra_core::error::{ChaffraError, Result};
@@ -10,6 +10,9 @@ pub fn parse(source: &[u8], language: Language) -> Result<Tree> {
     let ts_language = match language {
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
+        // TypeScript uses the JavaScript grammar (covers TS/JSX/TSX superset).
+        Language::TypeScript | Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
     };
     parser
         .set_language(&ts_language)
@@ -43,7 +46,6 @@ mod tests {
         let src = b"package main\n\nfunc Add(a, b int) int {\n    return a + b\n}\n";
         let tree = parse(src, Language::Go).unwrap();
         let root = tree.root_node();
-        // Find function_declaration node
         let mut found_func = false;
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
@@ -67,5 +69,26 @@ mod tests {
             }
         }
         assert!(found_class, "should find class_definition node");
+    }
+
+    #[test]
+    fn test_parse_javascript() {
+        let src = b"function hello() { return 42; }\n";
+        let tree = parse(src, Language::JavaScript).unwrap();
+        assert_eq!(tree.root_node().kind(), "program");
+    }
+
+    #[test]
+    fn test_parse_typescript() {
+        let src = b"function greet(name) { return name; }\n";
+        let tree = parse(src, Language::TypeScript).unwrap();
+        assert_eq!(tree.root_node().kind(), "program");
+    }
+
+    #[test]
+    fn test_parse_java() {
+        let src = b"public class Main { public static void main(String[] args) {} }\n";
+        let tree = parse(src, Language::Java).unwrap();
+        assert_eq!(tree.root_node().kind(), "program");
     }
 }

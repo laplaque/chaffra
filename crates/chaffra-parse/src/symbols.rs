@@ -70,6 +70,8 @@ pub fn extract_symbols(tree: &Tree, source: &[u8], language: Language, file: &st
     match language {
         Language::Go => extract_go_symbols(root, source, file),
         Language::Python => extract_python_symbols(root, source, file),
+        Language::TypeScript | Language::JavaScript => extract_js_symbols(root, source, file),
+        Language::Java => extract_java_symbols(root, source, file),
     }
 }
 
@@ -79,6 +81,8 @@ pub fn extract_imports(tree: &Tree, source: &[u8], language: Language) -> Vec<Im
     match language {
         Language::Go => extract_go_imports(root, source),
         Language::Python => extract_python_imports(root, source),
+        Language::TypeScript | Language::JavaScript => extract_js_imports(root, source),
+        Language::Java => extract_java_imports(root, source),
     }
 }
 
@@ -329,9 +333,6 @@ fn extract_python_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
                 }
             }
             "import_from_statement" => {
-                // from X import Y, Z
-                // The module path is the dotted_name/relative_import after "from"
-                // and before "import". Imported names come after "import".
                 let mut path = String::new();
                 let mut names = Vec::new();
                 let mut seen_import_keyword = false;
@@ -340,30 +341,25 @@ fn extract_python_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
                     if inner.kind() == "import" {
                         seen_import_keyword = true;
                     } else if !seen_import_keyword {
-                        // Before "import" keyword -- module path.
                         if inner.kind() == "dotted_name" || inner.kind() == "relative_import" {
                             path = node_text(inner, source);
                         }
-                    } else {
-                        // After "import" keyword -- imported names.
-                        if inner.kind() == "aliased_import" {
-                            // from X import Y as Z — use Z (the alias) as the local name
-                            let mut orig = String::new();
-                            let mut alias_name = None;
-                            let mut alias_inner = inner.walk();
-                            for a in inner.children(&mut alias_inner) {
-                                if a.kind() == "dotted_name" || a.kind() == "identifier" {
-                                    if orig.is_empty() {
-                                        orig = node_text(a, source);
-                                    } else {
-                                        alias_name = Some(node_text(a, source));
-                                    }
+                    } else if inner.kind() == "aliased_import" {
+                        let mut orig = String::new();
+                        let mut alias_name = None;
+                        let mut alias_inner = inner.walk();
+                        for a in inner.children(&mut alias_inner) {
+                            if a.kind() == "dotted_name" || a.kind() == "identifier" {
+                                if orig.is_empty() {
+                                    orig = node_text(a, source);
+                                } else {
+                                    alias_name = Some(node_text(a, source));
                                 }
                             }
-                            names.push(alias_name.unwrap_or(orig));
-                        } else if inner.kind() == "dotted_name" || inner.kind() == "identifier" {
-                            names.push(node_text(inner, source));
                         }
+                        names.push(alias_name.unwrap_or(orig));
+                    } else if inner.kind() == "dotted_name" || inner.kind() == "identifier" {
+                        names.push(node_text(inner, source));
                     }
                 }
                 if !path.is_empty() {
@@ -376,6 +372,266 @@ fn extract_python_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
                 }
             }
             _ => {}
+        }
+    }
+    imports
+}
+
+// --- JavaScript/TypeScript symbol extraction ---
+
+fn extract_js_symbols(root: Node<'_>, source: &[u8], file: &str) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    extract_js_symbols_recursive(root, source, file, &mut symbols);
+    symbols
+}
+
+fn extract_js_symbols_recursive(
+    node: Node<'_>,
+    source: &[u8],
+    file: &str,
+    symbols: &mut Vec<Symbol>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(name_node, source);
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Function,
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        exported: false, // updated below if in export_statement
+                        file: file.to_owned(),
+                    });
+                }
+            }
+            "class_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(name_node, source);
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Type,
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        exported: false,
+                        file: file.to_owned(),
+                    });
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                // const foo = ... / let bar = ... / var baz = ...
+                let mut inner = child.walk();
+                for decl in child.children(&mut inner) {
+                    if decl.kind() == "variable_declarator" {
+                        if let Some(name_node) = decl.child_by_field_name("name") {
+                            if name_node.kind() == "identifier" {
+                                let name = node_text(name_node, source);
+                                // Check if the value is an arrow function or function expression.
+                                let is_func = decl
+                                    .child_by_field_name("value")
+                                    .map(|v| {
+                                        v.kind() == "arrow_function"
+                                            || v.kind() == "function_expression"
+                                            || v.kind() == "function"
+                                    })
+                                    .unwrap_or(false);
+                                let kind = if is_func {
+                                    SymbolKind::Function
+                                } else {
+                                    SymbolKind::Variable
+                                };
+                                symbols.push(Symbol {
+                                    name,
+                                    kind,
+                                    start_line: decl.start_position().row as u32 + 1,
+                                    end_line: decl.end_position().row as u32 + 1,
+                                    exported: false,
+                                    file: file.to_owned(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "export_statement" => {
+                // Recurse into the export to find the actual declaration.
+                let before_count = symbols.len();
+                extract_js_symbols_recursive(child, source, file, symbols);
+                // Mark everything found inside the export as exported.
+                for sym in &mut symbols[before_count..] {
+                    sym.exported = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_js_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        if child.kind() == "import_statement" {
+            let mut path = String::new();
+            let mut names = Vec::new();
+
+            let mut inner = child.walk();
+            for part in child.children(&mut inner) {
+                if part.kind() == "string" {
+                    path = node_text(part, source);
+                    path = path.trim_matches(|c| c == '"' || c == '\'').to_owned();
+                } else if part.kind() == "import_clause" {
+                    collect_js_import_names(part, source, &mut names);
+                }
+            }
+
+            if !path.is_empty() {
+                imports.push(ImportInfo {
+                    path,
+                    alias: None,
+                    names,
+                    line: child.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
+    imports
+}
+
+fn collect_js_import_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                names.push(node_text(child, source));
+            }
+            "named_imports" => {
+                let mut inner = child.walk();
+                for spec in child.children(&mut inner) {
+                    if spec.kind() == "import_specifier" {
+                        // Use alias if present, otherwise the name.
+                        let alias_node = spec.child_by_field_name("alias");
+                        let name_node = spec.child_by_field_name("name");
+                        if let Some(alias) = alias_node {
+                            names.push(node_text(alias, source));
+                        } else if let Some(name) = name_node {
+                            names.push(node_text(name, source));
+                        }
+                    }
+                }
+            }
+            "namespace_import" => {
+                // import * as foo
+                let mut inner = child.walk();
+                for part in child.children(&mut inner) {
+                    if part.kind() == "identifier" {
+                        names.push(node_text(part, source));
+                    }
+                }
+            }
+            _ => {
+                collect_js_import_names(child, source, names);
+            }
+        }
+    }
+}
+
+// --- Java symbol extraction ---
+
+fn extract_java_symbols(root: Node<'_>, source: &[u8], file: &str) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    extract_java_symbols_recursive(root, source, file, &mut symbols);
+    symbols
+}
+
+fn extract_java_symbols_recursive(
+    node: Node<'_>,
+    source: &[u8],
+    file: &str,
+    symbols: &mut Vec<Symbol>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "class_declaration" | "interface_declaration" | "enum_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(name_node, source);
+                    let exported = has_java_modifier(child, source, "public");
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Type,
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        exported,
+                        file: file.to_owned(),
+                    });
+                }
+                // Recurse into body for inner classes and methods.
+                if let Some(body) = child.child_by_field_name("body") {
+                    extract_java_symbols_recursive(body, source, file, symbols);
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(name_node, source);
+                    let exported = has_java_modifier(child, source, "public");
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Function,
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        exported,
+                        file: file.to_owned(),
+                    });
+                }
+            }
+            _ => {
+                extract_java_symbols_recursive(child, source, file, symbols);
+            }
+        }
+    }
+}
+
+fn has_java_modifier(node: Node<'_>, source: &[u8], modifier: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let text = node_text(child, source);
+            return text.contains(modifier);
+        }
+    }
+    false
+}
+
+fn extract_java_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        if child.kind() == "import_declaration" {
+            let text = node_text(child, source);
+            // Extract the path: "import foo.bar.Baz;" -> "foo.bar.Baz"
+            let path = text
+                .trim()
+                .strip_prefix("import ")
+                .unwrap_or("")
+                .strip_prefix("static ")
+                .unwrap_or_else(|| text.trim().strip_prefix("import ").unwrap_or(""))
+                .trim_end_matches(';')
+                .trim()
+                .to_owned();
+
+            if !path.is_empty() {
+                imports.push(ImportInfo {
+                    path,
+                    alias: None,
+                    names: Vec::new(),
+                    line: child.start_position().row as u32 + 1,
+                });
+            }
         }
     }
     imports
@@ -440,6 +696,33 @@ fn is_definition_name(node: Node<'_>, language: Language) -> bool {
             }
             Language::Python => {
                 if matches!(parent_kind, "function_definition" | "class_definition") {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        return name_node.id() == node.id();
+                    }
+                }
+            }
+            Language::TypeScript | Language::JavaScript => {
+                if matches!(
+                    parent_kind,
+                    "function_declaration"
+                        | "class_declaration"
+                        | "variable_declarator"
+                        | "method_definition"
+                ) {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        return name_node.id() == node.id();
+                    }
+                }
+            }
+            Language::Java => {
+                if matches!(
+                    parent_kind,
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "method_declaration"
+                        | "constructor_declaration"
+                ) {
                     if let Some(name_node) = parent.child_by_field_name("name") {
                         return name_node.id() == node.id();
                     }
@@ -520,7 +803,6 @@ mod tests {
         let src = b"class MyClass:\n    def method(self):\n        pass\n";
         let tree = parser::parse(src, Language::Python).unwrap();
         let symbols = extract_symbols(&tree, src, Language::Python, "app.py");
-        // Should find the class at top level.
         let class = symbols.iter().find(|s| s.name == "MyClass").unwrap();
         assert_eq!(class.kind, SymbolKind::Type);
         assert!(class.exported);
@@ -691,5 +973,114 @@ mod tests {
         assert_eq!(SymbolKind::Type.to_string(), "type");
         assert_eq!(SymbolKind::Import.to_string(), "import");
         assert_eq!(SymbolKind::Variable.to_string(), "variable");
+    }
+
+    // --- JavaScript/TypeScript tests ---
+
+    #[test]
+    fn test_extract_js_functions() {
+        let src = b"function hello() { return 1; }\nfunction world() {}\n";
+        let tree = parser::parse(src, Language::JavaScript).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::JavaScript, "app.js");
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "hello");
+        assert_eq!(symbols[0].kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_extract_js_class() {
+        let src = b"class MyComponent { render() {} }\n";
+        let tree = parser::parse(src, Language::JavaScript).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::JavaScript, "app.js");
+        let cls = symbols.iter().find(|s| s.name == "MyComponent").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Type);
+    }
+
+    #[test]
+    fn test_extract_js_arrow_function() {
+        let src = b"const greet = (name) => `hello ${name}`;\n";
+        let tree = parser::parse(src, Language::JavaScript).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::JavaScript, "app.js");
+        let greet = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(greet.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_extract_js_imports() {
+        let src = b"import { useState } from 'react';\n";
+        let tree = parser::parse(src, Language::JavaScript).unwrap();
+        let imports = extract_imports(&tree, src, Language::JavaScript);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].path, "react");
+        assert!(imports[0].names.contains(&"useState".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_js_exported_function() {
+        let src = b"export function fetchData() { return null; }\nfunction helper() {}\n";
+        let tree = parser::parse(src, Language::JavaScript).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::JavaScript, "api.js");
+        let fetch = symbols.iter().find(|s| s.name == "fetchData").unwrap();
+        assert!(
+            fetch.exported,
+            "exported function should be marked exported"
+        );
+        let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+        assert!(
+            !helper.exported,
+            "non-exported function should not be marked exported"
+        );
+    }
+
+    #[test]
+    fn test_extract_js_references() {
+        let src = b"function main() { console.log(hello()); }\nfunction hello() { return 1; }\n";
+        let tree = parser::parse(src, Language::JavaScript).unwrap();
+        let refs = extract_references(&tree, src, Language::JavaScript, "app.js");
+        let has_hello = refs.iter().any(|r| r.name == "hello");
+        assert!(has_hello, "should reference hello");
+    }
+
+    // --- Java tests ---
+
+    #[test]
+    fn test_extract_java_class() {
+        let src = b"public class Main { public static void main(String[] args) {} }\n";
+        let tree = parser::parse(src, Language::Java).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Java, "Main.java");
+        let cls = symbols.iter().find(|s| s.name == "Main").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Type);
+        assert!(cls.exported);
+    }
+
+    #[test]
+    fn test_extract_java_methods() {
+        let src = b"public class Calc {\n  public int add(int a, int b) { return a + b; }\n  private int sub(int a, int b) { return a - b; }\n}\n";
+        let tree = parser::parse(src, Language::Java).unwrap();
+        let symbols = extract_symbols(&tree, src, Language::Java, "Calc.java");
+        let add = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(add.kind, SymbolKind::Function);
+        assert!(add.exported);
+        let sub = symbols.iter().find(|s| s.name == "sub").unwrap();
+        assert!(!sub.exported);
+    }
+
+    #[test]
+    fn test_extract_java_imports() {
+        let src = b"import java.util.List;\nimport java.io.File;\n\npublic class App {}\n";
+        let tree = parser::parse(src, Language::Java).unwrap();
+        let imports = extract_imports(&tree, src, Language::Java);
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].path, "java.util.List");
+        assert_eq!(imports[1].path, "java.io.File");
+    }
+
+    #[test]
+    fn test_extract_java_references() {
+        let src = b"public class App { void run() { System.out.println(\"hi\"); } }\n";
+        let tree = parser::parse(src, Language::Java).unwrap();
+        let refs = extract_references(&tree, src, Language::Java, "App.java");
+        let has_system = refs.iter().any(|r| r.name == "System");
+        assert!(has_system, "should reference System");
     }
 }
