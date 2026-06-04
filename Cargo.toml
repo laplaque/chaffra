@@ -31,7 +31,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-tree-sitter = "0.24"
+tree-sitter = "0.26"
 gix = { version = "0.72", default-features = false, features = ["max-performance-safe"] }
 tonic = "0.13"
 prost = "0.13"
