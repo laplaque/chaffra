@@ -6,6 +6,7 @@ use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::module::ModuleHost;
 use chaffra_deadcode::DeadCodeModule;
+use chaffra_frameworks::FrameworksModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use chaffra_security::SecurityModule;
 use clap::{Parser, Subcommand};
@@ -93,6 +94,7 @@ fn build_module_host() -> ModuleHost {
     let _ = host.register(Box::new(DeadCodeModule::new()));
     let _ = host.register(Box::new(ComplexityModule::new()));
     let _ = host.register(Box::new(SecurityModule::new()));
+    let _ = host.register(Box::new(FrameworksModule::new()));
     host
 }
 
@@ -402,11 +404,12 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 3);
+        assert_eq!(modules.len(), 4);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
         assert!(ids.contains(&"security"));
+        assert!(ids.contains(&"frameworks"));
     }
 
     #[test]
@@ -618,6 +621,10 @@ mod tests {
             "should list complexity module"
         );
         assert!(output.contains("security"), "should list security module");
+        assert!(
+            output.contains("frameworks"),
+            "should list frameworks module"
+        );
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
         assert!(output.contains("Rules:"));

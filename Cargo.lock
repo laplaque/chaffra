@@ -242,6 +242,7 @@ dependencies = [
  "chaffra-core",
  "chaffra-deadcode",
  "chaffra-duplication",
+ "chaffra-frameworks",
  "chaffra-health",
  "chaffra-hotspot",
  "chaffra-mcp",
@@ -295,6 +296,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chaffra-frameworks"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "chaffra-parse",
+ "serde",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-python",
+]
+
+[[package]]
 name = "chaffra-health"
 version = "0.1.0"
 dependencies = [
@@ -344,10 +358,17 @@ dependencies = [
 name = "chaffra-plugin"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chaffra-core",
+ "http",
+ "http-body-util",
  "prost",
+ "serde",
+ "thiserror",
  "tokio",
+ "toml",
  "tonic",
+ "tower",
 ]
 
 [[package]]

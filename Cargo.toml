@@ -14,6 +14,7 @@ members = [
     "crates/chaffra-output",
     "crates/chaffra-mcp",
     "crates/chaffra-plugin",
+    "crates/chaffra-frameworks",
     "crates/chaffra-cli",
 ]
 
@@ -54,3 +55,4 @@ chaffra-output = { path = "crates/chaffra-output" }
 chaffra-mcp = { path = "crates/chaffra-mcp" }
 chaffra-plugin = { path = "crates/chaffra-plugin" }
 chaffra-security = { path = "crates/chaffra-security" }
+chaffra-frameworks = { path = "crates/chaffra-frameworks" }
