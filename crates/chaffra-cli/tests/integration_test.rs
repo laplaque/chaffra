@@ -1,13 +1,15 @@
-//! Integration tests for chaffra modules.
+//! Integration tests for chaffra modules (Phase 1 + Phase 8 + Phase 9).
 //!
 //! Tests use Go and Python fixtures under `tests/fixtures/`.
 
+use chaffra_autofix::{AutofixModule, apply_fixes_to_files, collect_fixable, orchestrate_fixes};
 use chaffra_complexity::{ComplexityModule, analyze_project_health};
 use chaffra_core::config::ChaffraConfig;
 use chaffra_core::diagnostic::{FileInfo, HealthGrade};
 use chaffra_core::module::{AnalysisModule, ModuleHost};
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_frameworks::FrameworksModule;
+use chaffra_tui::App;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -557,4 +559,316 @@ port = 50052
     assert_eq!(modules[2].id, "django");
     assert_eq!(modules[2].mode, TransportMode::Container);
     assert_eq!(modules[2].port, Some(50052));
+}
+
+// --- Phase 8: Autofix integration tests ---
+
+#[test]
+fn test_autofix_module_registration() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(DeadCodeModule::new())).unwrap();
+    host.register(Box::new(ComplexityModule::new())).unwrap();
+    host.register(Box::new(AutofixModule::new())).unwrap();
+
+    let modules = host.list();
+    assert_eq!(modules.len(), 3);
+
+    let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"autofix"));
+}
+
+#[test]
+fn test_autofix_explain_rules() {
+    let mut host = ModuleHost::new();
+    host.register(Box::new(AutofixModule::new())).unwrap();
+
+    let cases = vec!["fix-applied", "fix-conflict", "fix-skipped"];
+    for rule_id in cases {
+        let explanation = host.explain(&format!("autofix:{rule_id}")).unwrap();
+        assert_eq!(explanation.rule_id, rule_id);
+        assert!(!explanation.description.is_empty());
+    }
+}
+
+#[test]
+fn test_autofix_collect_fixable_from_dead_code() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let fixable = collect_fixable(&result.findings);
+    // There should be fixable findings (unused function, unused import, etc.)
+    assert!(
+        !fixable.is_empty(),
+        "dead-code module should produce fixable findings"
+    );
+
+    // All fixable findings should have auto_fixable actions.
+    for finding in &fixable {
+        assert!(
+            finding.actions.iter().any(|a| a.auto_fixable),
+            "fixable finding should have an auto_fixable action"
+        );
+    }
+}
+
+#[test]
+fn test_autofix_dry_run_on_real_findings() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let fixable: Vec<_> = collect_fixable(&result.findings)
+        .into_iter()
+        .cloned()
+        .collect();
+    if fixable.is_empty() {
+        return; // No fixable findings; skip.
+    }
+
+    let results = orchestrate_fixes(&fixable, true).unwrap();
+    assert_eq!(results.len(), fixable.len());
+
+    // All should be dry-run (not applied).
+    for r in &results {
+        assert!(!r.applied, "dry run should not apply fixes");
+        assert!(
+            r.reason == "dry run" || r.reason.contains("overlapping"),
+            "unexpected reason: {}",
+            r.reason
+        );
+    }
+}
+
+#[test]
+fn test_autofix_apply_to_content() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    // Get one fixable finding for unused import.
+    let unused_imports: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "unused-import")
+        .cloned()
+        .collect();
+    if unused_imports.is_empty() {
+        return;
+    }
+
+    let fix_results = orchestrate_fixes(&unused_imports, false).unwrap();
+
+    // Build file contents from fixtures.
+    let mut file_contents = HashMap::new();
+    for file in &files {
+        let content = String::from_utf8_lossy(&file.content).to_string();
+        file_contents.insert(file.path.clone(), content);
+    }
+
+    let new_contents = apply_fixes_to_files(&file_contents, &fix_results);
+
+    // If any fixes were applied, the file content should be different.
+    let any_applied = fix_results.iter().any(|r| r.applied);
+    if any_applied {
+        assert!(
+            !new_contents.is_empty(),
+            "applied fixes should produce new content"
+        );
+    }
+}
+
+#[test]
+fn test_autofix_conflict_detection() {
+    use chaffra_core::diagnostic::{Action, Finding, Location, Severity, TextEdit};
+
+    // Create two findings that overlap in the same file.
+    let findings = vec![
+        Finding {
+            rule_id: "rule-a".to_owned(),
+            message: "finding a".to_owned(),
+            severity: Severity::Warning,
+            location: Location {
+                file: "test.go".to_owned(),
+                start_line: 5,
+                end_line: 10,
+                start_column: 0,
+                end_column: 0,
+            },
+            confidence: 1.0,
+            actions: vec![Action {
+                description: "fix a".to_owned(),
+                auto_fixable: true,
+                edits: vec![TextEdit {
+                    file: "test.go".to_owned(),
+                    start_line: 5,
+                    end_line: 10,
+                    new_text: String::new(),
+                }],
+            }],
+            metadata: HashMap::new(),
+        },
+        Finding {
+            rule_id: "rule-b".to_owned(),
+            message: "finding b".to_owned(),
+            severity: Severity::Warning,
+            location: Location {
+                file: "test.go".to_owned(),
+                start_line: 8,
+                end_line: 12,
+                start_column: 0,
+                end_column: 0,
+            },
+            confidence: 1.0,
+            actions: vec![Action {
+                description: "fix b".to_owned(),
+                auto_fixable: true,
+                edits: vec![TextEdit {
+                    file: "test.go".to_owned(),
+                    start_line: 8,
+                    end_line: 12,
+                    new_text: String::new(),
+                }],
+            }],
+            metadata: HashMap::new(),
+        },
+    ];
+
+    let results = orchestrate_fixes(&findings, false).unwrap();
+    assert_eq!(results.len(), 2);
+    // Both should be skipped due to conflict.
+    assert!(!results[0].applied);
+    assert!(!results[1].applied);
+    assert!(results[0].reason.contains("overlapping"));
+    assert!(results[1].reason.contains("overlapping"));
+}
+
+// --- Phase 8: Hooks integration tests ---
+
+#[test]
+fn test_hooks_install_and_uninstall() {
+    use chaffra_autofix::hooks;
+    use tempfile::TempDir;
+
+    let repo = TempDir::new().unwrap();
+    let hooks_dir = repo.path().join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+
+    // Install.
+    let result = hooks::install_hook(repo.path()).unwrap();
+    assert_eq!(result, hooks::HookResult::Installed);
+    assert!(hooks::is_hook_installed(repo.path()));
+
+    // Idempotent.
+    let result = hooks::install_hook(repo.path()).unwrap();
+    assert_eq!(result, hooks::HookResult::AlreadyInstalled);
+
+    // Uninstall.
+    let result = hooks::uninstall_hook(repo.path()).unwrap();
+    assert_eq!(result, hooks::HookResult::Uninstalled);
+    assert!(!hooks::is_hook_installed(repo.path()));
+}
+
+// --- Phase 8: TUI integration tests ---
+
+#[test]
+fn test_tui_app_with_real_findings() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let app = App::new(result.findings.clone());
+    assert_eq!(app.visible_count(), result.findings.len());
+
+    // Grouped by file should have entries.
+    let groups = app.grouped_findings();
+    assert!(!groups.is_empty());
+}
+
+#[test]
+fn test_tui_navigation_with_findings() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let mut app = App::new(result.findings);
+    assert_eq!(app.selected, 0);
+
+    app.handle_key('j'); // Move down.
+    if app.visible_count() > 1 {
+        assert_eq!(app.selected, 1);
+    }
+
+    app.handle_key('G'); // Move to end.
+    assert_eq!(app.selected, app.visible_count().saturating_sub(1));
+
+    app.handle_key('g'); // Move to top.
+    assert_eq!(app.selected, 0);
+}
+
+#[test]
+fn test_tui_severity_filtering() {
+    use chaffra_core::diagnostic::Severity;
+
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let mut app = App::new(result.findings);
+    let total = app.visible_count();
+
+    // Toggle off info severity.
+    app.toggle_severity(Severity::Info);
+    let after_toggle = app.visible_count();
+    assert!(after_toggle <= total);
+
+    // Toggle it back on.
+    app.toggle_severity(Severity::Info);
+    assert_eq!(app.visible_count(), total);
+}
+
+#[test]
+fn test_tui_grouping_modes() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let mut app = App::new(result.findings);
+
+    // Default: group by file.
+    let by_file_count = app.grouped_findings().len();
+
+    // Cycle to rule.
+    app.cycle_group();
+    let by_rule_count = app.grouped_findings().len();
+
+    // Cycle to severity.
+    app.cycle_group();
+    let by_severity_count = app.grouped_findings().len();
+
+    // Different groupings should produce groups.
+    assert!(by_file_count > 0);
+    assert!(by_rule_count > 0);
+    assert!(by_severity_count > 0);
+}
+
+#[test]
+fn test_tui_fix_action() {
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    let mut app = App::new(result.findings);
+
+    // Navigate to a fixable finding and press 'f'.
+    let fixable_idx = app
+        .visible_findings()
+        .iter()
+        .position(|f| f.actions.iter().any(|a| a.auto_fixable));
+
+    if let Some(idx) = fixable_idx {
+        app.selected = idx;
+        app.handle_key('f');
+        assert!(!app.pending_actions.is_empty(), "should queue a fix action");
+    }
 }
