@@ -7,6 +7,7 @@ use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::module::ModuleHost;
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_output::{OutputFormat, create_formatter};
+use chaffra_security::SecurityModule;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
@@ -57,6 +58,12 @@ enum Command {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Run security analysis: SAST, secret scanning, and dependency CVE checks.
+    Security {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
     /// Watch for file changes and re-run analysis incrementally.
     Watch {
         /// Path to the repository root (defaults to current directory).
@@ -85,6 +92,7 @@ fn build_module_host() -> ModuleHost {
     // Register built-in modules.
     let _ = host.register(Box::new(DeadCodeModule::new()));
     let _ = host.register(Box::new(ComplexityModule::new()));
+    let _ = host.register(Box::new(SecurityModule::new()));
     host
 }
 
@@ -140,6 +148,109 @@ fn cmd_dead_code(
     let host = build_module_host();
     let result = host.analyze("dead-code", &files, config)?;
     Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_security(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let mut files = discover_and_read_files(root, config);
+
+    discover_security_files(root, root, &mut files);
+
+    if files.is_empty() {
+        return Ok("No files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let result = host.analyze("security", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+const SECURITY_SCAN_EXTENSIONS: &[&str] = &[
+    "env",
+    "toml",
+    "yaml",
+    "yml",
+    "json",
+    "cfg",
+    "ini",
+    "conf",
+    "properties",
+];
+
+const MANIFEST_NAMES: &[&str] = &[
+    "go.mod",
+    "go.sum",
+    "requirements.txt",
+    "pyproject.toml",
+    "poetry.lock",
+    "Cargo.lock",
+    "Cargo.toml",
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "pubspec.lock",
+    "Gemfile.lock",
+];
+
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "vendor",
+    "__pycache__",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+];
+
+fn discover_security_files(root: &Path, dir: &Path, files: &mut Vec<FileInfo>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+
+        if path.is_dir() {
+            if SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            discover_security_files(root, &path, files);
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+
+            if files.iter().any(|f| f.path == rel) {
+                continue;
+            }
+
+            let is_manifest = MANIFEST_NAMES.iter().any(|m| name.as_ref() == *m);
+            let is_security_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| SECURITY_SCAN_EXTENSIONS.contains(&ext));
+            let is_dotenv = name.starts_with(".env");
+
+            if is_manifest || is_security_ext || is_dotenv {
+                if let Ok(content) = std::fs::read(&path) {
+                    if content.len() <= 10 * 1024 * 1024 {
+                        files.push(FileInfo { path: rel, content });
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn cmd_stub(_name: &str) -> String {
@@ -232,6 +343,12 @@ async fn main() -> Result<()> {
             print!("{}", cmd_dead_code(&root, &config, formatter.as_ref())?);
         }
 
+        Command::Security { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_security(&root, &config, formatter.as_ref())?);
+        }
+
         Command::Dupes { .. } => {
             print!("{}", cmd_stub("dupes"));
         }
@@ -285,10 +402,11 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 2);
+        assert_eq!(modules.len(), 3);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
+        assert!(ids.contains(&"security"));
     }
 
     #[test]
@@ -499,8 +617,119 @@ mod tests {
             output.contains("complexity"),
             "should list complexity module"
         );
+        assert!(output.contains("security"), "should list security module");
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
         assert!(output.contains("Rules:"));
+    }
+
+    // --- cmd_security tests ---
+
+    #[test]
+    fn test_cmd_security_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No files found.\n");
+    }
+
+    #[test]
+    fn test_cmd_security_with_fixtures() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/security/vulnerable");
+        if root.exists() {
+            let config = ChaffraConfig::default();
+            let formatter = create_formatter(OutputFormat::Terminal);
+            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            assert!(!output.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_cmd_security_json_format() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/security/vulnerable");
+        if root.exists() {
+            let config = ChaffraConfig::default();
+            let formatter = create_formatter(OutputFormat::Json);
+            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&output)
+                .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{output}"));
+            assert!(parsed.is_array() || parsed.is_object());
+        }
+    }
+
+    #[test]
+    fn test_cmd_security_clean_handler_no_false_positive() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/security/clean");
+        if root.exists() {
+            let config = ChaffraConfig::default();
+            let formatter = create_formatter(OutputFormat::Terminal);
+            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            assert!(
+                !output.contains("sql-injection")
+                    && !output.contains("command-injection")
+                    && !output.contains("xss")
+                    && !output.contains("ssrf")
+                    && !output.contains("path-traversal"),
+                "clean handlers should not produce SAST findings, got: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cmd_security_discovers_nested_manifests() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/security/nested");
+        if root.exists() {
+            let config = ChaffraConfig::default();
+            let formatter = create_formatter(OutputFormat::Terminal);
+            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            assert!(
+                !output.is_empty(),
+                "should discover files in nested directories"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cmd_security_discovers_dotenv_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nDB_PASSWORD=supersecret123\n",
+        )
+        .unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert!(
+            output.contains("hardcoded-secret") || output.contains("high-entropy"),
+            "should detect secrets in .env files, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_cmd_explain_sql_injection() {
+        let output = cmd_explain("security:sql-injection").unwrap();
+        assert!(output.contains("SQL injection"));
+        assert!(output.contains("Rationale:"));
+        assert!(output.contains("Examples:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_hardcoded_secret() {
+        let output = cmd_explain("security:hardcoded-secret").unwrap();
+        assert!(output.contains("Hardcoded secret"));
+        assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_vulnerable_dependency() {
+        let output = cmd_explain("security:vulnerable-dependency").unwrap();
+        assert!(output.contains("Vulnerable dependency"));
+        assert!(output.contains("Rationale:"));
     }
 }

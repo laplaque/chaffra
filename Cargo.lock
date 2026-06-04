@@ -248,6 +248,7 @@ dependencies = [
  "chaffra-output",
  "chaffra-parse",
  "chaffra-plugin",
+ "chaffra-security",
  "clap",
  "serde_json",
  "tempfile",
@@ -347,6 +348,18 @@ dependencies = [
  "prost",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "chaffra-security"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "chaffra-parse",
+ "regex",
+ "serde",
+ "serde_json",
+ "tree-sitter",
 ]
 
 [[package]]

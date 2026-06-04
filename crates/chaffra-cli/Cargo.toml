@@ -21,6 +21,7 @@ chaffra-duplication = { workspace = true }
 chaffra-arch = { workspace = true }
 chaffra-hotspot = { workspace = true }
 chaffra-audit = { workspace = true }
+chaffra-security = { workspace = true }
 chaffra-output = { workspace = true }
 chaffra-mcp = { workspace = true }
 chaffra-plugin = { workspace = true }
