@@ -6,6 +6,7 @@
 use chaffra_core::diagnostic::{AnalysisResult, Finding, ProjectHealth, Severity};
 
 pub mod annotations;
+pub mod badge;
 pub mod codeclimate;
 pub mod json;
 pub mod markdown;
@@ -21,6 +22,7 @@ pub enum OutputFormat {
     PrComment,
     Annotations,
     CodeClimate,
+    Badge,
 }
 
 impl OutputFormat {
@@ -35,6 +37,7 @@ impl OutputFormat {
             "codeclimate" | "code-climate" | "code_climate" | "gitlab" => {
                 Some(OutputFormat::CodeClimate)
             }
+            "badge" | "shields" => Some(OutputFormat::Badge),
             _ => None,
         }
     }
@@ -61,6 +64,7 @@ pub fn create_formatter(format: OutputFormat) -> Box<dyn Formatter> {
         OutputFormat::PrComment => Box::new(pr_comment::PrCommentFormatter),
         OutputFormat::Annotations => Box::new(annotations::AnnotationsFormatter),
         OutputFormat::CodeClimate => Box::new(codeclimate::CodeClimateFormatter),
+        OutputFormat::Badge => Box::new(badge::BadgeFormatter),
     }
 }
 
@@ -96,6 +100,8 @@ mod tests {
             ("code-climate", Some(OutputFormat::CodeClimate)),
             ("code_climate", Some(OutputFormat::CodeClimate)),
             ("gitlab", Some(OutputFormat::CodeClimate)),
+            ("badge", Some(OutputFormat::Badge)),
+            ("shields", Some(OutputFormat::Badge)),
             ("unknown", None),
         ];
         for (input, expected) in cases {
@@ -116,6 +122,7 @@ mod tests {
             OutputFormat::PrComment,
             OutputFormat::Annotations,
             OutputFormat::CodeClimate,
+            OutputFormat::Badge,
         ] {
             let formatter = create_formatter(fmt);
             let output = formatter.format_findings(&[]);
