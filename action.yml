@@ -1,0 +1,94 @@
+name: 'Chaffra Codebase Intelligence'
+description: 'Run chaffra analysis on your codebase: dead code, complexity, health, audit, and hotspots'
+branding:
+  icon: 'activity'
+  color: 'blue'
+
+inputs:
+  command:
+    description: 'Chaffra command to run (health, dead-code, audit, hotspot)'
+    required: false
+    default: 'health'
+  path:
+    description: 'Path to the repository root'
+    required: false
+    default: '.'
+  format:
+    description: 'Output format (terminal, json, markdown, pr-comment, annotations, codeclimate)'
+    required: false
+    default: 'annotations'
+  config:
+    description: 'Path to .chaffra.toml configuration file'
+    required: false
+    default: ''
+  version:
+    description: 'Chaffra version to install (or "latest")'
+    required: false
+    default: 'latest'
+
+outputs:
+  exit-code:
+    description: 'Exit code from chaffra (0 = pass, 1 = findings/fail)'
+    value: ${{ steps.run.outputs.exit-code }}
+  output:
+    description: 'Raw output from chaffra'
+    value: ${{ steps.run.outputs.output }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        if ! command -v cargo &> /dev/null; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-chaffra-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-chaffra-
+
+    - name: Build chaffra
+      shell: bash
+      run: |
+        cargo build --release -p chaffra-cli 2>/dev/null || cargo install --path crates/chaffra-cli
+
+    - name: Run chaffra
+      id: run
+      shell: bash
+      run: |
+        CONFIG_FLAG=""
+        if [ -n "${{ inputs.config }}" ]; then
+          CONFIG_FLAG="--config ${{ inputs.config }}"
+        fi
+
+        set +e
+        OUTPUT=$(cargo run --release -p chaffra-cli -- \
+          --format "${{ inputs.format }}" \
+          $CONFIG_FLAG \
+          ${{ inputs.command }} "${{ inputs.path }}" 2>&1)
+        EXIT_CODE=$?
+        set -e
+
+        echo "exit-code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        # Write output to file to handle multiline.
+        echo "$OUTPUT" > /tmp/chaffra-output.txt
+        {
+          echo "output<<CHAFFRA_EOF"
+          cat /tmp/chaffra-output.txt
+          echo "CHAFFRA_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # Print output so it appears in the log.
+        echo "$OUTPUT"
+
+        exit $EXIT_CODE

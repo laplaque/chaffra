@@ -1,0 +1,44 @@
+# Chaffra GitLab CI template
+#
+# Include this template in your .gitlab-ci.yml:
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/laplaque/chaffra/main/ci/gitlab-ci.yml'
+#
+# Or copy it into your project and include locally.
+
+.chaffra-base:
+  image: rust:latest
+  cache:
+    key: chaffra-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
+      - .cargo/registry/
+  before_script:
+    - cargo build --release -p chaffra-cli 2>/dev/null || cargo install --path crates/chaffra-cli
+
+chaffra-health:
+  extends: .chaffra-base
+  stage: test
+  script:
+    - cargo run --release -p chaffra-cli -- --format codeclimate health . > gl-code-quality-report.json || true
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
+    expire_in: 1 week
+
+chaffra-dead-code:
+  extends: .chaffra-base
+  stage: test
+  script:
+    - cargo run --release -p chaffra-cli -- --format codeclimate dead-code . > gl-dead-code-report.json || true
+  artifacts:
+    reports:
+      codequality: gl-dead-code-report.json
+    expire_in: 1 week
+
+chaffra-audit:
+  extends: .chaffra-base
+  stage: test
+  script:
+    - cargo run --release -p chaffra-cli -- --format terminal audit .
+  allow_failure: false
