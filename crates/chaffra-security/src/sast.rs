@@ -667,6 +667,34 @@ fn check_parameter_taint(
     }
 }
 
+/// Check if a character is a valid identifier character (alphanumeric or underscore).
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Check if `var` appears as a whole identifier in `line` (not as a substring
+/// of another identifier or function name).
+fn contains_identifier(line: &str, var: &str) -> bool {
+    let var_bytes = var.as_bytes();
+    let line_bytes = line.as_bytes();
+    if var_bytes.len() > line_bytes.len() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(var) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0 || !is_ident_char(line.as_bytes()[abs_pos - 1] as char);
+        let after_pos = abs_pos + var.len();
+        let after_ok =
+            after_pos >= line.len() || !is_ident_char(line.as_bytes()[after_pos] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
+}
+
 /// Check if any tainted variable is used in the sink call line.
 /// Returns (is_tainted, source_description).
 fn check_taint_reaches_sink(
@@ -675,7 +703,7 @@ fn check_taint_reaches_sink(
     _lang: Language,
 ) -> (bool, String) {
     for (var, desc) in tainted {
-        if line.contains(var.as_str()) {
+        if contains_identifier(line, var) {
             return (true, desc.to_string());
         }
     }
@@ -687,7 +715,7 @@ fn compute_taint_confidence(line: &str, tainted: &HashMap<String, &str>) -> f32 
     // If a tainted variable appears directly in the sink call arguments,
     // higher confidence. If it appears via string concatenation/formatting,
     // slightly lower.
-    let has_direct_ref = tainted.keys().any(|v| line.contains(v.as_str()));
+    let has_direct_ref = tainted.keys().any(|v| contains_identifier(line, v));
     let has_concat = line.contains('+') || line.contains("fmt.Sprintf") || line.contains("format(");
     let has_fstring = line.contains("f\"") || line.contains("f'");
 
@@ -1107,6 +1135,76 @@ func handler() {
         assert!(
             tainted.contains_key("query"),
             "query should become tainted through assignment from user_input"
+        );
+    }
+
+    #[test]
+    fn test_contains_identifier_word_boundary() {
+        assert!(contains_identifier("db.Query(r.FormValue(\"id\"))", "r"));
+        assert!(!contains_identifier("fmt.Fprintf(w, \"ok\")", "r"));
+        assert!(!contains_identifier(
+            "exec.Command(\"echo\", \"hello\")",
+            "r"
+        ));
+        assert!(contains_identifier(
+            "exec.Command(r.FormValue(\"cmd\"))",
+            "r"
+        ));
+        assert!(contains_identifier("os.Open(req.URL.Path)", "req"));
+        assert!(!contains_identifier("require(\"something\")", "req"));
+        assert!(contains_identifier(
+            "cursor.execute(request.args.get('q'))",
+            "request"
+        ));
+        assert!(!contains_identifier("unrequested = True", "request"));
+    }
+
+    #[test]
+    fn test_clean_go_handler_no_false_positive() {
+        let file = make_file(
+            "handler.go",
+            r#"package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func safeHandler(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintf(w, "ok")
+}
+"#,
+        );
+        let findings = analyze_file(&file);
+        assert!(
+            findings.is_empty(),
+            "clean handler with sinks but no taint flow should produce no findings, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_clean_go_exec_no_false_positive() {
+        let file = make_file(
+            "safe_exec.go",
+            r#"package main
+
+import (
+    "fmt"
+    "net/http"
+    "os/exec"
+)
+
+func safeExec(w http.ResponseWriter, r *http.Request) {
+    cmd := exec.Command("echo", "hello")
+    output, _ := cmd.Output()
+    fmt.Fprintf(w, "%s", output)
+}
+"#,
+        );
+        let findings = analyze_file(&file);
+        assert!(
+            findings.is_empty(),
+            "exec with hardcoded args should not be flagged, got: {findings:?}"
         );
     }
 }
