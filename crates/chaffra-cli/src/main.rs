@@ -1,12 +1,14 @@
 //! chaffra -- codebase intelligence CLI.
 
 use anyhow::{Context, Result};
+use chaffra_audit::AuditModule;
 use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::module::ModuleHost;
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_frameworks::FrameworksModule;
+use chaffra_hotspot::HotspotModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use chaffra_security::SecurityModule;
 use clap::{Parser, Subcommand};
@@ -23,7 +25,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Output format: json, markdown, terminal.
+    /// Output format: json, markdown, terminal, pr-comment, annotations, codeclimate.
     #[arg(long, global = true, default_value = "terminal")]
     format: String,
 
@@ -61,6 +63,12 @@ enum Command {
     },
     /// Run security analysis: SAST, secret scanning, and dependency CVE checks.
     Security {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Rank files by churn x complexity hotspot score.
+    Hotspot {
         /// Path to the repository root (defaults to current directory).
         #[arg(default_value = ".")]
         path: String,
@@ -133,6 +141,8 @@ fn build_module_host() -> ModuleHost {
     let _ = host.register(Box::new(ComplexityModule::new()));
     let _ = host.register(Box::new(SecurityModule::new()));
     let _ = host.register(Box::new(FrameworksModule::new()));
+    let _ = host.register(Box::new(AuditModule::new()));
+    let _ = host.register(Box::new(HotspotModule::new()));
     host
 }
 
@@ -291,6 +301,48 @@ fn discover_security_files(root: &Path, dir: &Path, files: &mut Vec<FileInfo>) {
             }
         }
     }
+}
+
+fn cmd_audit(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    let host = build_module_host();
+
+    // First, run dead-code and complexity to collect findings.
+    let mut all_findings = Vec::new();
+    if let Ok(result) = host.analyze("dead-code", &files, config) {
+        all_findings.extend(result.findings);
+    }
+    if let Ok(result) = host.analyze("complexity", &files, config) {
+        all_findings.extend(result.findings);
+    }
+
+    // Package findings as JSON for the audit module.
+    let findings_json = serde_json::to_vec(&all_findings).unwrap_or_default();
+    let audit_files = vec![FileInfo {
+        path: "findings.json".to_owned(),
+        content: findings_json,
+    }];
+
+    let result = host.analyze("audit", &audit_files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_hotspot(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let result = host.analyze("hotspot", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
 }
 
 fn cmd_stub(_name: &str) -> String {
@@ -521,8 +573,16 @@ async fn main() -> Result<()> {
             print!("{}", cmd_stub("dupes"));
         }
 
-        Command::Audit { .. } => {
-            print!("{}", cmd_stub("audit"));
+        Command::Audit { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_audit(&root, &config, formatter.as_ref())?);
+        }
+
+        Command::Hotspot { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_hotspot(&root, &config, formatter.as_ref())?);
         }
 
         Command::Watch { .. } => {
@@ -607,12 +667,14 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 4);
+        assert_eq!(modules.len(), 6);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
         assert!(ids.contains(&"security"));
         assert!(ids.contains(&"frameworks"));
+        assert!(ids.contains(&"audit"));
+        assert!(ids.contains(&"hotspot"));
     }
 
     #[test]
@@ -736,16 +798,53 @@ mod tests {
         assert!(!output.is_empty());
     }
 
+    // --- cmd_audit tests ---
+
+    #[test]
+    fn test_cmd_audit_go_fixtures() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_audit(&root, &config, formatter.as_ref()).unwrap();
+        // Should produce output (may have findings from dead-code/complexity).
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_cmd_audit_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_audit(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    // --- cmd_hotspot tests ---
+
+    #[test]
+    fn test_cmd_hotspot_no_commit_data() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_hotspot(&root, &config, formatter.as_ref()).unwrap();
+        // Without commit data, no hotspots should be found.
+        assert!(output.contains("No issues found"));
+    }
+
+    #[test]
+    fn test_cmd_hotspot_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_hotspot(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
     // --- stub commands ---
 
     #[test]
     fn test_cmd_stub_dupes() {
         assert_eq!(cmd_stub("dupes"), "not yet implemented\n");
-    }
-
-    #[test]
-    fn test_cmd_stub_audit() {
-        assert_eq!(cmd_stub("audit"), "not yet implemented\n");
     }
 
     #[test]
@@ -775,6 +874,18 @@ mod tests {
         let output = cmd_explain("complexity:high-cyclomatic").unwrap();
         assert!(output.contains("High cyclomatic complexity"));
         assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_audit_rule() {
+        let output = cmd_explain("audit:new-finding").unwrap();
+        assert!(output.contains("New finding"));
+    }
+
+    #[test]
+    fn test_cmd_explain_hotspot_rule() {
+        let output = cmd_explain("hotspot:hotspot").unwrap();
+        assert!(output.contains("Hotspot"));
     }
 
     #[test]
@@ -825,6 +936,8 @@ mod tests {
             output.contains("frameworks"),
             "should list frameworks module"
         );
+        assert!(output.contains("audit"), "should list audit module");
+        assert!(output.contains("hotspot"), "should list hotspot module");
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
         assert!(output.contains("Rules:"));
