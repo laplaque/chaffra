@@ -70,6 +70,8 @@ pub fn extract_symbols(tree: &Tree, source: &[u8], language: Language, file: &st
     match language {
         Language::Go => extract_go_symbols(root, source, file),
         Language::Python => extract_python_symbols(root, source, file),
+        // Languages without tree-sitter support return empty symbol lists.
+        Language::Php | Language::Dart | Language::CSharp | Language::Rust => Vec::new(),
     }
 }
 
@@ -79,6 +81,7 @@ pub fn extract_imports(tree: &Tree, source: &[u8], language: Language) -> Vec<Im
     match language {
         Language::Go => extract_go_imports(root, source),
         Language::Python => extract_python_imports(root, source),
+        Language::Php | Language::Dart | Language::CSharp | Language::Rust => Vec::new(),
     }
 }
 
@@ -445,6 +448,8 @@ fn is_definition_name(node: Node<'_>, language: Language) -> bool {
                     }
                 }
             }
+            // No tree-sitter AST for these languages, so no definition names to check.
+            Language::Php | Language::Dart | Language::CSharp | Language::Rust => {}
         }
     }
     false
