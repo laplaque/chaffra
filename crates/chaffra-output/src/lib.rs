@@ -1,18 +1,20 @@
 //! Output formatters for analysis results.
 //!
-//! Provides JSON, Markdown, and terminal formatters implementing a common
+//! Provides JSON, SARIF, Markdown, and terminal formatters implementing a common
 //! `Formatter` trait.
 
 use chaffra_core::diagnostic::{AnalysisResult, Finding, ProjectHealth, Severity};
 
 pub mod json;
 pub mod markdown;
+pub mod sarif;
 pub mod terminal;
 
 /// Output format selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Json,
+    Sarif,
     Markdown,
     Terminal,
 }
@@ -22,6 +24,7 @@ impl OutputFormat {
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "json" => Some(OutputFormat::Json),
+            "sarif" => Some(OutputFormat::Sarif),
             "markdown" | "md" => Some(OutputFormat::Markdown),
             "terminal" | "text" => Some(OutputFormat::Terminal),
             _ => None,
@@ -45,6 +48,7 @@ pub trait Formatter {
 pub fn create_formatter(format: OutputFormat) -> Box<dyn Formatter> {
     match format {
         OutputFormat::Json => Box::new(json::JsonFormatter),
+        OutputFormat::Sarif => Box::new(sarif::SarifFormatter),
         OutputFormat::Markdown => Box::new(markdown::MarkdownFormatter),
         OutputFormat::Terminal => Box::new(terminal::TerminalFormatter),
     }
@@ -68,6 +72,8 @@ mod tests {
         let cases = vec![
             ("json", Some(OutputFormat::Json)),
             ("JSON", Some(OutputFormat::Json)),
+            ("sarif", Some(OutputFormat::Sarif)),
+            ("SARIF", Some(OutputFormat::Sarif)),
             ("markdown", Some(OutputFormat::Markdown)),
             ("md", Some(OutputFormat::Markdown)),
             ("terminal", Some(OutputFormat::Terminal)),
@@ -87,6 +93,7 @@ mod tests {
     fn test_create_formatter_all_formats() {
         for fmt in [
             OutputFormat::Json,
+            OutputFormat::Sarif,
             OutputFormat::Markdown,
             OutputFormat::Terminal,
         ] {
