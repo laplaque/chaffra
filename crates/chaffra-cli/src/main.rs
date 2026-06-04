@@ -1,11 +1,13 @@
 //! chaffra -- codebase intelligence CLI.
 
 use anyhow::{Context, Result};
+use chaffra_arch::ArchitectureModule;
 use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::module::ModuleHost;
 use chaffra_deadcode::DeadCodeModule;
+use chaffra_duplication::DuplicationModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -21,7 +23,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Output format: json, markdown, terminal.
+    /// Output format: json, sarif, markdown, terminal.
     #[arg(long, global = true, default_value = "terminal")]
     format: String,
 
@@ -50,6 +52,16 @@ enum Command {
         /// Path to the repository root (defaults to current directory).
         #[arg(default_value = ".")]
         path: String,
+    },
+    /// Check architecture boundary violations and circular dependencies.
+    Boundaries {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Architecture preset: layered, hexagonal, feature-sliced, clean.
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Run a PR audit: compare against baseline and emit a pass/fail verdict.
     Audit {
@@ -85,6 +97,8 @@ fn build_module_host() -> ModuleHost {
     // Register built-in modules.
     let _ = host.register(Box::new(DeadCodeModule::new()));
     let _ = host.register(Box::new(ComplexityModule::new()));
+    let _ = host.register(Box::new(DuplicationModule::new()));
+    let _ = host.register(Box::new(ArchitectureModule::new()));
     host
 }
 
@@ -139,6 +153,50 @@ fn cmd_dead_code(
     }
     let host = build_module_host();
     let result = host.analyze("dead-code", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_dupes(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let result = host.analyze("duplication", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_boundaries(
+    root: &Path,
+    config: &ChaffraConfig,
+    preset: Option<&str>,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+
+    // Override the preset in config if specified on the command line.
+    let mut config = config.clone();
+    if let Some(preset) = preset {
+        let mut module_config = config
+            .modules
+            .entry("architecture".to_owned())
+            .or_default()
+            .clone();
+        module_config.insert("preset".to_owned(), toml::Value::String(preset.to_owned()));
+        config
+            .modules
+            .insert("architecture".to_owned(), module_config);
+    }
+
+    let host = build_module_host();
+    let result = host.analyze("architecture", &files, &config)?;
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -232,8 +290,19 @@ async fn main() -> Result<()> {
             print!("{}", cmd_dead_code(&root, &config, formatter.as_ref())?);
         }
 
-        Command::Dupes { .. } => {
-            print!("{}", cmd_stub("dupes"));
+        Command::Dupes { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_dupes(&root, &config, formatter.as_ref())?);
+        }
+
+        Command::Boundaries { path, preset } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!(
+                "{}",
+                cmd_boundaries(&root, &config, preset.as_deref(), formatter.as_ref())?
+            );
         }
 
         Command::Audit { .. } => {
@@ -285,10 +354,12 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 2);
+        assert_eq!(modules.len(), 4);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
+        assert!(ids.contains(&"duplication"));
+        assert!(ids.contains(&"architecture"));
     }
 
     #[test]
@@ -335,7 +406,6 @@ mod tests {
         let formatter = create_formatter(OutputFormat::Terminal);
         let output = cmd_health(&root, &config, formatter.as_ref()).unwrap();
         assert!(!output.is_empty());
-        // Output should mention a health score or grade.
         assert!(
             output.contains("Health") || output.contains("Score") || output.contains("Grade"),
             "health output should contain score info: {output}"
@@ -369,7 +439,6 @@ mod tests {
         let formatter = create_formatter(OutputFormat::Terminal);
         let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
         assert!(!output.is_empty());
-        // Should find the 'unused' function.
         assert!(
             output.contains("unused"),
             "dead-code output should mention 'unused': {output}"
@@ -400,7 +469,6 @@ mod tests {
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Json);
         let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
-        // JSON output should be valid JSON.
         let parsed: serde_json::Value = serde_json::from_str(&output)
             .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{output}"));
         assert!(parsed.is_array() || parsed.is_object());
@@ -415,12 +483,40 @@ mod tests {
         assert!(!output.is_empty());
     }
 
-    // --- stub commands ---
+    #[test]
+    fn test_cmd_dead_code_sarif_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Sarif);
+        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("invalid SARIF output: {e}\n{output}"));
+        assert_eq!(parsed["version"], "2.1.0");
+    }
+
+    // --- cmd_dupes tests ---
 
     #[test]
-    fn test_cmd_stub_dupes() {
-        assert_eq!(cmd_stub("dupes"), "not yet implemented\n");
+    fn test_cmd_dupes_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_dupes(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No source files found.\n");
     }
+
+    // --- cmd_boundaries tests ---
+
+    #[test]
+    fn test_cmd_boundaries_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_boundaries(dir.path(), &config, None, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    // --- stub commands ---
 
     #[test]
     fn test_cmd_stub_audit() {
@@ -454,6 +550,18 @@ mod tests {
         let output = cmd_explain("complexity:high-cyclomatic").unwrap();
         assert!(output.contains("High cyclomatic complexity"));
         assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_duplicate_block() {
+        let output = cmd_explain("duplication:duplicate-block").unwrap();
+        assert!(output.contains("Duplicate code block"));
+    }
+
+    #[test]
+    fn test_cmd_explain_boundary_violation() {
+        let output = cmd_explain("architecture:boundary-violation").unwrap();
+        assert!(output.contains("Boundary violation"));
     }
 
     #[test]
@@ -498,6 +606,14 @@ mod tests {
         assert!(
             output.contains("complexity"),
             "should list complexity module"
+        );
+        assert!(
+            output.contains("duplication"),
+            "should list duplication module"
+        );
+        assert!(
+            output.contains("architecture"),
+            "should list architecture module"
         );
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
