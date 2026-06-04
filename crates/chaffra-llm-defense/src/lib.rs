@@ -193,7 +193,7 @@ impl AnalysisModule for LlmDefenseModule {
             name: "LLM Defense Analysis".to_owned(),
             version: "0.1.0".to_owned(),
             languages: vec!["go".to_owned(), "python".to_owned()],
-            capabilities: vec!["analyze".to_owned(), "explain".to_owned(), "fix".to_owned()],
+            capabilities: vec!["analyze".to_owned(), "explain".to_owned()],
             rules: RULES
                 .iter()
                 .map(|(id, name, desc, sev, cat)| Rule {
@@ -242,6 +242,21 @@ impl AnalysisModule for LlmDefenseModule {
             detect_excessive_tool_permissions(&fd, &mut findings);
             detect_unguarded_agent_loop(&fd, &mut findings);
         }
+
+        // Filter out findings suppressed by `chaffra:ignore <rule-id>` comments.
+        let findings = findings
+            .into_iter()
+            .filter(|f| {
+                let file = files.iter().find(|fi| fi.path == f.location.file);
+                if let Some(fi) = file {
+                    let source = String::from_utf8_lossy(&fi.content);
+                    let lang = detect_language(&fi.path).unwrap_or(Language::Python);
+                    !is_line_suppressed(&source, f.location.start_line, &f.rule_id, lang)
+                } else {
+                    true
+                }
+            })
+            .collect();
 
         Ok(AnalysisResult {
             findings,
@@ -415,8 +430,8 @@ fn detect_unsafe_tool_use(fd: &FileData, findings: &mut Vec<Finding>) {
             tool_start_line = i;
         }
 
-        // Check for unsafe patterns within a tool context.
-        if in_tool_def || trimmed.contains("tool") {
+        // Check for unsafe patterns only within actual tool definition blocks.
+        if in_tool_def {
             for pattern in UNSAFE_TOOL_PATTERNS {
                 if fd
                     .source
@@ -651,6 +666,46 @@ fn detect_unguarded_agent_loop(fd: &FileData, findings: &mut Vec<Finding>) {
 
 // --- Helpers ---
 
+/// Check if a finding at `line_num` (1-based) is suppressed by a `chaffra:ignore <rule-id>`
+/// comment on the same line or the preceding line.
+fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let idx = (line_num as usize).saturating_sub(1); // convert to 0-based
+
+    let suppression_pattern = format!("chaffra:ignore {rule_id}");
+    let wildcard_pattern = "chaffra:ignore *";
+
+    let check_line = |line: &str| -> bool {
+        let comment_body = match lang {
+            Language::Python => {
+                if let Some(pos) = line.find('#') {
+                    &line[pos..]
+                } else {
+                    return false;
+                }
+            }
+            Language::Go => {
+                if let Some(pos) = line.find("//") {
+                    &line[pos..]
+                } else {
+                    return false;
+                }
+            }
+        };
+        comment_body.contains(&suppression_pattern) || comment_body.contains(wildcard_pattern)
+    };
+
+    // Check the finding line itself.
+    if idx < lines.len() && check_line(lines[idx]) {
+        return true;
+    }
+    // Check the preceding line.
+    if idx > 0 && check_line(lines[idx - 1]) {
+        return true;
+    }
+    false
+}
+
 fn has_user_input_indicator(line: &str) -> bool {
     let lower = line.to_lowercase();
     lower.contains("user")
@@ -724,11 +779,12 @@ fn has_llm_api_call_patterns(source: &str) -> bool {
         "client.completions",
         "client.messages.create",
         "anthropic.Anthropic",
-        ".create(",
+        "completions.create(",
+        "messages.create(",
+        "ChatCompletion.create(",
+        "generate_content(",
         "ChatOpenAI",
-        "generate_content",
         "chat.completions.create",
-        "messages.create",
     ];
     patterns.iter().any(|p| source.contains(p))
 }
@@ -1242,5 +1298,150 @@ mod tests {
             .filter(|f| f.rule_id == "unguarded-agent-loop")
             .collect();
         assert!(!loops.is_empty(), "should detect unguarded Go agent loop");
+    }
+
+    // --- M3 regression: unsafe-tool-use only fires within tool defs ---
+
+    #[test]
+    fn test_unsafe_tool_use_not_fired_for_comment_with_tool() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "utils.py",
+            "import openai\n\n# This is a tool for data processing\nimport subprocess\nsubprocess.run(['ls'])\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let unsafe_tools: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "unsafe-tool-use")
+            .collect();
+        assert!(
+            unsafe_tools.is_empty(),
+            "should not flag subprocess outside of tool definitions"
+        );
+    }
+
+    #[test]
+    fn test_unsafe_tool_use_fires_within_tool_def() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "tools.py",
+            "import openai\n\ndef tool_executor(cmd):\n    subprocess.run(cmd, shell=True)\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let unsafe_tools: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "unsafe-tool-use")
+            .collect();
+        assert!(
+            !unsafe_tools.is_empty(),
+            "should detect unsafe patterns within tool definitions"
+        );
+    }
+
+    // --- M4 regression: .create( pattern not too broad ---
+
+    #[test]
+    fn test_create_call_not_false_positive() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "models.py",
+            "import os\n\ndef setup():\n    db.create(table_name)\n    Widget.create(name='test')\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        // File should not be detected as having LLM calls
+        assert!(
+            result.findings.is_empty(),
+            "should not treat generic .create() calls as LLM API calls"
+        );
+    }
+
+    #[test]
+    fn test_specific_llm_create_detected() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "bot.py",
+            "import openai\n\ndef respond(msg):\n    return client.chat.completions.create(messages=[{'content': msg}])\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let rate: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "missing-rate-limit")
+            .collect();
+        assert!(
+            !rate.is_empty(),
+            "should detect specific LLM API create calls"
+        );
+    }
+
+    // --- M1+M5 regression: suppression and fix capability ---
+
+    #[test]
+    fn test_fix_not_in_capabilities() {
+        let module = LlmDefenseModule::new();
+        let info = module.describe();
+        assert!(
+            !info.capabilities.contains(&"fix".to_owned()),
+            "capabilities should not include 'fix'"
+        );
+    }
+
+    #[test]
+    fn test_suppression_same_line() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "chat.py",
+            "import openai\n\ndef ask(user_input):\n    prompt = f\"Summarize: {user_input}\"  # chaffra:ignore prompt-injection-exposure\n    return client.chat.completions.create(messages=[{'content': prompt}])\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let injections: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "prompt-injection-exposure")
+            .collect();
+        assert!(
+            injections.is_empty(),
+            "should suppress prompt-injection-exposure with inline chaffra:ignore"
+        );
+    }
+
+    #[test]
+    fn test_suppression_preceding_line() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "chat.py",
+            "import openai\n\ndef ask(user_input):\n    # chaffra:ignore prompt-injection-exposure\n    prompt = f\"Summarize: {user_input}\"\n    return client.chat.completions.create(messages=[{'content': prompt}])\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let injections: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "prompt-injection-exposure")
+            .collect();
+        assert!(
+            injections.is_empty(),
+            "should suppress with preceding-line chaffra:ignore"
+        );
+    }
+
+    #[test]
+    fn test_suppression_wrong_rule_not_suppressed() {
+        let module = LlmDefenseModule::new();
+        let files = vec![make_file(
+            "chat.py",
+            "import openai\n\ndef ask(user_input):\n    prompt = f\"Summarize: {user_input}\"  # chaffra:ignore missing-rate-limit\n    return client.chat.completions.create(messages=[{'content': prompt}])\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let injections: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "prompt-injection-exposure")
+            .collect();
+        assert!(
+            !injections.is_empty(),
+            "should NOT suppress when chaffra:ignore targets a different rule"
+        );
     }
 }

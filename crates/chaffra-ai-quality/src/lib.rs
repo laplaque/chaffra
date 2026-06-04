@@ -207,7 +207,7 @@ impl AnalysisModule for AiQualityModule {
             name: "AI Quality Analysis".to_owned(),
             version: "0.1.0".to_owned(),
             languages: vec!["go".to_owned(), "python".to_owned()],
-            capabilities: vec!["analyze".to_owned(), "explain".to_owned(), "fix".to_owned()],
+            capabilities: vec!["analyze".to_owned(), "explain".to_owned()],
             rules: RULES
                 .iter()
                 .map(|(id, name, desc, sev, cat)| Rule {
@@ -282,6 +282,19 @@ impl AnalysisModule for AiQualityModule {
         for file in files {
             detect_impossible_dependency_versions(file, &mut findings);
         }
+
+        // Filter out findings suppressed by `chaffra:ignore <rule-id>` comments.
+        let findings = findings
+            .into_iter()
+            .filter(|f| {
+                let file = per_file_data.iter().find(|fd| fd.path == f.location.file);
+                if let Some(fd) = file {
+                    !is_line_suppressed(&fd.source, f.location.start_line, &f.rule_id, fd.language)
+                } else {
+                    true
+                }
+            })
+            .collect();
 
         Ok(AnalysisResult {
             findings,
@@ -519,7 +532,7 @@ fn detect_phantom_api_calls(fd: &FileData, known: &HashSet<String>, findings: &m
 
         // Check if reference matches any known selector pattern (pkg.Method).
         // These are caught as field identifiers and are usually valid.
-        if is_likely_method_call(&r.name, fd.language) {
+        if is_likely_method_call(&r.name, &fd.source, fd.language) {
             continue;
         }
 
@@ -909,6 +922,46 @@ fn detect_inconsistent_error_handling(fd: &FileData, findings: &mut Vec<Finding>
 
 // --- Helpers ---
 
+/// Check if a finding at `line_num` (1-based) is suppressed by a `chaffra:ignore <rule-id>`
+/// comment on the same line or the preceding line.
+fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let idx = (line_num as usize).saturating_sub(1); // convert to 0-based
+
+    let suppression_pattern = format!("chaffra:ignore {rule_id}");
+    let wildcard_pattern = "chaffra:ignore *";
+
+    let check_line = |line: &str| -> bool {
+        let comment_body = match lang {
+            Language::Python => {
+                if let Some(pos) = line.find('#') {
+                    &line[pos..]
+                } else {
+                    return false;
+                }
+            }
+            Language::Go => {
+                if let Some(pos) = line.find("//") {
+                    &line[pos..]
+                } else {
+                    return false;
+                }
+            }
+        };
+        comment_body.contains(&suppression_pattern) || comment_body.contains(wildcard_pattern)
+    };
+
+    // Check the finding line itself.
+    if idx < lines.len() && check_line(lines[idx]) {
+        return true;
+    }
+    // Check the preceding line.
+    if idx > 0 && check_line(lines[idx - 1]) {
+        return true;
+    }
+    false
+}
+
 fn is_security_related(name: &str) -> bool {
     let lower = name.to_lowercase();
     PHANTOM_SECURITY_PATTERNS
@@ -922,16 +975,47 @@ fn is_security_related(name: &str) -> bool {
         || lower.contains("verify_sig")
 }
 
-fn is_function_call(name: &str, source: &str, _lang: Language) -> bool {
-    // Check if `name(` appears in the source.
+fn is_function_call(name: &str, source: &str, lang: Language) -> bool {
+    // Check if `name(` appears in the source outside of comments and strings.
     let pattern = format!("{name}(");
-    source.contains(&pattern)
+    for line in source.lines() {
+        if !line.contains(&pattern) {
+            continue;
+        }
+        let trimmed = line.trim();
+        // Skip comment lines.
+        let is_comment = match lang {
+            Language::Python => trimmed.starts_with('#'),
+            Language::Go => trimmed.starts_with("//"),
+        };
+        if is_comment {
+            continue;
+        }
+        // Skip if the match occurs only within a string literal (simple heuristic:
+        // count quotes before the match position; odd count means inside a string).
+        if let Some(pos) = line.find(&pattern) {
+            let prefix = &line[..pos];
+            let double_quotes = prefix.chars().filter(|&c| c == '"').count();
+            let single_quotes = prefix.chars().filter(|&c| c == '\'').count();
+            if double_quotes % 2 == 0 && single_quotes % 2 == 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
-fn is_likely_method_call(name: &str, lang: Language) -> bool {
+fn is_likely_method_call(name: &str, source: &str, lang: Language) -> bool {
     match lang {
-        // In Go, single-word capitalized names after a dot are method calls.
-        Language::Go => name.starts_with(char::is_uppercase) && name.len() <= 2,
+        // In Go, exported method calls appear as `receiver.MethodName(` in source.
+        // Check if the name appears with a dot-receiver pattern.
+        Language::Go => {
+            if !name.starts_with(char::is_uppercase) {
+                return false;
+            }
+            let dot_pattern = format!(".{name}(");
+            source.contains(&dot_pattern)
+        }
         Language::Python => name == "self" || name == "cls",
     }
 }
@@ -1776,5 +1860,142 @@ mod tests {
             !stubs.is_empty(),
             "should detect NotImplementedError as stub"
         );
+    }
+
+    // --- M2 regression: Go method calls with >2 char names ---
+
+    #[test]
+    fn test_go_method_call_not_flagged_as_phantom() {
+        let module = AiQualityModule::new();
+        let files = vec![make_file(
+            "server.go",
+            "package main\n\nfunc main() {\n\tserver.Handle(\"/api\")\n\tserver.Serve()\n\tconn.Close()\n}\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let phantom: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| {
+                f.rule_id == "phantom-api-call"
+                    && (f.message.contains("Handle") || f.message.contains("Serve"))
+            })
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "should not flag Go receiver method calls (Handle, Serve) as phantom"
+        );
+    }
+
+    // --- M1 regression: suppression via chaffra:ignore ---
+
+    #[test]
+    fn test_suppression_same_line_python() {
+        let module = AiQualityModule::new();
+        let files = vec![make_file(
+            "app.py",
+            "def main():\n    result = nonexistent_api_function(data)  # chaffra:ignore phantom-api-call\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let phantom: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "phantom-api-call")
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "should suppress phantom-api-call with inline chaffra:ignore comment"
+        );
+    }
+
+    #[test]
+    fn test_suppression_preceding_line_go() {
+        let module = AiQualityModule::new();
+        let files = vec![make_file(
+            "main.go",
+            "package main\n\nfunc main() {\n\t// chaffra:ignore phantom-api-call\n\tresult := fabricated_helper(x)\n}\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let phantom: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "phantom-api-call")
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "should suppress phantom-api-call with preceding-line chaffra:ignore comment"
+        );
+    }
+
+    #[test]
+    fn test_suppression_wrong_rule_not_suppressed() {
+        let module = AiQualityModule::new();
+        let files = vec![make_file(
+            "app.py",
+            "def main():\n    result = nonexistent_api_function(data)  # chaffra:ignore unfinished-stub\n",
+        )];
+        let result = module.analyze(&files, &HashMap::new()).unwrap();
+        let phantom: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "phantom-api-call")
+            .collect();
+        assert!(
+            !phantom.is_empty(),
+            "should NOT suppress phantom-api-call when chaffra:ignore targets a different rule"
+        );
+    }
+
+    // --- M5 regression: fix not in capabilities ---
+
+    #[test]
+    fn test_fix_not_in_capabilities() {
+        let module = AiQualityModule::new();
+        let info = module.describe();
+        assert!(
+            !info.capabilities.contains(&"fix".to_owned()),
+            "capabilities should not include 'fix'"
+        );
+    }
+
+    // --- L2 regression: is_function_call skips comments ---
+
+    #[test]
+    fn test_is_function_call_skips_comments_python() {
+        // The function name only appears inside a comment
+        assert!(!is_function_call(
+            "phantom_fn",
+            "def main():\n    # phantom_fn(data)\n    pass\n",
+            Language::Python,
+        ));
+    }
+
+    #[test]
+    fn test_is_function_call_skips_comments_go() {
+        assert!(!is_function_call(
+            "phantom_fn",
+            "package main\n\n// phantom_fn(data)\nfunc main() {}\n",
+            Language::Go,
+        ));
+    }
+
+    #[test]
+    fn test_is_function_call_matches_real_code() {
+        assert!(is_function_call(
+            "real_fn",
+            "def main():\n    result = real_fn(data)\n",
+            Language::Python,
+        ));
+    }
+
+    // --- is_likely_method_call with source ---
+
+    #[test]
+    fn test_is_likely_method_call_go_receiver() {
+        let source = "server.Handle(\"/api\")\nserver.Serve()\n";
+        assert!(is_likely_method_call("Handle", source, Language::Go));
+        assert!(is_likely_method_call("Serve", source, Language::Go));
+        // Standalone call (no dot receiver) should not be treated as method call
+        let source2 = "Handle(\"/api\")\n";
+        assert!(!is_likely_method_call("Handle", source2, Language::Go));
     }
 }
