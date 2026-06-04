@@ -39,13 +39,9 @@ prevent false positives in dead-code analysis.
 
 ## Configuration
 
-Enable specific frameworks in `.chaffra.toml`:
-
-```toml
-[framework]
-go = ["gin", "echo", "cobra"]
-python = ["fastapi", "django", "flask"]
-```
+Framework selection is **auto-detected** from project imports and dependencies.
+There is no manual configuration required. Config-based framework selection
+(to restrict or override detection) is planned for a future release.
 
 ## Integration with Dead-Code Module
 

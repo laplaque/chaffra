@@ -23,9 +23,13 @@ impl AnalysisModuleClient {
     }
 
     /// Connect to a remote endpoint.
-    pub async fn connect(endpoint: &str) -> Result<Self, tonic::transport::Error> {
+    ///
+    /// Returns an error if the endpoint is not a valid URI or the connection fails.
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let channel = Channel::from_shared(endpoint.to_owned())
-            .expect("valid URI")
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("invalid endpoint URI '{endpoint}': {e}").into()
+            })?
             .connect()
             .await?;
         Ok(Self::new(channel))

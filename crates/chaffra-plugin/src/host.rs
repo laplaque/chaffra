@@ -21,6 +21,9 @@ use tonic::transport::Channel;
 ///
 /// Wraps a tonic gRPC client and implements the `AnalysisModule` trait so that
 /// external modules are indistinguishable from built-in ones at the `ModuleHost` level.
+///
+/// When running in `Container` mode, the struct captures the Docker container ID
+/// and stops the container on drop.
 pub struct ExternalModule {
     config: ExternalModuleConfig,
     /// Cached module info from the Describe RPC.
@@ -29,6 +32,8 @@ pub struct ExternalModule {
     channel: Mutex<Option<Channel>>,
     /// Spawned child process (command mode only).
     _child: Mutex<Option<Child>>,
+    /// Docker container ID (container mode only), used for cleanup on drop.
+    container_id: Mutex<Option<String>>,
 }
 
 impl ExternalModule {
@@ -39,6 +44,7 @@ impl ExternalModule {
             cached_info: Mutex::new(None),
             channel: Mutex::new(None),
             _child: Mutex::new(None),
+            container_id: Mutex::new(None),
         }
     }
 
@@ -64,7 +70,11 @@ impl ExternalModule {
         let endpoint_str = match self.config.mode {
             TransportMode::Command => {
                 let cmd = self.config.command.as_deref().unwrap_or("");
-                // Allocate an ephemeral port by binding to :0.
+                // TOCTOU note: We allocate an ephemeral port by binding to :0 and
+                // reading the assigned port, then drop the listener before the child
+                // process binds. Another process could claim the port in between.
+                // We mitigate this with a retry loop (with backoff) when connecting
+                // to the child, which handles the rare collision case.
                 let port = self.config.port.unwrap_or_else(|| {
                     let listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
                     listener
@@ -96,7 +106,7 @@ impl ExternalModule {
                 }
                 let image = self.config.image.as_deref().unwrap_or("");
                 let port = self.config.port.unwrap_or(50051);
-                let _ = std::process::Command::new("docker")
+                let output = std::process::Command::new("docker")
                     .args(["run", "-d", "--rm", "-p"])
                     .arg(format!("{port}:{port}"))
                     .arg(image)
@@ -105,20 +115,42 @@ impl ExternalModule {
                         command: format!("docker run {image}"),
                         reason: e.to_string(),
                     })?;
+                // Capture the container ID so we can stop it on drop.
+                let cid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !cid.is_empty() {
+                    *self.container_id.lock().unwrap() = Some(cid);
+                }
                 format!("http://127.0.0.1:{port}")
             }
         };
 
-        let channel = block_on(async {
-            Channel::from_shared(endpoint_str.clone())
-                .map_err(|e| PluginError::Transport(e.to_string()))?
-                .connect()
-                .await
-                .map_err(|e| PluginError::Transport(e.to_string()))
-        })?;
-
-        *guard = Some(channel.clone());
-        Ok(channel)
+        // Retry with exponential backoff to handle TOCTOU port races and slow
+        // child/container startup. Tries up to 5 times (total ~3.1 s max wait).
+        let max_retries = 5u32;
+        let mut last_err = None;
+        for attempt in 0..max_retries {
+            match block_on(async {
+                Channel::from_shared(endpoint_str.clone())
+                    .map_err(|e| PluginError::Transport(e.to_string()))?
+                    .connect()
+                    .await
+                    .map_err(|e| PluginError::Transport(e.to_string()))
+            }) {
+                Ok(ch) => {
+                    *guard = Some(ch.clone());
+                    return Ok(ch);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < max_retries {
+                        let backoff = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
+                        std::thread::sleep(backoff);
+                    }
+                }
+            }
+        }
+        // All retries exhausted.
+        Err(last_err.unwrap())
     }
 
     fn make_client(&self) -> std::result::Result<AnalysisModuleClient, PluginError> {
@@ -247,6 +279,19 @@ impl AnalysisModule for ExternalModule {
         })?;
 
         Ok(response.results.into_iter().map(FixResult::from).collect())
+    }
+}
+
+impl Drop for ExternalModule {
+    fn drop(&mut self) {
+        // Stop the Docker container if one was started in container mode.
+        if let Some(cid) = self.container_id.lock().unwrap().take() {
+            let _ = std::process::Command::new("docker")
+                .args(["stop", &cid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 }
 
