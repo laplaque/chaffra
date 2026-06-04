@@ -28,6 +28,9 @@ chaffra-plugin = { workspace = true }
 chaffra-frameworks = { workspace = true }
 chaffra-ai-quality = { workspace = true }
 chaffra-llm-defense = { workspace = true }
+chaffra-monorepo = { workspace = true }
+chaffra-impact = { workspace = true }
+chaffra-migrate = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

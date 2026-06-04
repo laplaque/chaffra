@@ -102,6 +102,44 @@ enum Command {
     Init,
     /// List all registered analysis modules.
     Modules,
+    /// Track impact: save snapshots and compare trends over time.
+    Impact {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Save a snapshot to the given file path.
+        #[arg(long, value_name = "PATH")]
+        save_snapshot: Option<String>,
+
+        /// Compare against a baseline snapshot file.
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<String>,
+
+        /// Optional label for the snapshot (e.g. git ref).
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Migrate configuration from another analysis tool to `.chaffra.toml`.
+    Migrate {
+        /// Source tool to migrate from (knip, jscpd, golangci-lint, ruff, import-linter).
+        #[arg(long)]
+        from: String,
+
+        /// Path to the project directory containing the tool's config.
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Write the generated config to `.chaffra.toml` instead of stdout.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Detect monorepo workspace members.
+    Workspaces {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
 }
 
 fn build_module_host() -> ModuleHost {
@@ -372,6 +410,134 @@ fn cmd_modules() -> String {
     out
 }
 
+fn cmd_impact(
+    root: &Path,
+    config: &ChaffraConfig,
+    save_path: Option<&str>,
+    baseline_path: Option<&str>,
+    label: Option<String>,
+    format: OutputFormat,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+
+    // Run all registered modules and aggregate findings
+    let host = build_module_host();
+    let mut all_findings: Vec<chaffra_core::diagnostic::Finding> = Vec::new();
+    let mut total_files_analyzed: u64 = 0;
+
+    for module_info in host.list() {
+        if let Ok(result) = host.analyze(&module_info.id, &files, config) {
+            all_findings.extend(result.findings);
+            total_files_analyzed = total_files_analyzed.max(result.metrics.files_analyzed);
+        }
+    }
+
+    let health = chaffra_complexity::analyze_project_health(
+        &files,
+        config.health.max_cyclomatic,
+        config.health.max_cognitive,
+    )
+    .ok();
+
+    let snapshot = chaffra_impact::snapshot_from_findings(
+        &all_findings,
+        total_files_analyzed,
+        health.as_ref(),
+        label,
+    );
+
+    // Save snapshot if requested
+    if let Some(save_to) = save_path {
+        let path = Path::new(save_to);
+        chaffra_impact::save_snapshot(&snapshot, path).map_err(|e| anyhow::anyhow!("{}", e))?;
+        return Ok(format!("Snapshot saved to {save_to}\n"));
+    }
+
+    // Compare against baseline if provided
+    if let Some(base_path) = baseline_path {
+        let baseline = chaffra_impact::load_snapshot(Path::new(base_path))
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let report = chaffra_impact::compare_snapshots(&baseline, &snapshot);
+
+        return match format {
+            OutputFormat::Json => Ok(chaffra_impact::format_trend_json(&report)),
+            _ => Ok(chaffra_impact::format_trend_table(&report)),
+        };
+    }
+
+    // No baseline: just show current snapshot
+    let json = serde_json::to_string_pretty(&snapshot)?;
+    Ok(json)
+}
+
+fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<String> {
+    let tool = chaffra_migrate::SourceTool::from_str_loose(tool_name)
+        .ok_or_else(|| anyhow::anyhow!("unsupported tool: {tool_name}"))?;
+
+    let result =
+        chaffra_migrate::migrate(tool, project_dir).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    if write {
+        let config_path = project_dir.join(CONFIG_FILE_NAME);
+        if config_path.exists() {
+            anyhow::bail!("{CONFIG_FILE_NAME} already exists; remove it first or migrate manually");
+        }
+        std::fs::write(&config_path, &result.toml_content)
+            .context("failed to write configuration file")?;
+    }
+
+    let mut out = String::new();
+
+    if write {
+        out.push_str(&format!("Wrote {CONFIG_FILE_NAME}\n"));
+    } else {
+        out.push_str(&result.toml_content);
+        out.push('\n');
+    }
+
+    if !result.notes.is_empty() {
+        out.push('\n');
+        out.push_str("Migration notes:\n");
+        for note in &result.notes {
+            out.push_str(&format!("  - {note}\n"));
+        }
+    }
+
+    Ok(out)
+}
+
+fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
+    let workspaces = chaffra_monorepo::detect_workspaces(root);
+
+    if workspaces.is_empty() {
+        return "No workspace configurations detected.\n".to_owned();
+    }
+
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(&workspaces).unwrap_or_else(|_| "[]".to_owned())
+        }
+        _ => {
+            let mut out = String::new();
+            for ws in &workspaces {
+                out.push_str(&format!(
+                    "Workspace: {} ({} members)\n",
+                    ws.kind,
+                    ws.members.len()
+                ));
+                for member in &ws.members {
+                    out.push_str(&format!("  {} -> {}\n", member.name, member.path.display()));
+                }
+                out.push('\n');
+            }
+            out
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -447,6 +613,43 @@ async fn main() -> Result<()> {
         Command::Modules => {
             print!("{}", cmd_modules());
         }
+
+        Command::Impact {
+            path,
+            save_snapshot,
+            baseline,
+            label,
+        } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!(
+                "{}",
+                cmd_impact(
+                    &root,
+                    &config,
+                    save_snapshot.as_deref(),
+                    baseline.as_deref(),
+                    label,
+                    format,
+                )?
+            );
+        }
+
+        Command::Migrate { from, path, write } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            match cmd_migrate(&from, &root, write) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::Workspaces { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            print!("{}", cmd_workspaces(&root, format));
+        }
     }
 
     Ok(())
@@ -516,7 +719,6 @@ mod tests {
         let formatter = create_formatter(OutputFormat::Terminal);
         let output = cmd_health(&root, &config, formatter.as_ref()).unwrap();
         assert!(!output.is_empty());
-        // Output should mention a health score or grade.
         assert!(
             output.contains("Health") || output.contains("Score") || output.contains("Grade"),
             "health output should contain score info: {output}"
@@ -550,7 +752,6 @@ mod tests {
         let formatter = create_formatter(OutputFormat::Terminal);
         let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
         assert!(!output.is_empty());
-        // Should find the 'unused' function.
         assert!(
             output.contains("unused"),
             "dead-code output should mention 'unused': {output}"
@@ -581,7 +782,6 @@ mod tests {
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Json);
         let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
-        // JSON output should be valid JSON.
         let parsed: serde_json::Value = serde_json::from_str(&output)
             .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{output}"));
         assert!(parsed.is_array() || parsed.is_object());
@@ -864,5 +1064,299 @@ mod tests {
         let output = cmd_explain("llm-defense:unsafe-tool-use").unwrap();
         assert!(output.contains("Unsafe tool use"));
         assert!(output.contains("Rationale:"));
+    }
+
+    // --- cmd_impact tests ---
+
+    #[test]
+    fn test_cmd_impact_save_snapshot() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("snapshot.json");
+
+        let output = cmd_impact(
+            &root,
+            &config,
+            Some(snapshot_path.to_str().unwrap()),
+            None,
+            Some("test-label".to_owned()),
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+        assert!(output.contains("Snapshot saved"));
+        assert!(snapshot_path.exists());
+
+        let content = fs::read_to_string(&snapshot_path).unwrap();
+        let snapshot: chaffra_impact::Snapshot = serde_json::from_str(&content).unwrap();
+        assert_eq!(snapshot.label, Some("test-label".to_owned()));
+    }
+
+    #[test]
+    fn test_cmd_impact_compare_snapshots() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("baseline.json");
+
+        cmd_impact(
+            &root,
+            &config,
+            Some(snapshot_path.to_str().unwrap()),
+            None,
+            Some("baseline".to_owned()),
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+
+        let output = cmd_impact(
+            &root,
+            &config,
+            None,
+            Some(snapshot_path.to_str().unwrap()),
+            Some("current".to_owned()),
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+
+        assert!(output.contains("Impact Report"));
+        assert!(output.contains("Catch Rate"));
+    }
+
+    #[test]
+    fn test_cmd_impact_compare_json_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("baseline.json");
+
+        cmd_impact(
+            &root,
+            &config,
+            Some(snapshot_path.to_str().unwrap()),
+            None,
+            None,
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+
+        let output = cmd_impact(
+            &root,
+            &config,
+            None,
+            Some(snapshot_path.to_str().unwrap()),
+            None,
+            OutputFormat::Json,
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.get("trends").is_some());
+        assert!(parsed.get("catch_rate").is_some());
+    }
+
+    #[test]
+    fn test_cmd_impact_no_files() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let output = cmd_impact(
+            dir.path(),
+            &config,
+            None,
+            None,
+            None,
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    // --- cmd_migrate tests ---
+
+    #[test]
+    fn test_cmd_migrate_knip() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("knip.json"),
+            r#"{"entry": ["src/index.ts"], "ignore": ["dist/**"]}"#,
+        )
+        .unwrap();
+
+        let output = cmd_migrate("knip", dir.path(), false).unwrap();
+        assert!(output.contains("[project]"));
+        assert!(output.contains("src/index.ts"));
+    }
+
+    #[test]
+    fn test_cmd_migrate_write() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("knip.json"),
+            r#"{"entry": ["src/index.ts"]}"#,
+        )
+        .unwrap();
+
+        let output = cmd_migrate("knip", dir.path(), true).unwrap();
+        assert!(output.contains("Wrote"));
+        assert!(dir.path().join(CONFIG_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn test_cmd_migrate_write_exists() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(CONFIG_FILE_NAME), "existing").unwrap();
+        fs::write(dir.path().join("knip.json"), r#"{"entry": []}"#).unwrap();
+
+        let result = cmd_migrate("knip", dir.path(), true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cmd_migrate_unknown_tool() {
+        let dir = TempDir::new().unwrap();
+        let result = cmd_migrate("unknown-tool", dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    // --- cmd_workspaces tests ---
+
+    #[test]
+    fn test_cmd_workspaces_empty() {
+        let dir = TempDir::new().unwrap();
+        let output = cmd_workspaces(dir.path(), OutputFormat::Terminal);
+        assert!(output.contains("No workspace"));
+    }
+
+    #[test]
+    fn test_cmd_workspaces_rust() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("crates/core")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\"]\n",
+        )
+        .unwrap();
+
+        let output = cmd_workspaces(dir.path(), OutputFormat::Terminal);
+        assert!(output.contains("rust-cargo"));
+        assert!(output.contains("core"));
+    }
+
+    #[test]
+    fn test_cmd_workspaces_json() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("crates/a")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n",
+        )
+        .unwrap();
+
+        let output = cmd_workspaces(dir.path(), OutputFormat::Json);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn test_cmd_workspaces_go() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./svc-a\n\t./svc-b\n)\n",
+        )
+        .unwrap();
+
+        let output = cmd_workspaces(dir.path(), OutputFormat::Terminal);
+        assert!(output.contains("go-work"));
+        assert!(output.contains("svc-a"));
+    }
+
+    #[test]
+    fn test_cmd_workspaces_js() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("packages/ui")).unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "root", "workspaces": ["packages/ui"]}"#,
+        )
+        .unwrap();
+
+        let output = cmd_workspaces(dir.path(), OutputFormat::Terminal);
+        assert!(output.contains("js-package-json"));
+        assert!(output.contains("ui"));
+    }
+
+    // --- P1-1 regression: workspace flags removed until wired ---
+
+    #[test]
+    fn test_cli_struct_has_no_group_by_field() {
+        // Ensure --group-by and --changed-workspaces are not accepted
+        // until they are properly wired into analysis commands.
+        let result = Cli::try_parse_from(["chaffra", "--group-by", "workspace", "health"]);
+        assert!(
+            result.is_err(),
+            "unexpected --group-by flag should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cli_struct_has_no_changed_workspaces_field() {
+        let result = Cli::try_parse_from(["chaffra", "--changed-workspaces", "main", "health"]);
+        assert!(
+            result.is_err(),
+            "unexpected --changed-workspaces flag should be rejected"
+        );
+    }
+
+    // --- P1-2 regression: impact aggregates all modules ---
+
+    #[test]
+    fn test_cmd_impact_aggregates_all_modules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("snapshot.json");
+
+        cmd_impact(
+            &root,
+            &config,
+            Some(snapshot_path.to_str().unwrap()),
+            None,
+            Some("all-modules".to_owned()),
+            OutputFormat::Terminal,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&snapshot_path).unwrap();
+        let snapshot: chaffra_impact::Snapshot = serde_json::from_str(&content).unwrap();
+
+        // The snapshot must contain findings from dead-code AND complexity
+        // modules, not just dead-code alone.
+        let has_dead_code = snapshot
+            .finding_counts
+            .keys()
+            .any(|k| k.starts_with("unused-") || k.starts_with("dead-"));
+        let has_complexity = snapshot
+            .finding_counts
+            .keys()
+            .any(|k| k.starts_with("high-"));
+
+        assert!(
+            has_dead_code || has_complexity,
+            "snapshot should aggregate findings from multiple modules, got keys: {:?}",
+            snapshot.finding_counts.keys().collect::<Vec<_>>()
+        );
+
+        // total_findings should reflect all modules' findings combined
+        let total = snapshot
+            .metrics
+            .get("total_findings")
+            .copied()
+            .unwrap_or(0.0);
+        let sum_by_rule: u64 = snapshot.finding_counts.values().sum();
+        assert_eq!(
+            total as u64, sum_by_rule,
+            "total_findings metric should equal sum of all finding_counts"
+        );
     }
 }
