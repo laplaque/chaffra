@@ -249,6 +249,7 @@ dependencies = [
  "chaffra-parse",
  "chaffra-plugin",
  "clap",
+ "serde_json",
  "tokio",
 ]
 
@@ -258,6 +259,9 @@ version = "0.1.0"
 dependencies = [
  "chaffra-core",
  "chaffra-parse",
+ "serde",
+ "serde_json",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -267,6 +271,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -275,6 +280,8 @@ version = "0.1.0"
 dependencies = [
  "chaffra-core",
  "chaffra-parse",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -325,7 +332,10 @@ name = "chaffra-parse"
 version = "0.1.0"
 dependencies = [
  "chaffra-core",
+ "glob",
  "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-python",
 ]
 
 [[package]]
@@ -1141,6 +1151,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1878,6 +1894,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,6 +2130,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_edit",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_write",
+ "winnow",
+]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
 name = "tonic"
 version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2210,10 +2276,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-go"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "try-lock"
