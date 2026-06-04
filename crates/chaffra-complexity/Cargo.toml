@@ -10,3 +10,6 @@ description = "Cyclomatic and cognitive complexity metrics computed from ASTs"
 [dependencies]
 chaffra-core = { workspace = true }
 chaffra-parse = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tree-sitter = { workspace = true }

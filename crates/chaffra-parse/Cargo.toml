@@ -10,3 +10,6 @@ description = "tree-sitter integration and per-language AST walkers"
 [dependencies]
 chaffra-core = { workspace = true }
 tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-python = { workspace = true }
+glob = { workspace = true }

@@ -1,0 +1,123 @@
+syntax = "proto3";
+package chaffra.module.v1;
+
+service AnalysisModule {
+  rpc Describe(DescribeRequest) returns (ModuleInfo);
+  rpc Analyze(AnalysisRequest) returns (AnalysisResponse);
+  rpc Explain(ExplainRequest) returns (ExplainResponse);
+  rpc Fix(FixRequest) returns (FixResponse);
+}
+
+message DescribeRequest {}
+
+message ModuleInfo {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  repeated string languages = 4;
+  repeated string capabilities = 5;
+  repeated RuleInfo rules = 6;
+}
+
+message RuleInfo {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string default_severity = 4;
+  string category = 5;
+}
+
+message AnalysisRequest {
+  repeated FileInfo files = 1;
+  map<string, string> config = 2;
+  repeated string enabled_rules = 3;
+  string language = 4;
+}
+
+message FileInfo {
+  string path = 1;
+  bytes content = 2;
+  repeated ASTNode nodes = 3;
+}
+
+message ASTNode {
+  string kind = 1;
+  uint32 start_byte = 2;
+  uint32 end_byte = 3;
+  uint32 start_line = 4;
+  uint32 end_line = 5;
+  string text = 6;
+  repeated ASTNode children = 7;
+}
+
+message AnalysisResponse {
+  repeated Finding findings = 1;
+  ModuleMetrics metrics = 2;
+}
+
+message Finding {
+  string rule_id = 1;
+  string message = 2;
+  string severity = 3;
+  Location location = 4;
+  float confidence = 5;
+  repeated Action actions = 6;
+  map<string, string> metadata = 7;
+}
+
+message Location {
+  string file = 1;
+  uint32 start_line = 2;
+  uint32 end_line = 3;
+  uint32 start_column = 4;
+  uint32 end_column = 5;
+}
+
+message Action {
+  string description = 1;
+  bool auto_fixable = 2;
+  repeated TextEdit edits = 3;
+}
+
+message TextEdit {
+  string file = 1;
+  uint32 start_line = 2;
+  uint32 end_line = 3;
+  string new_text = 4;
+}
+
+message ModuleMetrics {
+  uint64 files_analyzed = 1;
+  uint64 duration_ms = 2;
+  map<string, uint64> counters = 3;
+}
+
+message ExplainRequest {
+  string rule_id = 1;
+}
+
+message ExplainResponse {
+  string rule_id = 1;
+  string name = 2;
+  string description = 3;
+  string rationale = 4;
+  string default_severity = 5;
+  string suppression_syntax = 6;
+  repeated string examples = 7;
+}
+
+message FixRequest {
+  repeated Finding findings = 1;
+  bool dry_run = 2;
+}
+
+message FixResponse {
+  repeated FixResult results = 1;
+}
+
+message FixResult {
+  string rule_id = 1;
+  bool applied = 2;
+  repeated TextEdit edits = 3;
+  string reason = 4;
+}
