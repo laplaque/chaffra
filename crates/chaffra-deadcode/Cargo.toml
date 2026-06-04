@@ -10,3 +10,5 @@ description = "Dead code detection engine for unreachable functions, types, impo
 [dependencies]
 chaffra-core = { workspace = true }
 chaffra-parse = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
