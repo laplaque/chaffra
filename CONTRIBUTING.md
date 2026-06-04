@@ -2,9 +2,11 @@
 
 ## Tests
 
-Every PR must satisfy these gates before merge.
+Every PR that introduces or changes functional code must satisfy these gates before merge. Scaffold-only PRs (empty stubs, config, CI, docs) are exempt from coverage gates but must still pass CI and review.
 
 ### Coverage
+
+Applies when the PR contains functional (non-stub) Rust code:
 
 - **95%** on new or changed code (delta coverage).
 - **85%** overall.
@@ -38,7 +40,7 @@ cargo fmt -- --check           # format check
 - `thiserror` for library crate errors, `anyhow` in the CLI crate only.
 - Public types that cross crate boundaries derive `Serialize` + `Deserialize` where appropriate.
 - Prefer `&str` / `&[u8]` over owned types in function signatures unless ownership transfer is required.
-- Dependencies: security scan + license check before adding anything new. Prefer `std` over third-party when the functionality is comparable.
+- Dependencies: security scan + license check before adding anything new. Prefer `std` over third-party when the functionality is comparable. Document the scan result in the PR body when adding new direct dependencies.
 
 ## Commits
 
