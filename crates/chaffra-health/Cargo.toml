@@ -1,0 +1,12 @@
+[package]
+name = "chaffra-health"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Composite 0-100 health scoring aggregated from complexity and other metrics"
+
+[dependencies]
+chaffra-core = { workspace = true }
+chaffra-complexity = { workspace = true }

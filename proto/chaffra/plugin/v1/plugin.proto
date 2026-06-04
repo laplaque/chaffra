@@ -1,0 +1,78 @@
+syntax = "proto3";
+package chaffra.plugin.v1;
+
+service FrameworkPlugin {
+  rpc Describe(DescribeRequest) returns (PluginInfo);
+  rpc FindEntryPoints(AnalysisRequest) returns (EntryPointsResponse);
+  rpc ExplainUsage(UsageQuery) returns (UsageEvidence);
+  rpc GetImpliedBoundaries(BoundaryRequest) returns (BoundaryRules);
+}
+
+message DescribeRequest {}
+
+message PluginInfo {
+  string name = 1;
+  string version = 2;
+  repeated string languages = 3;
+  repeated string capabilities = 4;
+}
+
+message AnalysisRequest {
+  repeated FileInfo files = 1;
+  map<string, string> config = 2;
+}
+
+message FileInfo {
+  string path = 1;
+  bytes content = 2;
+  repeated ASTNode nodes = 3;
+}
+
+message ASTNode {
+  string kind = 1;
+  uint32 start_line = 2;
+  uint32 end_line = 3;
+  string text = 4;
+  repeated ASTNode children = 5;
+}
+
+message EntryPointsResponse {
+  repeated EntryPoint entry_points = 1;
+}
+
+message EntryPoint {
+  string symbol = 1;
+  string file = 2;
+  uint32 line = 3;
+  string reason = 4;
+  float confidence = 5;
+}
+
+message UsageQuery {
+  string symbol = 1;
+  string file = 2;
+}
+
+message UsageEvidence {
+  bool alive = 1;
+  string reason = 2;
+  repeated string references = 3;
+}
+
+message BoundaryRequest {}
+
+message BoundaryRules {
+  repeated ZoneDefinition zones = 1;
+  repeated DependencyRule rules = 2;
+}
+
+message ZoneDefinition {
+  string name = 1;
+  repeated string patterns = 2;
+}
+
+message DependencyRule {
+  string from = 1;
+  repeated string allow = 2;
+  repeated string deny = 3;
+}

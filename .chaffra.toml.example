@@ -1,0 +1,66 @@
+# chaffra configuration
+# Copy to .chaffra.toml and customize
+
+[project]
+# Entry points — files where analysis starts
+# entry = ["cmd/*/main.go", "src/**/*.py"]
+
+# Files/directories to ignore
+# ignore = ["vendor/**", "**/*_test.go", "**/__pycache__/**"]
+
+[rules]
+# Per-rule severity: "error" | "warn" | "off"
+# unused-functions = "error"
+# unused-types = "warn"
+# unused-imports = "error"
+# unused-files = "warn"
+# unused-dependencies = "error"
+# circular-dependencies = "error"
+# boundary-violations = "error"
+# stale-suppressions = "warn"
+
+[health]
+# Complexity thresholds
+# max-cyclomatic = 20
+# max-cognitive = 15
+# max-crap = 30
+# min-score = 70
+
+[boundaries]
+# Architecture preset: "layered" | "hexagonal" | "feature-sliced" | "clean"
+# preset = "layered"
+
+# Custom zones (alternative to preset):
+# [[boundaries.zones]]
+# name = "domain"
+# patterns = ["internal/domain/**"]
+#
+# [[boundaries.zones]]
+# name = "infra"
+# patterns = ["internal/infra/**"]
+#
+# [[boundaries.rules]]
+# from = "domain"
+# deny = ["infra"]
+
+[duplication]
+# min-tokens = 50
+# mode = "mild"     # strict | mild | weak | semantic
+
+[audit]
+# gate = "new-only"  # new-only | all
+# tolerance = "2%"
+
+# External framework plugins (gRPC)
+# [[plugins]]
+# name = "gin"
+# command = "chaffra-plugin-gin"  # binary in PATH
+#
+# [[plugins]]
+# name = "fastapi"
+# grpc = "localhost:50051"  # running container
+
+[framework]
+# Built-in framework awareness
+# go = ["stdlib"]        # main, init, Test*, Benchmark*
+# python = ["stdlib"]    # __main__, __init__

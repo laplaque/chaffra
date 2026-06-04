@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chaffra-core",
+    "crates/chaffra-parse",
+    "crates/chaffra-deadcode",
+    "crates/chaffra-complexity",
+    "crates/chaffra-health",
+    "crates/chaffra-duplication",
+    "crates/chaffra-arch",
+    "crates/chaffra-hotspot",
+    "crates/chaffra-audit",
+    "crates/chaffra-output",
+    "crates/chaffra-mcp",
+    "crates/chaffra-plugin",
+    "crates/chaffra-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/laplaque/chaffra"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tree-sitter = "0.24"
+gix = { version = "0.72", default-features = false, features = ["max-performance-safe"] }
+tonic = "0.13"
+prost = "0.13"
+
+chaffra-core = { path = "crates/chaffra-core" }
+chaffra-parse = { path = "crates/chaffra-parse" }
+chaffra-deadcode = { path = "crates/chaffra-deadcode" }
+chaffra-complexity = { path = "crates/chaffra-complexity" }
+chaffra-health = { path = "crates/chaffra-health" }
+chaffra-duplication = { path = "crates/chaffra-duplication" }
+chaffra-arch = { path = "crates/chaffra-arch" }
+chaffra-hotspot = { path = "crates/chaffra-hotspot" }
+chaffra-audit = { path = "crates/chaffra-audit" }
+chaffra-output = { path = "crates/chaffra-output" }
+chaffra-mcp = { path = "crates/chaffra-mcp" }
+chaffra-plugin = { path = "crates/chaffra-plugin" }
