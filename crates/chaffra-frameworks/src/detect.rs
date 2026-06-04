@@ -39,6 +39,8 @@ pub fn detect_framework_entries(
     match language {
         Language::Go => go::detect_go_frameworks(&tree, source, file),
         Language::Python => python::detect_python_frameworks(&tree, source, file),
+        // Other languages: no framework detectors registered yet.
+        _ => vec![],
     }
 }
 
