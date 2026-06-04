@@ -11,6 +11,7 @@ members = [
     "crates/chaffra-hotspot",
     "crates/chaffra-audit",
     "crates/chaffra-security",
+    "crates/chaffra-cicd-security",
     "crates/chaffra-output",
     "crates/chaffra-mcp",
     "crates/chaffra-plugin",
@@ -50,6 +51,7 @@ glob = "0.3"
 regex = "1"
 ratatui = "0.29"
 crossterm = "0.28"
+serde_yaml = "0.9"
 
 chaffra-core = { path = "crates/chaffra-core" }
 chaffra-parse = { path = "crates/chaffra-parse" }
@@ -62,6 +64,7 @@ chaffra-hotspot = { path = "crates/chaffra-hotspot" }
 chaffra-audit = { path = "crates/chaffra-audit" }
 chaffra-output = { path = "crates/chaffra-output" }
 chaffra-mcp = { path = "crates/chaffra-mcp" }
+chaffra-cicd-security = { path = "crates/chaffra-cicd-security" }
 chaffra-plugin = { path = "crates/chaffra-plugin" }
 chaffra-security = { path = "crates/chaffra-security" }
 chaffra-frameworks = { path = "crates/chaffra-frameworks" }

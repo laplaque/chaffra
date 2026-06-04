@@ -1,0 +1,14 @@
+[package]
+name = "chaffra-cicd-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CI/CD configuration security analysis: GitHub Actions, GitLab CI, Dockerfile, Docker Compose, and systemd"
+
+[dependencies]
+chaffra-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
