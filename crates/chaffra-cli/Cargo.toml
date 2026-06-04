@@ -25,6 +25,7 @@ chaffra-security = { workspace = true }
 chaffra-output = { workspace = true }
 chaffra-mcp = { workspace = true }
 chaffra-plugin = { workspace = true }
+chaffra-frameworks = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
