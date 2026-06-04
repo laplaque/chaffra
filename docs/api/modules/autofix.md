@@ -39,7 +39,7 @@ The module includes hook management:
 
 - `chaffra hooks install` -- writes a `.git/hooks/pre-commit` shell script
 - `chaffra hooks uninstall` -- removes the chaffra-managed hook
-- The hook runs `chaffra dead-code .` on staged files before each commit
+- The hook analyzes staged files only by running `chaffra dead-code` on each staged path before each commit
 
 Hooks are identified by a marker comment (`# chaffra-managed-hook`). If an existing non-chaffra hook is present, the chaffra hook is appended rather than replacing it.
 

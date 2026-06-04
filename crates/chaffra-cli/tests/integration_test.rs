@@ -916,8 +916,12 @@ fn test_hook_script_scopes_to_staged_files_integration() {
     // analysis command, not run over the entire repo.
     let script = chaffra_autofix::hooks::hook_script();
     assert!(
-        script.contains("chaffra dead-code $STAGED"),
-        "hook must scope analysis to staged files via $STAGED variable"
+        script.contains("for file in $STAGED"),
+        "hook must iterate through staged files"
+    );
+    assert!(
+        script.contains("chaffra dead-code \"$file\""),
+        "hook must scope analysis to each staged file path"
     );
     assert!(
         !script.contains("chaffra dead-code ."),
