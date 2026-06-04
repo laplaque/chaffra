@@ -1,0 +1,10 @@
+name: Secure CI
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
+      - run: echo "${{ github.sha }}"

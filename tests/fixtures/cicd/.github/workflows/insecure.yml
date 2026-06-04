@@ -1,0 +1,12 @@
+name: Insecure CI
+on: pull_request_target
+permissions: write-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v3
+      - run: echo "${{ github.event.pull_request.title }}"

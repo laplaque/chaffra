@@ -1,0 +1,16 @@
+[Unit]
+Description=Hardened Application
+After=network.target
+
+[Service]
+User=myapp
+Group=myapp
+ExecStart=/usr/bin/myapp
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
