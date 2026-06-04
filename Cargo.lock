@@ -230,6 +230,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chaffra-ai-quality"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "chaffra-parse",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chaffra-arch"
 version = "0.1.0"
 dependencies = [
@@ -262,6 +272,7 @@ name = "chaffra-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chaffra-ai-quality",
  "chaffra-arch",
  "chaffra-audit",
  "chaffra-autofix",
@@ -273,6 +284,7 @@ dependencies = [
  "chaffra-health",
  "chaffra-hotspot",
  "chaffra-impact",
+ "chaffra-llm-defense",
  "chaffra-mcp",
  "chaffra-migrate",
  "chaffra-monorepo",
@@ -367,6 +379,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "chaffra-llm-defense"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "chaffra-parse",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

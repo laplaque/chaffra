@@ -1,6 +1,7 @@
 //! chaffra -- codebase intelligence CLI.
 
 use anyhow::{Context, Result};
+use chaffra_ai_quality::AiQualityModule;
 use chaffra_autofix::AutofixModule;
 use chaffra_autofix::hooks;
 use chaffra_complexity::ComplexityModule;
@@ -9,6 +10,7 @@ use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::module::ModuleHost;
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_frameworks::FrameworksModule;
+use chaffra_llm_defense::LlmDefenseModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use chaffra_security::SecurityModule;
 use chaffra_tui::App;
@@ -65,6 +67,20 @@ enum Command {
     },
     /// Run security analysis: SAST, secret scanning, and dependency CVE checks.
     Security {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Detect AI-generated code quality issues: hallucinated APIs, stubs, disabled controls.
+    #[command(name = "ai-quality")]
+    AiQuality {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Detect LLM integration risks: prompt injection, unsafe tools, unguarded loops.
+    #[command(name = "llm-defense")]
+    LlmDefense {
         /// Path to the repository root (defaults to current directory).
         #[arg(default_value = ".")]
         path: String,
@@ -173,6 +189,8 @@ fn build_module_host() -> ModuleHost {
     let _ = host.register(Box::new(SecurityModule::new()));
     let _ = host.register(Box::new(FrameworksModule::new()));
     let _ = host.register(Box::new(AutofixModule::new()));
+    let _ = host.register(Box::new(AiQualityModule::new()));
+    let _ = host.register(Box::new(LlmDefenseModule::new()));
     host
 }
 
@@ -333,6 +351,35 @@ fn discover_security_files(root: &Path, dir: &Path, files: &mut Vec<FileInfo>) {
     }
 }
 
+fn cmd_ai_quality(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+
+    let host = build_module_host();
+    let result = host.analyze("ai-quality", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_llm_defense(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let result = host.analyze("llm-defense", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
 fn cmd_fix(
     root: &Path,
     config: &ChaffraConfig,
@@ -346,7 +393,6 @@ fn cmd_fix(
 
     let host = build_module_host();
 
-    // Run analysis to collect findings from dead-code and complexity modules.
     let dead_code_result = host.analyze("dead-code", &files, config)?;
     let mut all_findings = dead_code_result.findings;
 
@@ -761,6 +807,18 @@ async fn main() -> Result<()> {
             print!("{}", cmd_security(&root, &config, formatter.as_ref())?);
         }
 
+        Command::AiQuality { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_ai_quality(&root, &config, formatter.as_ref())?);
+        }
+
+        Command::LlmDefense { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_llm_defense(&root, &config, formatter.as_ref())?);
+        }
+
         Command::Dupes { .. } => {
             print!("{}", cmd_stub("dupes"));
         }
@@ -889,13 +947,15 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 5);
+        assert_eq!(modules.len(), 7);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
         assert!(ids.contains(&"security"));
         assert!(ids.contains(&"frameworks"));
         assert!(ids.contains(&"autofix"));
+        assert!(ids.contains(&"ai-quality"));
+        assert!(ids.contains(&"llm-defense"));
     }
 
     #[test]
@@ -1190,6 +1250,14 @@ mod tests {
             "should list frameworks module"
         );
         assert!(output.contains("autofix"), "should list autofix module");
+        assert!(
+            output.contains("ai-quality"),
+            "should list ai-quality module"
+        );
+        assert!(
+            output.contains("llm-defense"),
+            "should list llm-defense module"
+        );
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
         assert!(output.contains("Rules:"));
@@ -1302,6 +1370,64 @@ mod tests {
     fn test_cmd_explain_vulnerable_dependency() {
         let output = cmd_explain("security:vulnerable-dependency").unwrap();
         assert!(output.contains("Vulnerable dependency"));
+        assert!(output.contains("Rationale:"));
+    }
+
+    // --- cmd_ai_quality tests ---
+
+    #[test]
+    fn test_cmd_ai_quality_fixtures() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/python/ai-quality");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_ai_quality(&root, &config, formatter.as_ref()).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_cmd_ai_quality_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_ai_quality(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    // --- cmd_llm_defense tests ---
+
+    #[test]
+    fn test_cmd_llm_defense_fixtures() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/python/llm-defense");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_llm_defense(&root, &config, formatter.as_ref()).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_cmd_llm_defense_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_llm_defense(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    // --- explain for new modules ---
+
+    #[test]
+    fn test_cmd_explain_phantom_api_call() {
+        let output = cmd_explain("ai-quality:phantom-api-call").unwrap();
+        assert!(output.contains("Phantom API call"));
+        assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_unsafe_tool_use() {
+        let output = cmd_explain("llm-defense:unsafe-tool-use").unwrap();
+        assert!(output.contains("Unsafe tool use"));
         assert!(output.contains("Rationale:"));
     }
 
