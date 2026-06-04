@@ -22,18 +22,9 @@ chaffra workspaces .
 chaffra workspaces --format json .
 ```
 
-### Filter by changed workspaces
-
-```bash
-chaffra health --changed-workspaces origin/main .
-chaffra dead-code --changed-workspaces HEAD~5 .
-```
-
-### Group output by workspace
-
-```bash
-chaffra health --group-by workspace .
-```
+> **Note:** Per-workspace analysis filtering (`--changed-workspaces`) and grouped
+> output (`--group-by workspace`) are not yet exposed through the CLI. Use the
+> library API below for programmatic workspace scoping.
 
 ## API
 
