@@ -172,6 +172,22 @@ impl App {
         sorted
     }
 
+    /// Return a flat list of findings in grouped order (matching render order).
+    ///
+    /// This is the canonical ordering used for both display and selection.
+    /// The `selected` index maps into this list, ensuring the highlighted row
+    /// in the TUI always corresponds to the finding that actions operate on.
+    pub fn grouped_flat_findings(&self) -> Vec<&Finding> {
+        let groups = self.grouped_findings();
+        let mut flat = Vec::new();
+        for (_label, findings) in &groups {
+            for finding in findings {
+                flat.push(*finding);
+            }
+        }
+        flat
+    }
+
     /// Total number of visible findings.
     pub fn visible_count(&self) -> usize {
         self.visible_findings().len()
@@ -221,19 +237,16 @@ impl App {
 
     /// Apply fix for the currently selected finding.
     pub fn apply_fix(&mut self) {
-        let visible = self.visible_findings();
-        if self.selected >= visible.len() {
+        let flat = self.grouped_flat_findings();
+        if self.selected >= flat.len() {
             return;
         }
-        let has_fix = visible[self.selected]
-            .actions
-            .iter()
-            .any(|a| a.auto_fixable);
-        let rule_id = visible[self.selected].rule_id.clone();
-        drop(visible);
+        let has_fix = flat[self.selected].actions.iter().any(|a| a.auto_fixable);
+        let rule_id = flat[self.selected].rule_id.clone();
+        drop(flat);
 
         if has_fix {
-            if let Some(idx) = self.original_index(self.selected) {
+            if let Some(idx) = self.original_index_grouped(self.selected) {
                 self.pending_actions.push(TuiAction::ApplyFix(idx));
                 self.status = format!("Fix queued for: {rule_id}");
             }
@@ -244,9 +257,9 @@ impl App {
 
     /// Add suppression for the currently selected finding.
     pub fn add_suppression(&mut self) {
-        let visible = self.visible_findings();
-        if self.selected < visible.len() {
-            if let Some(idx) = self.original_index(self.selected) {
+        let flat = self.grouped_flat_findings();
+        if self.selected < flat.len() {
+            if let Some(idx) = self.original_index_grouped(self.selected) {
                 self.pending_actions.push(TuiAction::AddSuppression(idx));
                 self.status = "Suppression queued.".to_owned();
             }
@@ -255,9 +268,9 @@ impl App {
 
     /// Copy location of the currently selected finding.
     pub fn copy_location(&mut self) -> Option<String> {
-        let visible = self.visible_findings();
-        if self.selected < visible.len() {
-            let finding = visible[self.selected];
+        let flat = self.grouped_flat_findings();
+        if self.selected < flat.len() {
+            let finding = flat[self.selected];
             let location = format!("{}:{}", finding.location.file, finding.location.start_line);
             self.status = format!("Copied: {location}");
             Some(location)
@@ -293,13 +306,13 @@ impl App {
         }
     }
 
-    /// Get the original finding index for a visible index.
-    fn original_index(&self, visible_idx: usize) -> Option<usize> {
-        let visible = self.visible_findings();
-        if visible_idx >= visible.len() {
+    /// Get the original finding index for a grouped-flat index.
+    fn original_index_grouped(&self, flat_idx: usize) -> Option<usize> {
+        let flat = self.grouped_flat_findings();
+        if flat_idx >= flat.len() {
             return None;
         }
-        let target = visible[visible_idx] as *const Finding;
+        let target = flat[flat_idx] as *const Finding;
         self.findings.iter().position(|f| std::ptr::eq(f, target))
     }
 
@@ -671,6 +684,63 @@ mod tests {
 
         filter.toggle("dead-code");
         assert!(filter.includes("dead-code"));
+    }
+
+    #[test]
+    fn test_grouped_selection_action_alignment() {
+        // Regression: when grouped by severity, the render list includes
+        // group headers but `selected` indexes into findings only. Actions
+        // (fix/suppress/copy) must act on the same finding that is highlighted.
+        let findings = vec![
+            make_finding("unused-function", "a.go", 5, Severity::Warning, true),
+            make_finding("unused-import", "a.go", 3, Severity::Warning, true),
+            make_finding("high-complexity", "b.go", 10, Severity::Error, false),
+            make_finding("unused-file", "c.go", 1, Severity::Info, false),
+        ];
+        let mut app = App::new(findings);
+        app.group_by = GroupBy::Severity;
+
+        // grouped_findings() sorts by group label: Error, Info, Warning.
+        // Flat order: [high-complexity(E), unused-file(I), unused-function(W), unused-import(W)]
+        let flat = app.grouped_flat_findings();
+        assert_eq!(flat.len(), 4);
+        assert_eq!(flat[0].rule_id, "high-complexity");
+        assert_eq!(flat[1].rule_id, "unused-file");
+        assert_eq!(flat[2].rule_id, "unused-function");
+        assert_eq!(flat[3].rule_id, "unused-import");
+
+        // Select index 2 (unused-function in grouped order) and copy location.
+        app.selected = 2;
+        let loc = app.copy_location();
+        assert_eq!(
+            loc.as_deref(),
+            Some("a.go:5"),
+            "action must target the finding at grouped index 2"
+        );
+
+        // Apply fix on index 0 (high-complexity, non-fixable) -> should say no fix.
+        app.selected = 0;
+        app.apply_fix();
+        assert!(
+            app.status.contains("No auto-fix"),
+            "non-fixable finding should report no fix"
+        );
+
+        // Apply fix on index 2 (unused-function, fixable) -> should queue.
+        app.pending_actions.clear();
+        app.selected = 2;
+        app.apply_fix();
+        assert!(
+            !app.pending_actions.is_empty(),
+            "fixable finding should queue an action"
+        );
+        if let TuiAction::ApplyFix(orig_idx) = app.pending_actions[0] {
+            // The original index should point to unused-function in the
+            // original findings vec (index 0).
+            assert_eq!(app.findings[orig_idx].rule_id, "unused-function");
+        } else {
+            panic!("expected ApplyFix action");
+        }
     }
 
     #[test]

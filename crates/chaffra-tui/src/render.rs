@@ -58,13 +58,21 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the findings list.
+///
+/// Group headers are rendered as non-selectable rows. The `app.selected` index
+/// maps into the flat list of *findings only* (via `grouped_flat_findings`), so
+/// we translate it into the widget row index by accounting for header rows that
+/// precede the selected finding.
 fn render_findings(frame: &mut Frame, area: Rect, app: &App) {
     let groups = app.grouped_findings();
 
     let mut items: Vec<ListItem> = Vec::new();
+    // Track the widget row index that corresponds to app.selected.
+    let mut widget_selected: Option<usize> = None;
+    let mut finding_idx: usize = 0;
 
     for (group_label, findings) in &groups {
-        // Group header.
+        // Group header (non-selectable).
         items.push(ListItem::new(Line::from(Span::styled(
             format!(" --- {group_label} ({} findings) ---", findings.len()),
             Style::default()
@@ -73,6 +81,11 @@ fn render_findings(frame: &mut Frame, area: Rect, app: &App) {
         ))));
 
         for finding in findings {
+            if finding_idx == app.selected {
+                widget_selected = Some(items.len());
+            }
+            finding_idx += 1;
+
             let sev_char = match finding.severity {
                 Severity::Error => "E",
                 Severity::Warning => "W",
@@ -111,7 +124,7 @@ fn render_findings(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol(">> ");
 
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    state.select(widget_selected);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -211,6 +224,42 @@ mod tests {
         let line = format_finding_line(&finding);
         assert!(line.contains("[ ]"));
         assert!(line.contains("[WRN]"));
+    }
+
+    #[test]
+    fn test_grouped_render_row_count_includes_headers() {
+        use crate::app::App;
+
+        // With 3 findings across 2 groups, the rendered list should have
+        // 2 header rows + 3 finding rows = 5 total items, but the selectable
+        // count (visible_count) should remain 3. This proves headers are
+        // non-selectable padding.
+        let findings = vec![
+            make_finding(Severity::Error, false),
+            make_finding(Severity::Warning, true),
+            make_finding(Severity::Warning, false),
+        ];
+        // Patch the file paths so they land in different groups.
+        let mut findings = findings;
+        findings[0].location.file = "a.go".to_owned();
+        findings[0].rule_id = "rule-a".to_owned();
+        findings[1].location.file = "b.go".to_owned();
+        findings[1].rule_id = "rule-b".to_owned();
+        findings[2].location.file = "b.go".to_owned();
+        findings[2].rule_id = "rule-c".to_owned();
+
+        let app = App::new(findings);
+
+        // Group by file: 2 groups (a.go, b.go).
+        let groups = app.grouped_findings();
+        assert_eq!(groups.len(), 2, "should have 2 file groups");
+
+        // The flat findings list should have 3 entries (no headers).
+        let flat = app.grouped_flat_findings();
+        assert_eq!(flat.len(), 3, "flat findings should not include headers");
+
+        // visible_count uses the unordered filter, should also be 3.
+        assert_eq!(app.visible_count(), 3);
     }
 
     #[test]

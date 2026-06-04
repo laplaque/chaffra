@@ -25,10 +25,10 @@ if [ -z "$STAGED" ]; then
     exit 0
 fi
 
-# Run chaffra dead-code analysis on the repo root.
+# Run chaffra dead-code analysis scoped to staged files only.
 if command -v chaffra >/dev/null 2>&1; then
     echo "chaffra: analyzing staged files..."
-    chaffra dead-code . --format terminal
+    chaffra dead-code $STAGED --format terminal
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 0 ]; then
         echo "chaffra: analysis found issues. Commit blocked."
@@ -176,7 +176,7 @@ mod tests {
 
         let content = fs::read_to_string(&hook).unwrap();
         assert!(content.contains(HOOK_MARKER));
-        assert!(content.contains("chaffra dead-code"));
+        assert!(content.contains("chaffra dead-code $STAGED"));
 
         let meta = fs::metadata(&hook).unwrap();
         assert!(meta.permissions().mode() & 0o111 != 0);
@@ -269,6 +269,27 @@ mod tests {
         let script = hook_script();
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains(HOOK_MARKER));
+    }
+
+    #[test]
+    fn test_hook_script_scopes_to_staged_files() {
+        // The hook must pass $STAGED (the staged file list) to the analysis
+        // command instead of scanning the whole repo with ".".
+        let script = hook_script();
+
+        // The command must reference $STAGED, NOT "." as the target.
+        assert!(
+            script.contains("chaffra dead-code $STAGED"),
+            "hook must pass staged file list to analysis, not scan entire repo"
+        );
+        assert!(
+            !script.contains("chaffra dead-code ."),
+            "hook must NOT run analysis on the entire repo root"
+        );
+
+        // Unstaged/unrelated findings should never block: the hook only sees
+        // the staged file paths, so files not in $STAGED are excluded from
+        // analysis and cannot produce findings that block the commit.
     }
 
     #[test]

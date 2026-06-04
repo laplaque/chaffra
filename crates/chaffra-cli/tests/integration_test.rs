@@ -872,3 +872,97 @@ fn test_tui_fix_action() {
         assert!(!app.pending_actions.is_empty(), "should queue a fix action");
     }
 }
+
+// --- Phase 8: Regression tests for P1 fixes ---
+
+#[test]
+fn test_fix_command_includes_complexity_findings() {
+    // Regression: cmd_fix must analyze both dead-code and complexity modules,
+    // not just dead-code. Verify that the module host can produce complexity
+    // findings that would be included in a fix pass.
+    let mut host = ModuleHost::new();
+    host.register(Box::new(DeadCodeModule::new())).unwrap();
+    host.register(Box::new(ComplexityModule::new())).unwrap();
+
+    let files = load_fixture_files("go/complex");
+    let config_toml = r#"
+[modules.complexity]
+max-cyclomatic = "5"
+max-cognitive = "3"
+"#;
+    let config = chaffra_core::config::ChaffraConfig::parse(config_toml).unwrap();
+
+    let dead_code_result = host.analyze("dead-code", &files, &config).unwrap();
+    let complexity_result = host.analyze("complexity", &files, &config).unwrap();
+
+    let mut all_findings = dead_code_result.findings;
+    all_findings.extend(complexity_result.findings);
+
+    // The combined findings should include complexity rules (high-cyclomatic
+    // or high-cognitive) in addition to any dead-code rules.
+    let complexity_findings: Vec<_> = all_findings
+        .iter()
+        .filter(|f| f.rule_id.starts_with("high-"))
+        .collect();
+    assert!(
+        !complexity_findings.is_empty(),
+        "fix pass should include complexity findings with low thresholds"
+    );
+}
+
+#[test]
+fn test_hook_script_scopes_to_staged_files_integration() {
+    // Regression: the pre-commit hook must pass staged file paths to the
+    // analysis command, not run over the entire repo.
+    let script = chaffra_autofix::hooks::hook_script();
+    assert!(
+        script.contains("chaffra dead-code $STAGED"),
+        "hook must scope analysis to staged files via $STAGED variable"
+    );
+    assert!(
+        !script.contains("chaffra dead-code ."),
+        "hook must NOT scan the entire repo"
+    );
+}
+
+#[test]
+fn test_tui_grouped_selection_alignment_integration() {
+    // Regression: when findings are grouped (e.g. by severity), the selected
+    // index must map to the same finding in both the render list and the
+    // action handlers.
+    let module = DeadCodeModule::new();
+    let files = load_fixture_files("go/simple");
+    let result = module.analyze(&files, &HashMap::new()).unwrap();
+
+    if result.findings.len() < 2 {
+        return; // Need multiple findings to test grouping.
+    }
+
+    let mut app = App::new(result.findings);
+    app.group_by = chaffra_tui::GroupBy::Severity;
+
+    let count = app.grouped_flat_findings().len();
+    assert!(count >= 2, "need at least 2 findings for grouping test");
+
+    // Capture expected location from the last finding *before* mutating app.
+    let expected_loc = {
+        let flat = app.grouped_flat_findings();
+        let f = flat[count - 1];
+        format!("{}:{}", f.location.file, f.location.start_line)
+    };
+
+    // Select the last finding and copy its location.
+    app.selected = count - 1;
+    let loc = app.copy_location();
+    assert!(
+        loc.is_some(),
+        "should copy location for last grouped finding"
+    );
+
+    // The copied location must match the last finding in grouped flat order.
+    assert_eq!(
+        loc.unwrap(),
+        expected_loc,
+        "copied location must match the finding at the selected grouped index"
+    );
+}

@@ -346,9 +346,13 @@ fn cmd_fix(
 
     let host = build_module_host();
 
-    // Run analysis to collect findings.
+    // Run analysis to collect findings from dead-code and complexity modules.
     let dead_code_result = host.analyze("dead-code", &files, config)?;
     let mut all_findings = dead_code_result.findings;
+
+    if let Ok(complexity_result) = host.analyze("complexity", &files, config) {
+        all_findings.extend(complexity_result.findings);
+    }
 
     // Optionally filter by rule.
     if let Some(rule_id) = rule {
