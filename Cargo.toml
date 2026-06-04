@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.26"
 gix = { version = "0.72", default-features = false, features = ["max-performance-safe"] }
-tonic = "0.13"
+tonic = "0.14"
 prost = "0.14"
 
 chaffra-core = { path = "crates/chaffra-core" }
