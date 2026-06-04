@@ -245,7 +245,10 @@ dependencies = [
  "chaffra-frameworks",
  "chaffra-health",
  "chaffra-hotspot",
+ "chaffra-impact",
  "chaffra-mcp",
+ "chaffra-migrate",
+ "chaffra-monorepo",
  "chaffra-output",
  "chaffra-parse",
  "chaffra-plugin",
@@ -326,12 +329,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "chaffra-impact"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "chaffra-mcp"
 version = "0.1.0"
 dependencies = [
  "chaffra-core",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "chaffra-migrate"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "chaffra-monorepo"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "glob",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

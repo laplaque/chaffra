@@ -15,6 +15,9 @@ members = [
     "crates/chaffra-mcp",
     "crates/chaffra-plugin",
     "crates/chaffra-frameworks",
+    "crates/chaffra-monorepo",
+    "crates/chaffra-impact",
+    "crates/chaffra-migrate",
     "crates/chaffra-cli",
 ]
 
@@ -56,3 +59,6 @@ chaffra-mcp = { path = "crates/chaffra-mcp" }
 chaffra-plugin = { path = "crates/chaffra-plugin" }
 chaffra-security = { path = "crates/chaffra-security" }
 chaffra-frameworks = { path = "crates/chaffra-frameworks" }
+chaffra-monorepo = { path = "crates/chaffra-monorepo" }
+chaffra-impact = { path = "crates/chaffra-impact" }
+chaffra-migrate = { path = "crates/chaffra-migrate" }
