@@ -1,0 +1,17 @@
+[package]
+name = "chaffra-frameworks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Framework detection for Go and Python using tree-sitter: gin, echo, cobra, FastAPI, Django, Flask"
+
+[dependencies]
+chaffra-core = { workspace = true }
+chaffra-parse = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-python = { workspace = true }
