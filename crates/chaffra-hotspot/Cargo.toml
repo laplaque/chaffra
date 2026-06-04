@@ -10,4 +10,5 @@ description = "Hotspot ranking by combining git churn history (via gix) with com
 [dependencies]
 chaffra-core = { workspace = true }
 chaffra-complexity = { workspace = true }
-gix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
