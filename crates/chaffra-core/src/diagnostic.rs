@@ -264,3 +264,96 @@ pub struct ProjectHealth {
     pub files: Vec<FileHealthScore>,
     pub total_files: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_severity_display() {
+        let cases = vec![
+            (Severity::Info, "info"),
+            (Severity::Warning, "warning"),
+            (Severity::Error, "error"),
+        ];
+        for (sev, expected) in cases {
+            assert_eq!(sev.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_severity_from_str_loose() {
+        let cases = vec![
+            ("info", Some(Severity::Info)),
+            ("warning", Some(Severity::Warning)),
+            ("warn", Some(Severity::Warning)),
+            ("error", Some(Severity::Error)),
+            ("err", Some(Severity::Error)),
+            ("off", None),
+            ("bogus", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(Severity::from_str_loose(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_language_display() {
+        assert_eq!(Language::Go.to_string(), "go");
+        assert_eq!(Language::Python.to_string(), "python");
+    }
+
+    #[test]
+    fn test_language_from_extension() {
+        let cases = vec![
+            ("go", Some(Language::Go)),
+            ("py", Some(Language::Python)),
+            ("rs", None),
+            ("js", None),
+        ];
+        for (ext, expected) in cases {
+            assert_eq!(Language::from_extension(ext), expected, "ext: {ext}");
+        }
+    }
+
+    #[test]
+    fn test_module_id() {
+        let id = ModuleId::new("dead-code");
+        assert_eq!(id.as_str(), "dead-code");
+        assert_eq!(id.to_string(), "dead-code");
+    }
+
+    #[test]
+    fn test_health_grade_from_score() {
+        let cases = vec![
+            (100, HealthGrade::A),
+            (95, HealthGrade::A),
+            (90, HealthGrade::A),
+            (89, HealthGrade::B),
+            (80, HealthGrade::B),
+            (79, HealthGrade::C),
+            (70, HealthGrade::C),
+            (69, HealthGrade::D),
+            (60, HealthGrade::D),
+            (59, HealthGrade::F),
+            (0, HealthGrade::F),
+        ];
+        for (score, expected) in cases {
+            assert_eq!(HealthGrade::from_score(score), expected, "score: {score}");
+        }
+    }
+
+    #[test]
+    fn test_health_grade_display() {
+        let cases = vec![
+            (HealthGrade::A, "A"),
+            (HealthGrade::B, "B"),
+            (HealthGrade::C, "C"),
+            (HealthGrade::D, "D"),
+            (HealthGrade::F, "F"),
+        ];
+        for (grade, expected) in cases {
+            assert_eq!(grade.to_string(), expected);
+        }
+    }
+}

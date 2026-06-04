@@ -154,4 +154,75 @@ mod tests {
         let output = formatter.format_findings(&[]);
         assert!(output.contains("No issues found"));
     }
+
+    #[test]
+    fn test_markdown_format_result_with_health() {
+        let formatter = MarkdownFormatter;
+        let result = AnalysisResult {
+            findings: vec![
+                Finding {
+                    rule_id: "unused-function".to_owned(),
+                    message: "f unused".to_owned(),
+                    severity: Severity::Warning,
+                    location: Location {
+                        file: "a.go".to_owned(),
+                        start_line: 1,
+                        end_line: 2,
+                        start_column: 0,
+                        end_column: 0,
+                    },
+                    confidence: 1.0,
+                    actions: vec![],
+                    metadata: HashMap::new(),
+                },
+                Finding {
+                    rule_id: "high-cyclomatic".to_owned(),
+                    message: "too complex".to_owned(),
+                    severity: Severity::Error,
+                    location: Location {
+                        file: "b.go".to_owned(),
+                        start_line: 10,
+                        end_line: 20,
+                        start_column: 0,
+                        end_column: 0,
+                    },
+                    confidence: 0.9,
+                    actions: vec![],
+                    metadata: HashMap::new(),
+                },
+                Finding {
+                    rule_id: "note".to_owned(),
+                    message: "info note".to_owned(),
+                    severity: Severity::Info,
+                    location: Location {
+                        file: "c.go".to_owned(),
+                        start_line: 1,
+                        end_line: 1,
+                        start_column: 0,
+                        end_column: 0,
+                    },
+                    confidence: 1.0,
+                    actions: vec![],
+                    metadata: HashMap::new(),
+                },
+            ],
+            metrics: ModuleMetrics {
+                files_analyzed: 3,
+                duration_ms: 42,
+                counters: HashMap::new(),
+            },
+        };
+        let health = ProjectHealth {
+            score: 75,
+            grade: HealthGrade::C,
+            files: vec![],
+            total_files: 3,
+        };
+        let output = formatter.format_result(&result, Some(&health));
+        assert!(output.contains("# Chaffra Analysis Report"));
+        assert!(output.contains("Errors:** 1"));
+        assert!(output.contains("Warnings:** 1"));
+        assert!(output.contains("Info:** 1"));
+        assert!(output.contains("75"));
+    }
 }

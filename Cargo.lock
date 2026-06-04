@@ -250,6 +250,7 @@ dependencies = [
  "chaffra-plugin",
  "clap",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

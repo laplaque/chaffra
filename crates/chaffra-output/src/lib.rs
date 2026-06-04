@@ -58,3 +58,48 @@ pub fn severity_icon(severity: &Severity) -> &'static str {
         Severity::Info => "[I]",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_output_format_from_str_loose() {
+        let cases = vec![
+            ("json", Some(OutputFormat::Json)),
+            ("JSON", Some(OutputFormat::Json)),
+            ("markdown", Some(OutputFormat::Markdown)),
+            ("md", Some(OutputFormat::Markdown)),
+            ("terminal", Some(OutputFormat::Terminal)),
+            ("text", Some(OutputFormat::Terminal)),
+            ("unknown", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                OutputFormat::from_str_loose(input),
+                expected,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_formatter_all_formats() {
+        for fmt in [
+            OutputFormat::Json,
+            OutputFormat::Markdown,
+            OutputFormat::Terminal,
+        ] {
+            let formatter = create_formatter(fmt);
+            let output = formatter.format_findings(&[]);
+            assert!(!output.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_severity_icon() {
+        assert_eq!(severity_icon(&Severity::Error), "[E]");
+        assert_eq!(severity_icon(&Severity::Warning), "[W]");
+        assert_eq!(severity_icon(&Severity::Info), "[I]");
+    }
+}

@@ -775,4 +775,43 @@ mod tests {
         assert_eq!(health.score, 100);
         assert_eq!(health.grade, HealthGrade::A);
     }
+
+    #[test]
+    fn test_default_module() {
+        let module = ComplexityModule::default();
+        assert_eq!(module.describe().id, "complexity");
+    }
+
+    #[test]
+    fn test_empty_file_health() {
+        let health = compute_file_health(&[], "empty.go", 20, 15);
+        assert_eq!(health.score, 100);
+        assert_eq!(health.grade, HealthGrade::A);
+    }
+
+    #[test]
+    fn test_explain_rule() {
+        let module = ComplexityModule::new();
+        let explanation = module.explain("high-cyclomatic").unwrap();
+        assert_eq!(explanation.rule_id, "high-cyclomatic");
+        assert!(!explanation.description.is_empty());
+
+        let explanation = module.explain("high-cognitive").unwrap();
+        assert_eq!(explanation.rule_id, "high-cognitive");
+
+        let explanation = module.explain("low-health-score").unwrap();
+        assert_eq!(explanation.rule_id, "low-health-score");
+
+        assert!(module.explain("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_analyze_project_health() {
+        let files = vec![make_file(
+            "simple.go",
+            "package main\n\nfunc simple() {\n\tx := 1\n\t_ = x\n}\n",
+        )];
+        let health = analyze_project_health(&files, 20, 15).unwrap();
+        assert!(health.score >= 80);
+    }
 }

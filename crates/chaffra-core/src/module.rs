@@ -275,4 +275,33 @@ mod tests {
         let err = host.explain("nope:nope").unwrap_err();
         assert!(matches!(err, ChaffraError::ModuleNotFound(_)));
     }
+
+    #[test]
+    fn test_explain_unqualified_not_found() {
+        let mut host = ModuleHost::new();
+        host.register(Box::new(TestModule)).unwrap();
+        let err = host.explain("nonexistent-rule").unwrap_err();
+        assert!(matches!(err, ChaffraError::RuleNotFound(_)));
+    }
+
+    #[test]
+    fn test_with_builtins() {
+        let host = ModuleHost::with_builtins();
+        assert!(host.list().is_empty());
+    }
+
+    #[test]
+    fn test_default() {
+        let host = ModuleHost::default();
+        assert!(host.list().is_empty());
+    }
+
+    #[test]
+    fn test_debug() {
+        let mut host = ModuleHost::new();
+        host.register(Box::new(TestModule)).unwrap();
+        let debug = format!("{host:?}");
+        assert!(debug.contains("ModuleHost"));
+        assert!(debug.contains("test"));
+    }
 }

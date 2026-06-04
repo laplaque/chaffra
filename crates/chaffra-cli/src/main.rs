@@ -231,3 +231,55 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_build_module_host() {
+        let host = build_module_host();
+        let modules = host.list();
+        assert_eq!(modules.len(), 2);
+        let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"dead-code"));
+        assert!(ids.contains(&"complexity"));
+    }
+
+    #[test]
+    fn test_load_config_default() {
+        let dir = TempDir::new().unwrap();
+        let config = load_config(None, dir.path()).unwrap();
+        assert_eq!(config.health.max_cyclomatic, 20);
+    }
+
+    #[test]
+    fn test_load_config_from_file() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".chaffra.toml");
+        fs::write(
+            &config_path,
+            "[project]\nentry = []\n\n[health]\nmax-cyclomatic = 30\n",
+        )
+        .unwrap();
+        let config = load_config(Some(config_path.to_str().unwrap()), dir.path()).unwrap();
+        assert_eq!(config.health.max_cyclomatic, 30);
+    }
+
+    #[test]
+    fn test_load_config_missing_file() {
+        let result = load_config(Some("/nonexistent/.chaffra.toml"), Path::new("."));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_discover_and_read_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let files = discover_and_read_files(&root, &config);
+        assert!(!files.is_empty());
+        assert!(files.iter().any(|f| f.path.ends_with(".go")));
+    }
+}

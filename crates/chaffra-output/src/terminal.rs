@@ -161,4 +161,72 @@ mod tests {
         let output = formatter.format_findings(&[]);
         assert!(output.contains("No issues found"));
     }
+
+    #[test]
+    fn test_terminal_format_result_with_health() {
+        let formatter = TerminalFormatter;
+        let result = AnalysisResult {
+            findings: vec![Finding {
+                rule_id: "unused-import".to_owned(),
+                message: "import os unused".to_owned(),
+                severity: Severity::Warning,
+                location: Location {
+                    file: "app.py".to_owned(),
+                    start_line: 1,
+                    end_line: 1,
+                    start_column: 0,
+                    end_column: 0,
+                },
+                confidence: 1.0,
+                actions: vec![],
+                metadata: HashMap::new(),
+            }],
+            metrics: ModuleMetrics {
+                files_analyzed: 2,
+                duration_ms: 15,
+                counters: HashMap::new(),
+            },
+        };
+        let health = ProjectHealth {
+            score: 55,
+            grade: HealthGrade::F,
+            files: vec![
+                FileHealthScore {
+                    file: "a.py".to_owned(),
+                    score: 55,
+                    grade: HealthGrade::F,
+                    cyclomatic_penalty: 20,
+                    cognitive_penalty: 15,
+                    size_penalty: 5,
+                    nesting_penalty: 5,
+                },
+                FileHealthScore {
+                    file: "b.py".to_owned(),
+                    score: 65,
+                    grade: HealthGrade::D,
+                    cyclomatic_penalty: 15,
+                    cognitive_penalty: 10,
+                    size_penalty: 5,
+                    nesting_penalty: 5,
+                },
+                FileHealthScore {
+                    file: "c.py".to_owned(),
+                    score: 72,
+                    grade: HealthGrade::C,
+                    cyclomatic_penalty: 10,
+                    cognitive_penalty: 8,
+                    size_penalty: 5,
+                    nesting_penalty: 5,
+                },
+            ],
+            total_files: 3,
+        };
+        let output = formatter.format_result(&result, Some(&health));
+        assert!(output.contains("=== Chaffra Analysis ==="));
+        assert!(output.contains("55"));
+        assert!(output.contains("[!]")); // F grade indicator
+        assert!(output.contains("[-]")); // D grade indicator
+        assert!(output.contains("[~]")); // C grade indicator
+        assert!(output.contains("2 file(s) in 15ms"));
+    }
 }

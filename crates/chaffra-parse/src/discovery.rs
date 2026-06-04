@@ -185,4 +185,37 @@ mod tests {
         assert!(!is_ignored("src/main.go", &["vendor/**".to_owned()]));
         assert!(is_ignored("test_foo.py", &["test_*.py".to_owned()]));
     }
+
+    #[test]
+    fn test_discover_custom_ignore_patterns() {
+        let dir = std::env::temp_dir().join("chaffra_test_custom_ignore");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("generated")).unwrap();
+        fs::write(dir.join("main.go"), "package main").unwrap();
+        fs::write(dir.join("generated/gen.go"), "package gen").unwrap();
+
+        let files = discover_files(&dir, &["generated/**".to_owned()]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "main.go");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_ignore_file() {
+        let dir = std::env::temp_dir().join("chaffra_test_ignore_file");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(".chafframeignore"),
+            "# comment\nvendor/**\n\ntestdata/**\n",
+        )
+        .unwrap();
+
+        let patterns = load_ignore_file(&dir, ".chafframeignore");
+        assert_eq!(patterns, vec!["vendor/**", "testdata/**"]);
+
+        let missing = load_ignore_file(&dir, ".nonexistent");
+        assert!(missing.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
