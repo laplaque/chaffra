@@ -1,3 +1,5 @@
+// TODO(#19): coverage gate unenforceable until CI tooling lands
+
 //! CI/CD configuration security analysis module.
 //!
 //! Detects security misconfigurations in CI/CD pipeline definitions:
