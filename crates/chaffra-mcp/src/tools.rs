@@ -4,13 +4,13 @@ use crate::protocol::{ToolCallResult, ToolDefinition};
 use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::ChaffraConfig;
 use chaffra_core::diagnostic::FileInfo;
-use chaffra_core::module::ModuleHost;
+use chaffra_core::grpc::GrpcModuleHost;
 use chaffra_deadcode::DeadCodeModule;
 use std::path::Path;
 
-/// Build a module host with all available built-in modules.
-pub fn build_module_host() -> ModuleHost {
-    let mut host = ModuleHost::new();
+/// Build a module host with all available built-in modules via gRPC.
+pub fn build_module_host() -> GrpcModuleHost {
+    let mut host = GrpcModuleHost::new();
     let _ = host.register(Box::new(DeadCodeModule::new()));
     let _ = host.register(Box::new(ComplexityModule::new()));
     host

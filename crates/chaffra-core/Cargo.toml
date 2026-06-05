@@ -12,3 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+chaffra-proto = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tower = "0.5"

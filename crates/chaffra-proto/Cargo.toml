@@ -1,0 +1,16 @@
+[package]
+name = "chaffra-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Generated protobuf/gRPC stubs for the AnalysisModule service"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+tonic-prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

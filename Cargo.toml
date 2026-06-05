@@ -24,6 +24,7 @@ members = [
     "crates/chaffra-autofix",
     "crates/chaffra-tui",
     "crates/chaffra-types",
+    "crates/chaffra-proto",
     "crates/chaffra-cli",
 ]
 
@@ -56,6 +57,7 @@ serde_yaml_ng = "0.10"
 notify = { version = "8", features = ["macos_fsevent"] }
 notify-debouncer-full = "0.5"
 lsp-types = "0.97"
+tower = "0.5"
 
 chaffra-core = { path = "crates/chaffra-core" }
 chaffra-parse = { path = "crates/chaffra-parse" }
@@ -80,3 +82,4 @@ chaffra-migrate = { path = "crates/chaffra-migrate" }
 chaffra-autofix = { path = "crates/chaffra-autofix" }
 chaffra-tui = { path = "crates/chaffra-tui" }
 chaffra-types = { path = "crates/chaffra-types" }
+chaffra-proto = { path = "crates/chaffra-proto" }

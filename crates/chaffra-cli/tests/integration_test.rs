@@ -6,7 +6,8 @@ use chaffra_autofix::{AutofixModule, apply_fixes_to_files, collect_fixable, orch
 use chaffra_complexity::{ComplexityModule, analyze_project_health};
 use chaffra_core::config::ChaffraConfig;
 use chaffra_core::diagnostic::{FileInfo, HealthGrade};
-use chaffra_core::module::{AnalysisModule, ModuleHost};
+use chaffra_core::grpc::GrpcModuleHost;
+use chaffra_core::module::AnalysisModule;
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_frameworks::FrameworksModule;
 use chaffra_tui::App;
@@ -191,7 +192,7 @@ fn test_go_health_scoring_complex() {
 
 #[test]
 fn test_complexity_module_via_host() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(ComplexityModule::new())).unwrap();
 
     let files = load_fixture_files("go/complex");
@@ -204,7 +205,7 @@ fn test_complexity_module_via_host() {
 
 #[test]
 fn test_module_discovery_and_registration() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(DeadCodeModule::new())).unwrap();
     host.register(Box::new(ComplexityModule::new())).unwrap();
 
@@ -218,7 +219,7 @@ fn test_module_discovery_and_registration() {
 
 #[test]
 fn test_module_explain_via_host() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(DeadCodeModule::new())).unwrap();
     host.register(Box::new(ComplexityModule::new())).unwrap();
 
@@ -236,7 +237,7 @@ fn test_module_explain_via_host() {
 
 #[test]
 fn test_analyze_with_config() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(ComplexityModule::new())).unwrap();
 
     let files = load_fixture_files("go/complex");
@@ -468,7 +469,7 @@ fn test_flask_framework_detection() {
 
 #[test]
 fn test_frameworks_module_registration() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(DeadCodeModule::new())).unwrap();
     host.register(Box::new(ComplexityModule::new())).unwrap();
     host.register(Box::new(FrameworksModule::new())).unwrap();
@@ -482,7 +483,7 @@ fn test_frameworks_module_registration() {
 
 #[test]
 fn test_frameworks_explain_via_host() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(FrameworksModule::new())).unwrap();
 
     let explanation = host.explain("frameworks:framework-entry-point").unwrap();
@@ -565,7 +566,7 @@ port = 50052
 
 #[test]
 fn test_autofix_module_registration() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(DeadCodeModule::new())).unwrap();
     host.register(Box::new(ComplexityModule::new())).unwrap();
     host.register(Box::new(AutofixModule::new())).unwrap();
@@ -579,7 +580,7 @@ fn test_autofix_module_registration() {
 
 #[test]
 fn test_autofix_explain_rules() {
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(AutofixModule::new())).unwrap();
 
     let cases = vec!["fix-applied", "fix-conflict", "fix-skipped"];
@@ -880,7 +881,7 @@ fn test_fix_command_includes_complexity_findings() {
     // Regression: cmd_fix must analyze both dead-code and complexity modules,
     // not just dead-code. Verify that the module host can produce complexity
     // findings that would be included in a fix pass.
-    let mut host = ModuleHost::new();
+    let mut host = GrpcModuleHost::new();
     host.register(Box::new(DeadCodeModule::new())).unwrap();
     host.register(Box::new(ComplexityModule::new())).unwrap();
 
