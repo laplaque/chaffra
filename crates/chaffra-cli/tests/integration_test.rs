@@ -970,3 +970,105 @@ fn test_tui_grouped_selection_alignment_integration() {
         "copied location must match the finding at the selected grouped index"
     );
 }
+
+// --- Wire-compatibility tests: chaffra_core ↔ chaffra_types ---
+
+#[test]
+fn test_wire_compat_finding_core_to_types() {
+    let core_finding = chaffra_core::diagnostic::Finding {
+        rule_id: "unused-function".to_owned(),
+        message: "function `foo` is never used".to_owned(),
+        severity: chaffra_core::diagnostic::Severity::Warning,
+        location: chaffra_core::diagnostic::Location {
+            file: "test.go".to_owned(),
+            start_line: 5,
+            end_line: 10,
+            start_column: 0,
+            end_column: 1,
+        },
+        confidence: 0.95,
+        actions: vec![chaffra_core::diagnostic::Action {
+            description: "Remove function".to_owned(),
+            auto_fixable: true,
+            edits: vec![chaffra_core::diagnostic::TextEdit {
+                file: "test.go".to_owned(),
+                start_line: 5,
+                end_line: 10,
+                new_text: String::new(),
+            }],
+        }],
+        metadata: {
+            let mut m = HashMap::new();
+            m.insert("scope".to_owned(), "package".to_owned());
+            m
+        },
+    };
+
+    let json = serde_json::to_string(&core_finding).unwrap();
+    let types_finding: chaffra_types::Finding = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(types_finding.rule_id, core_finding.rule_id);
+    assert_eq!(types_finding.message, core_finding.message);
+    assert_eq!(types_finding.confidence, core_finding.confidence);
+    assert_eq!(types_finding.location.file, core_finding.location.file);
+    assert_eq!(
+        types_finding.location.start_line,
+        core_finding.location.start_line
+    );
+    assert_eq!(types_finding.actions.len(), 1);
+    assert_eq!(types_finding.actions[0].auto_fixable, true);
+    assert_eq!(types_finding.metadata.get("scope").unwrap(), "package");
+}
+
+#[test]
+fn test_wire_compat_finding_types_to_core() {
+    let types_finding = chaffra_types::Finding {
+        rule_id: "high-cyclomatic".to_owned(),
+        message: "complexity too high".to_owned(),
+        severity: chaffra_types::Severity::Error,
+        location: chaffra_types::Location {
+            file: "main.py".to_owned(),
+            start_line: 1,
+            end_line: 50,
+            start_column: 0,
+            end_column: 0,
+        },
+        confidence: 1.0,
+        actions: vec![],
+        metadata: HashMap::new(),
+    };
+
+    let json = serde_json::to_string(&types_finding).unwrap();
+    let core_finding: chaffra_core::diagnostic::Finding = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(core_finding.rule_id, types_finding.rule_id);
+    assert_eq!(core_finding.message, types_finding.message);
+    assert_eq!(core_finding.location.file, types_finding.location.file);
+}
+
+#[test]
+fn test_wire_compat_severity_values() {
+    for (core_sev, label) in [
+        (chaffra_core::diagnostic::Severity::Info, "\"info\""),
+        (chaffra_core::diagnostic::Severity::Warning, "\"warning\""),
+        (chaffra_core::diagnostic::Severity::Error, "\"error\""),
+    ] {
+        let core_json = serde_json::to_string(&core_sev).unwrap();
+        assert_eq!(core_json, label);
+        let types_sev: chaffra_types::Severity = serde_json::from_str(&core_json).unwrap();
+        let types_json = serde_json::to_string(&types_sev).unwrap();
+        assert_eq!(core_json, types_json);
+    }
+}
+
+#[test]
+fn test_wire_compat_health_grade_values() {
+    for score in [100, 90, 85, 75, 65, 50, 0] {
+        let core_grade = chaffra_core::diagnostic::HealthGrade::from_score(score);
+        let types_grade = chaffra_types::HealthGrade::from_score(score);
+
+        let core_json = serde_json::to_string(&core_grade).unwrap();
+        let types_json = serde_json::to_string(&types_grade).unwrap();
+        assert_eq!(core_json, types_json, "grade mismatch at score={score}");
+    }
+}

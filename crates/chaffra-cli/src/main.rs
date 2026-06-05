@@ -1,5 +1,8 @@
 //! chaffra -- codebase intelligence CLI.
 
+mod lsp;
+mod watch;
+
 use anyhow::{Context, Result};
 use chaffra_ai_quality::AiQualityModule;
 use chaffra_audit::AuditModule;
@@ -32,7 +35,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Output format: json, markdown, terminal, pr-comment, annotations, codeclimate.
+    /// Output format: json, markdown, terminal, pr-comment, annotations, codeclimate, badge.
     #[arg(long, global = true, default_value = "terminal")]
     format: String,
 
@@ -107,6 +110,10 @@ enum Command {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Start the MCP server (JSON-RPC 2.0 over stdio).
+    Mcp,
+    /// Start the LSP server (Language Server Protocol over stdio).
+    Lsp,
     /// Apply automated fixes for flagged issues where safe to do so.
     Fix {
         /// Path to the repository root (defaults to current directory).
@@ -197,7 +204,7 @@ enum HooksAction {
     },
 }
 
-fn build_module_host() -> ModuleHost {
+pub(crate) fn build_module_host() -> ModuleHost {
     let mut host = ModuleHost::new();
     // Register built-in modules.
     let _ = host.register(Box::new(DeadCodeModule::new()));
@@ -973,8 +980,23 @@ async fn main() -> Result<()> {
             print!("{}", cmd_stub("dupes"));
         }
 
-        Command::Watch { .. } => {
-            print!("{}", cmd_stub("watch"));
+        Command::Watch { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            let watch_config = watch::WatchConfig::new(root, format, config);
+            watch::run_watch(watch_config)?;
+        }
+
+        Command::Mcp => {
+            let mut server = chaffra_mcp::McpServer::new();
+            server
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+        }
+
+        Command::Lsp => {
+            lsp::run_lsp_server().await?;
         }
 
         Command::Fix {
@@ -1175,6 +1197,18 @@ mod tests {
         assert_eq!(output, "No source files found.\n");
     }
 
+    #[test]
+    fn test_cmd_health_badge_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Badge);
+        let output = cmd_health(&root, &config, formatter.as_ref()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("invalid badge JSON: {e}\n{output}"));
+        assert!(parsed["schemaVersion"].is_number());
+        assert!(parsed["color"].is_string());
+    }
+
     // --- cmd_dead_code tests ---
 
     #[test]
@@ -1226,6 +1260,16 @@ mod tests {
         let formatter = create_formatter(OutputFormat::Markdown);
         let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_cmd_dead_code_badge_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Badge);
+        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed["schemaVersion"].is_number());
     }
 
     // --- stub commands ---
