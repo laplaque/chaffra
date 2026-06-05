@@ -33,6 +33,10 @@ pub enum ChaffraError {
     #[error("analysis error: {0}")]
     Analysis(String),
 
+    /// A proto response was malformed or missing required fields.
+    #[error("proto conversion error: {0}")]
+    ProtoConversion(String),
+
     /// Parse error from tree-sitter or other parser.
     #[error("parse error: {0}")]
     Parse(String),

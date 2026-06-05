@@ -2,6 +2,27 @@
 
 The `AnalysisModule` service is defined in `proto/chaffra/module/v1/module.proto` and is the universal interface for all chaffra analysis modules.
 
+## Transport Architecture
+
+All module dispatch -- both built-in and external -- uses gRPC as the transport layer.
+
+### Built-in modules (in-process gRPC)
+
+Built-in modules implement the Rust `AnalysisModule` trait. Each trait impl is wrapped in a `GrpcModuleService` (a tonic gRPC server) and connected to a tonic `AnalysisModuleClient` via the server's `tower::Service` implementation directly -- no TCP socket, no network. All calls go through full proto serialization (prost encode/decode) with low transport overhead (validated < 10ms/call in benchmarks).
+
+Key components:
+- `GrpcModuleService` -- implements the tonic server trait by delegating to `Arc<dyn AnalysisModule>`
+- `GrpcModuleHandle` -- wraps the tonic client connected to the in-process server
+- `GrpcModuleHost` -- the central registry; stores handles by module ID and dispatches analyze/explain/fix calls through gRPC
+
+### External modules (networked gRPC)
+
+Framework-specific modules (gin, FastAPI, Django, etc.) run as separate containers and communicate over real gRPC transport on configured ports. They implement the same proto service definition.
+
+### Why gRPC everywhere?
+
+Using a single dispatch mechanism simplifies the architecture: there is one code path for analyze/explain/fix regardless of whether the module is in-process or remote. The in-process path pays a small serialization cost (validated to be under 10ms/call in benchmarks) but gains full proto contract validation on every call.
+
 ## Service Definition
 
 ```protobuf

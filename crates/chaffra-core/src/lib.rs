@@ -7,5 +7,6 @@
 pub mod config;
 pub mod diagnostic;
 pub mod error;
+pub mod grpc;
 pub mod module;
 pub mod telemetry;

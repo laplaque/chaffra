@@ -12,7 +12,7 @@ use chaffra_cicd_security::CicdSecurityModule;
 use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
-use chaffra_core::module::ModuleHost;
+use chaffra_core::grpc::GrpcModuleHost;
 use chaffra_deadcode::DeadCodeModule;
 use chaffra_frameworks::FrameworksModule;
 use chaffra_hotspot::HotspotModule;
@@ -204,9 +204,10 @@ enum HooksAction {
     },
 }
 
-pub(crate) fn build_module_host() -> ModuleHost {
-    let mut host = ModuleHost::new();
-    // Register built-in modules.
+pub(crate) fn build_module_host() -> GrpcModuleHost {
+    let mut host = GrpcModuleHost::new();
+    // Register built-in modules. Each module is wrapped in a GrpcModuleHandle
+    // that starts an in-process gRPC service (tower::Service, no TCP).
     let _ = host.register(Box::new(DeadCodeModule::new()));
     let _ = host.register(Box::new(ComplexityModule::new()));
     let _ = host.register(Box::new(SecurityModule::new()));
