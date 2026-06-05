@@ -31,10 +31,14 @@ chaffra-llm-defense = { workspace = true }
 chaffra-monorepo = { workspace = true }
 chaffra-impact = { workspace = true }
 chaffra-migrate = { workspace = true }
+chaffra-autofix = { workspace = true }
+chaffra-tui = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

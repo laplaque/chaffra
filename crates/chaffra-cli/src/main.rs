@@ -2,6 +2,8 @@
 
 use anyhow::{Context, Result};
 use chaffra_ai_quality::AiQualityModule;
+use chaffra_autofix::AutofixModule;
+use chaffra_autofix::hooks;
 use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
@@ -11,7 +13,9 @@ use chaffra_frameworks::FrameworksModule;
 use chaffra_llm_defense::LlmDefenseModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use chaffra_security::SecurityModule;
+use chaffra_tui::App;
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Parser)]
@@ -92,6 +96,25 @@ enum Command {
         /// Path to the repository root (defaults to current directory).
         #[arg(default_value = ".")]
         path: String,
+
+        /// Preview fixes without applying them.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply fixes for a specific rule only.
+        #[arg(long)]
+        rule: Option<String>,
+    },
+    /// Manage pre-commit hooks.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+    /// Launch the terminal UI for browsing findings.
+    Tui {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
     },
     /// Explain a specific diagnostic rule in plain language.
     Explain {
@@ -142,6 +165,22 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Install the chaffra pre-commit hook.
+    Install {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Uninstall the chaffra pre-commit hook.
+    Uninstall {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+}
+
 fn build_module_host() -> ModuleHost {
     let mut host = ModuleHost::new();
     // Register built-in modules.
@@ -149,6 +188,7 @@ fn build_module_host() -> ModuleHost {
     let _ = host.register(Box::new(ComplexityModule::new()));
     let _ = host.register(Box::new(SecurityModule::new()));
     let _ = host.register(Box::new(FrameworksModule::new()));
+    let _ = host.register(Box::new(AutofixModule::new()));
     let _ = host.register(Box::new(AiQualityModule::new()));
     let _ = host.register(Box::new(LlmDefenseModule::new()));
     host
@@ -320,6 +360,7 @@ fn cmd_ai_quality(
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
+
     let host = build_module_host();
     let result = host.analyze("ai-quality", &files, config)?;
     Ok(formatter.format_findings(&result.findings))
@@ -337,6 +378,210 @@ fn cmd_llm_defense(
     let host = build_module_host();
     let result = host.analyze("llm-defense", &files, config)?;
     Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_fix(
+    root: &Path,
+    config: &ChaffraConfig,
+    dry_run: bool,
+    rule: Option<&str>,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+
+    let host = build_module_host();
+
+    let dead_code_result = host.analyze("dead-code", &files, config)?;
+    let mut all_findings = dead_code_result.findings;
+
+    match host.analyze("complexity", &files, config) {
+        Ok(result) => all_findings.extend(result.findings),
+        Err(e) => eprintln!("warning: complexity analysis failed: {e}"),
+    }
+
+    // Optionally filter by rule.
+    if let Some(rule_id) = rule {
+        all_findings.retain(|f| f.rule_id == rule_id);
+    }
+
+    // Collect fixable findings.
+    let fixable = chaffra_autofix::collect_fixable(&all_findings);
+    if fixable.is_empty() {
+        return Ok("No auto-fixable findings.\n".to_owned());
+    }
+
+    // Orchestrate fixes.
+    let fixable_owned: Vec<_> = fixable.into_iter().cloned().collect();
+    let results = chaffra_autofix::orchestrate_fixes(&fixable_owned, dry_run)?;
+
+    // If not dry run, apply edits to files on disk.
+    if !dry_run {
+        // Read current file contents.
+        let mut file_contents: HashMap<String, String> = HashMap::new();
+        for result in &results {
+            for edit in &result.edits {
+                if !file_contents.contains_key(&edit.file) {
+                    let full_path = root.join(&edit.file);
+                    if let Ok(content) = std::fs::read_to_string(&full_path) {
+                        file_contents.insert(edit.file.clone(), content);
+                    }
+                }
+            }
+        }
+
+        let new_contents = chaffra_autofix::apply_fixes_to_files(&file_contents, &results);
+        for (file, content) in &new_contents {
+            let full_path = root.join(file);
+            std::fs::write(&full_path, content)
+                .with_context(|| format!("failed to write {file}"))?;
+        }
+    }
+
+    // Format output.
+    let mut out = String::new();
+    let applied = results.iter().filter(|r| r.applied).count();
+    let skipped = results.iter().filter(|r| !r.applied).count();
+
+    if dry_run {
+        out.push_str(&format!(
+            "Dry run: {} fixes would be applied, {} skipped.\n",
+            results.iter().filter(|r| r.reason == "dry run").count(),
+            results.iter().filter(|r| r.reason != "dry run").count(),
+        ));
+    } else {
+        out.push_str(&format!("Applied {applied} fixes, skipped {skipped}.\n"));
+    }
+
+    for result in &results {
+        let status = if result.applied { "APPLIED" } else { "SKIPPED" };
+        out.push_str(&format!(
+            "  [{status}] {} - {}\n",
+            result.rule_id, result.reason,
+        ));
+    }
+
+    Ok(out)
+}
+
+fn cmd_hooks_install(path: &Path) -> Result<String> {
+    match hooks::install_hook(path) {
+        Ok(result) => Ok(format!("{result}\n")),
+        Err(e) => anyhow::bail!("{e}"),
+    }
+}
+
+fn cmd_hooks_uninstall(path: &Path) -> Result<String> {
+    match hooks::uninstall_hook(path) {
+        Ok(result) => Ok(format!("{result}\n")),
+        Err(e) => anyhow::bail!("{e}"),
+    }
+}
+
+fn cmd_tui(root: &Path, config: &ChaffraConfig) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+
+    let host = build_module_host();
+    let dead_code_result = host.analyze("dead-code", &files, config)?;
+    let mut all_findings = dead_code_result.findings;
+
+    match host.analyze("complexity", &files, config) {
+        Ok(result) => all_findings.extend(result.findings),
+        Err(e) => eprintln!("warning: complexity analysis failed: {e}"),
+    }
+
+    if all_findings.is_empty() {
+        return Ok("No findings to display.\n".to_owned());
+    }
+
+    // Run the TUI.
+    run_tui(all_findings, root)?;
+
+    Ok(String::new())
+}
+
+fn run_tui(findings: Vec<chaffra_core::diagnostic::Finding>, root: &Path) -> Result<()> {
+    use crossterm::event::{self, Event, KeyCode};
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)
+        .context("failed to enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
+
+    let mut app = App::new(findings);
+
+    loop {
+        terminal
+            .draw(|frame| chaffra_tui::render::render(frame, &app))
+            .context("failed to draw frame")?;
+
+        if let Event::Key(key) = event::read().context("failed to read event")? {
+            match key.code {
+                KeyCode::Char(c) => app.handle_key(c),
+                KeyCode::Up => app.move_up(),
+                KeyCode::Down => app.move_down(),
+                KeyCode::Home => app.move_to_top(),
+                KeyCode::End => app.move_to_bottom(),
+                KeyCode::Esc => app.quit(),
+                _ => {}
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+
+        // Process pending fix actions.
+        let actions: Vec<_> = app.pending_actions.drain(..).collect();
+        for action in actions {
+            if let chaffra_tui::TuiAction::ApplyFix(idx) = action {
+                if idx < app.findings.len() {
+                    let finding = &app.findings[idx];
+                    let results =
+                        chaffra_autofix::orchestrate_fixes(std::slice::from_ref(finding), false)?;
+                    if let Some(result) = results.first() {
+                        if result.applied {
+                            // Apply to disk.
+                            let mut file_contents = HashMap::new();
+                            for edit in &result.edits {
+                                let full_path = root.join(&edit.file);
+                                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                                    file_contents.insert(edit.file.clone(), content);
+                                }
+                            }
+                            let new_contents =
+                                chaffra_autofix::apply_fixes_to_files(&file_contents, &results);
+                            for (file, content) in &new_contents {
+                                let full_path = root.join(file);
+                                std::fs::write(&full_path, content)?;
+                            }
+                            app.status = format!("Fix applied: {}", result.rule_id);
+                        } else {
+                            app.status = format!("Fix skipped: {}", result.reason);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    disable_raw_mode().context("failed to disable raw mode")?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .context("failed to leave alternate screen")?;
+    terminal.show_cursor().context("failed to show cursor")?;
+
+    Ok(())
 }
 
 fn cmd_stub(_name: &str) -> String {
@@ -587,8 +832,46 @@ async fn main() -> Result<()> {
             print!("{}", cmd_stub("watch"));
         }
 
-        Command::Fix { .. } => {
-            print!("{}", cmd_stub("fix"));
+        Command::Fix {
+            path,
+            dry_run,
+            rule,
+        } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_fix(&root, &config, dry_run, rule.as_deref())?);
+        }
+
+        Command::Hooks { action } => match action {
+            HooksAction::Install { path } => {
+                let root = Path::new(&path).canonicalize().context("invalid path")?;
+                match cmd_hooks_install(&root) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            HooksAction::Uninstall { path } => {
+                let root = Path::new(&path).canonicalize().context("invalid path")?;
+                match cmd_hooks_uninstall(&root) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
+        Command::Tui { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            let output = cmd_tui(&root, &config)?;
+            if !output.is_empty() {
+                print!("{output}");
+            }
         }
 
         Command::Explain { id } => match cmd_explain(&id) {
@@ -665,12 +948,13 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 6);
+        assert_eq!(modules.len(), 7);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
         assert!(ids.contains(&"security"));
         assert!(ids.contains(&"frameworks"));
+        assert!(ids.contains(&"autofix"));
         assert!(ids.contains(&"ai-quality"));
         assert!(ids.contains(&"llm-defense"));
     }
@@ -813,9 +1097,83 @@ mod tests {
         assert_eq!(cmd_stub("watch"), "not yet implemented\n");
     }
 
+    // --- cmd_fix tests ---
+
     #[test]
-    fn test_cmd_stub_fix() {
-        assert_eq!(cmd_stub("fix"), "not yet implemented\n");
+    fn test_cmd_fix_dry_run() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let output = cmd_fix(&root, &config, true, None).unwrap();
+        assert!(output.contains("Dry run") || output.contains("No auto-fixable"));
+    }
+
+    #[test]
+    fn test_cmd_fix_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let output = cmd_fix(dir.path(), &config, true, None).unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    #[test]
+    fn test_cmd_fix_with_rule_filter() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let output = cmd_fix(&root, &config, true, Some("unused-function")).unwrap();
+        // Should either find fixable findings or report none.
+        assert!(
+            output.contains("Dry run") || output.contains("No auto-fixable"),
+            "unexpected output: {output}"
+        );
+    }
+
+    #[test]
+    fn test_cmd_fix_with_nonexistent_rule() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let output = cmd_fix(&root, &config, true, Some("nonexistent-rule")).unwrap();
+        assert_eq!(output, "No auto-fixable findings.\n");
+    }
+
+    // --- cmd_hooks tests ---
+
+    #[test]
+    fn test_cmd_hooks_install() {
+        let dir = TempDir::new().unwrap();
+        let hooks_dir = dir.path().join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+
+        let output = cmd_hooks_install(dir.path()).unwrap();
+        assert!(output.contains("installed"));
+    }
+
+    #[test]
+    fn test_cmd_hooks_install_no_git() {
+        let dir = TempDir::new().unwrap();
+        let result = cmd_hooks_install(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cmd_hooks_uninstall() {
+        let dir = TempDir::new().unwrap();
+        let hooks_dir = dir.path().join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+
+        // Install first, then uninstall.
+        hooks::install_hook(dir.path()).unwrap();
+        let output = cmd_hooks_uninstall(dir.path()).unwrap();
+        assert!(output.contains("uninstalled") || output.contains("Uninstalled"));
+    }
+
+    #[test]
+    fn test_cmd_hooks_uninstall_not_installed() {
+        let dir = TempDir::new().unwrap();
+        let hooks_dir = dir.path().join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+
+        let output = cmd_hooks_uninstall(dir.path()).unwrap();
+        assert!(output.contains("No chaffra") || output.contains("not found"));
     }
 
     // --- cmd_explain tests ---
@@ -835,6 +1193,13 @@ mod tests {
         let output = cmd_explain("complexity:high-cyclomatic").unwrap();
         assert!(output.contains("High cyclomatic complexity"));
         assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_explain_autofix_rule() {
+        let output = cmd_explain("autofix:fix-conflict").unwrap();
+        assert!(output.contains("Fix conflict"));
+        assert!(output.contains("overlapping"));
     }
 
     #[test]
@@ -885,6 +1250,7 @@ mod tests {
             output.contains("frameworks"),
             "should list frameworks module"
         );
+        assert!(output.contains("autofix"), "should list autofix module");
         assert!(
             output.contains("ai-quality"),
             "should list ai-quality module"
@@ -1358,5 +1724,15 @@ mod tests {
             total as u64, sum_by_rule,
             "total_findings metric should equal sum of all finding_counts"
         );
+    }
+
+    // --- cmd_tui tests (non-interactive only) ---
+
+    #[test]
+    fn test_cmd_tui_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let output = cmd_tui(dir.path(), &config).unwrap();
+        assert_eq!(output, "No source files found.\n");
     }
 }
