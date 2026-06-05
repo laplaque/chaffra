@@ -29,9 +29,13 @@ fi
 if command -v chaffra >/dev/null 2>&1; then
     echo "chaffra: analyzing staged files..."
     FAIL=0
+    OLD_IFS="$IFS"
+    IFS='
+'
     for file in $STAGED; do
         chaffra dead-code "$file" --format terminal || FAIL=1
     done
+    IFS="$OLD_IFS"
     if [ $FAIL -ne 0 ]; then
         echo "chaffra: findings detected in staged files"
         exit 1
@@ -336,6 +340,13 @@ mod tests {
         assert!(
             !script.contains("set -e"),
             "must not use set -e — it would abort on first failure in the loop"
+        );
+
+        // IFS must be set to newline-only before the loop to handle
+        // filenames with spaces correctly.
+        assert!(
+            script.contains("IFS="),
+            "must set IFS to newline-only for whitespace-safe iteration"
         );
     }
 

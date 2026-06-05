@@ -396,8 +396,9 @@ fn cmd_fix(
     let dead_code_result = host.analyze("dead-code", &files, config)?;
     let mut all_findings = dead_code_result.findings;
 
-    if let Ok(complexity_result) = host.analyze("complexity", &files, config) {
-        all_findings.extend(complexity_result.findings);
+    match host.analyze("complexity", &files, config) {
+        Ok(result) => all_findings.extend(result.findings),
+        Err(e) => eprintln!("warning: complexity analysis failed: {e}"),
     }
 
     // Optionally filter by rule.
@@ -488,9 +489,9 @@ fn cmd_tui(root: &Path, config: &ChaffraConfig) -> Result<String> {
     let dead_code_result = host.analyze("dead-code", &files, config)?;
     let mut all_findings = dead_code_result.findings;
 
-    // Also run complexity analysis for more findings.
-    if let Ok(complexity_result) = host.analyze("complexity", &files, config) {
-        all_findings.extend(complexity_result.findings);
+    match host.analyze("complexity", &files, config) {
+        Ok(result) => all_findings.extend(result.findings),
+        Err(e) => eprintln!("warning: complexity analysis failed: {e}"),
     }
 
     if all_findings.is_empty() {
