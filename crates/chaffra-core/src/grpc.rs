@@ -165,7 +165,7 @@ impl GrpcModuleHandle {
             .await
             .map_err(|e| ChaffraError::Analysis(format!("gRPC describe failed: {e}")))?;
 
-        Ok(convert::module_info_from_proto(&response.into_inner()))
+        convert::module_info_from_proto(&response.into_inner())
     }
 
     /// Call `Analyze` via gRPC.
@@ -202,7 +202,7 @@ impl GrpcModuleHandle {
             .await
             .map_err(|e| ChaffraError::Analysis(format!("gRPC explain failed: {e}")))?;
 
-        Ok(convert::rule_explanation_from_proto(&response.into_inner()))
+        convert::rule_explanation_from_proto(&response.into_inner())
     }
 
     /// Call `Fix` via gRPC.
@@ -776,7 +776,7 @@ mod tests {
         };
 
         let proto = convert::module_info_to_proto(&original);
-        let restored = convert::module_info_from_proto(&proto);
+        let restored = convert::module_info_from_proto(&proto).unwrap();
 
         assert_eq!(original.id, restored.id);
         assert_eq!(original.name, restored.name);
@@ -805,7 +805,7 @@ mod tests {
         };
 
         let proto = convert::rule_explanation_to_proto(&original);
-        let restored = convert::rule_explanation_from_proto(&proto);
+        let restored = convert::rule_explanation_from_proto(&proto).unwrap();
 
         assert_eq!(original.rule_id, restored.rule_id);
         assert_eq!(original.name, restored.name);
@@ -931,6 +931,58 @@ mod tests {
             }),
         };
         let err = convert::analysis_result_from_proto(&proto_response).unwrap_err();
+        assert!(matches!(err, ChaffraError::ProtoConversion(_)));
+    }
+
+    /// Regression: finding_from_proto rejects invalid severity strings.
+    #[test]
+    fn test_finding_from_proto_invalid_severity() {
+        let proto_finding = chaffra_proto::proto::Finding {
+            rule_id: "test-rule".to_owned(),
+            message: "bad severity".to_owned(),
+            severity: "critical".to_owned(),
+            location: Some(chaffra_proto::proto::Location {
+                file: "test.go".to_owned(),
+                start_line: 1,
+                end_line: 1,
+                start_column: 0,
+                end_column: 10,
+            }),
+            confidence: 0.9,
+            actions: vec![],
+            metadata: Default::default(),
+        };
+        let err = convert::finding_from_proto(&proto_finding).unwrap_err();
+        assert!(matches!(err, ChaffraError::ProtoConversion(_)));
+    }
+
+    /// Regression: rule_from_proto rejects invalid default_severity.
+    #[test]
+    fn test_rule_from_proto_invalid_severity() {
+        let proto_rule = chaffra_proto::proto::RuleInfo {
+            id: "test-rule".to_owned(),
+            name: "Test".to_owned(),
+            description: "desc".to_owned(),
+            default_severity: "high".to_owned(),
+            category: "test".to_owned(),
+        };
+        let err = convert::rule_from_proto(&proto_rule).unwrap_err();
+        assert!(matches!(err, ChaffraError::ProtoConversion(_)));
+    }
+
+    /// Regression: rule_explanation_from_proto rejects invalid default_severity.
+    #[test]
+    fn test_rule_explanation_from_proto_invalid_severity() {
+        let proto_explanation = chaffra_proto::proto::ExplainResponse {
+            rule_id: "test-rule".to_owned(),
+            name: "Test".to_owned(),
+            description: "desc".to_owned(),
+            rationale: "reason".to_owned(),
+            default_severity: "".to_owned(),
+            suppression_syntax: "// ignore".to_owned(),
+            examples: vec![],
+        };
+        let err = convert::rule_explanation_from_proto(&proto_explanation).unwrap_err();
         assert!(matches!(err, ChaffraError::ProtoConversion(_)));
     }
 }

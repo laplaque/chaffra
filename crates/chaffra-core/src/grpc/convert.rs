@@ -86,8 +86,10 @@ fn severity_to_string(sev: diagnostic::Severity) -> String {
     sev.to_string()
 }
 
-fn severity_from_string(s: &str) -> diagnostic::Severity {
-    diagnostic::Severity::from_str_loose(s).unwrap_or(diagnostic::Severity::Warning)
+fn severity_from_string(s: &str) -> crate::error::Result<diagnostic::Severity> {
+    diagnostic::Severity::from_str_loose(s).ok_or_else(|| {
+        crate::error::ChaffraError::ProtoConversion(format!("unknown severity value: '{s}'"))
+    })
 }
 
 // --- Finding ---
@@ -119,7 +121,7 @@ pub fn finding_from_proto(f: &proto::Finding) -> crate::error::Result<diagnostic
     Ok(diagnostic::Finding {
         rule_id: f.rule_id.clone(),
         message: f.message.clone(),
-        severity: severity_from_string(&f.severity),
+        severity: severity_from_string(&f.severity)?,
         location,
         confidence: f.confidence,
         actions: f.actions.iter().map(action_from_proto).collect(),
@@ -188,14 +190,14 @@ pub fn rule_to_proto(r: &diagnostic::Rule) -> proto::RuleInfo {
     }
 }
 
-pub fn rule_from_proto(r: &proto::RuleInfo) -> diagnostic::Rule {
-    diagnostic::Rule {
+pub fn rule_from_proto(r: &proto::RuleInfo) -> crate::error::Result<diagnostic::Rule> {
+    Ok(diagnostic::Rule {
         id: r.id.clone(),
         name: r.name.clone(),
         description: r.description.clone(),
-        default_severity: severity_from_string(&r.default_severity),
+        default_severity: severity_from_string(&r.default_severity)?,
         category: r.category.clone(),
-    }
+    })
 }
 
 // --- ModuleInfo ---
@@ -211,15 +213,18 @@ pub fn module_info_to_proto(info: &diagnostic::ModuleInfo) -> proto::ModuleInfo 
     }
 }
 
-pub fn module_info_from_proto(info: &proto::ModuleInfo) -> diagnostic::ModuleInfo {
-    diagnostic::ModuleInfo {
+pub fn module_info_from_proto(
+    info: &proto::ModuleInfo,
+) -> crate::error::Result<diagnostic::ModuleInfo> {
+    let rules: crate::error::Result<Vec<_>> = info.rules.iter().map(rule_from_proto).collect();
+    Ok(diagnostic::ModuleInfo {
         id: info.id.clone(),
         name: info.name.clone(),
         version: info.version.clone(),
         languages: info.languages.clone(),
         capabilities: info.capabilities.clone(),
-        rules: info.rules.iter().map(rule_from_proto).collect(),
-    }
+        rules: rules?,
+    })
 }
 
 // --- RuleExplanation ---
@@ -236,16 +241,18 @@ pub fn rule_explanation_to_proto(e: &diagnostic::RuleExplanation) -> proto::Expl
     }
 }
 
-pub fn rule_explanation_from_proto(e: &proto::ExplainResponse) -> diagnostic::RuleExplanation {
-    diagnostic::RuleExplanation {
+pub fn rule_explanation_from_proto(
+    e: &proto::ExplainResponse,
+) -> crate::error::Result<diagnostic::RuleExplanation> {
+    Ok(diagnostic::RuleExplanation {
         rule_id: e.rule_id.clone(),
         name: e.name.clone(),
         description: e.description.clone(),
         rationale: e.rationale.clone(),
-        default_severity: severity_from_string(&e.default_severity),
+        default_severity: severity_from_string(&e.default_severity)?,
         suppression_syntax: e.suppression_syntax.clone(),
         examples: e.examples.clone(),
-    }
+    })
 }
 
 // --- FixResult ---
