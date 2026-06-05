@@ -529,6 +529,7 @@ fn extract_assigned_vars(line: &str, lang: Language) -> Vec<String> {
                 }
             }
         }
+        _ => {} // Other languages: no SAST variable extraction yet.
     }
     vars
 }
@@ -596,6 +597,7 @@ fn propagate_taint(
                 None
             }
         }),
+        _ => None, // Other languages: no taint propagation yet.
     };
 
     if let Some(rhs_start) = eq_pos {
@@ -658,12 +660,11 @@ fn check_parameter_taint(
                 }
             }
         }
-        Language::Python => {
-            // Flask/Django views often have `request` as a global or parameter.
-            if header.contains("request") {
-                tainted.insert("request".to_owned(), "HTTP request object");
-            }
+        // Flask/Django views often have `request` as a global or parameter.
+        Language::Python if header.contains("request") => {
+            tainted.insert("request".to_owned(), "HTTP request object");
         }
+        _ => {} // Other languages (and Python without request): no parameter taint patterns yet.
     }
 }
 

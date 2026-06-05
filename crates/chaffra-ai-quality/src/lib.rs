@@ -448,6 +448,11 @@ fn import_local_name(imp: &ImportInfo, lang: Language) -> String {
             .as_deref()
             .unwrap_or_else(|| imp.path.rsplit('.').next().unwrap_or(&imp.path))
             .to_owned(),
+        _ => imp
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| imp.path.rsplit('/').next().unwrap_or(&imp.path))
+            .to_owned(),
     }
 }
 
@@ -666,6 +671,7 @@ fn detect_missing_decorators(fd: &FileData, findings: &mut Vec<Finding>) {
                 }
             }
         }
+        _ => {}
     }
 }
 
@@ -722,12 +728,14 @@ fn detect_disabled_controls(fd: &FileData, findings: &mut Vec<Finding>) {
         let is_comment = match fd.language {
             Language::Python => trimmed.starts_with('#'),
             Language::Go => trimmed.starts_with("//"),
+            _ => false,
         };
 
         if is_comment {
             let comment_body = match fd.language {
                 Language::Python => trimmed.trim_start_matches('#').trim(),
                 Language::Go => trimmed.trim_start_matches("//").trim(),
+                _ => "",
             };
 
             if looks_like_disabled_security_check(comment_body) {
@@ -751,50 +759,49 @@ fn detect_disabled_controls(fd: &FileData, findings: &mut Vec<Finding>) {
 
         // Pattern 2: if false / if False gating security code.
         match fd.language {
-            Language::Go => {
+            Language::Go
                 if (trimmed.starts_with("if false {") || trimmed.starts_with("if false{"))
                     && (line_contains_security_keyword(trimmed)
-                        || next_lines_contain_security(&lines, i))
-                {
-                    findings.push(Finding {
-                        rule_id: "disabled-control".to_owned(),
-                        message: "`if false` gates a security check".to_owned(),
-                        severity: Severity::Error,
-                        location: Location {
-                            file: fd.path.clone(),
-                            start_line: line_num,
-                            end_line: line_num,
-                            start_column: 0,
-                            end_column: 0,
-                        },
-                        confidence: 0.9,
-                        actions: vec![],
-                        metadata: HashMap::new(),
-                    });
-                }
+                        || next_lines_contain_security(&lines, i)) =>
+            {
+                findings.push(Finding {
+                    rule_id: "disabled-control".to_owned(),
+                    message: "`if false` gates a security check".to_owned(),
+                    severity: Severity::Error,
+                    location: Location {
+                        file: fd.path.clone(),
+                        start_line: line_num,
+                        end_line: line_num,
+                        start_column: 0,
+                        end_column: 0,
+                    },
+                    confidence: 0.9,
+                    actions: vec![],
+                    metadata: HashMap::new(),
+                });
             }
-            Language::Python => {
+            Language::Python
                 if trimmed.starts_with("if False:")
                     && (line_contains_security_keyword(trimmed)
-                        || next_lines_contain_security(&lines, i))
-                {
-                    findings.push(Finding {
-                        rule_id: "disabled-control".to_owned(),
-                        message: "`if False` gates a security check".to_owned(),
-                        severity: Severity::Error,
-                        location: Location {
-                            file: fd.path.clone(),
-                            start_line: line_num,
-                            end_line: line_num,
-                            start_column: 0,
-                            end_column: 0,
-                        },
-                        confidence: 0.9,
-                        actions: vec![],
-                        metadata: HashMap::new(),
-                    });
-                }
+                        || next_lines_contain_security(&lines, i)) =>
+            {
+                findings.push(Finding {
+                    rule_id: "disabled-control".to_owned(),
+                    message: "`if False` gates a security check".to_owned(),
+                    severity: Severity::Error,
+                    location: Location {
+                        file: fd.path.clone(),
+                        start_line: line_num,
+                        end_line: line_num,
+                        start_column: 0,
+                        end_column: 0,
+                    },
+                    confidence: 0.9,
+                    actions: vec![],
+                    metadata: HashMap::new(),
+                });
             }
+            _ => {}
         }
     }
 }
@@ -917,6 +924,7 @@ fn detect_inconsistent_error_handling(fd: &FileData, findings: &mut Vec<Finding>
                 });
             }
         }
+        _ => {}
     }
 }
 
@@ -947,6 +955,7 @@ fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language
                     return false;
                 }
             }
+            _ => return false,
         };
         comment_body.contains(&suppression_pattern) || comment_body.contains(wildcard_pattern)
     };
@@ -987,6 +996,7 @@ fn is_function_call(name: &str, source: &str, lang: Language) -> bool {
         let is_comment = match lang {
             Language::Python => trimmed.starts_with('#'),
             Language::Go => trimmed.starts_with("//"),
+            _ => false,
         };
         if is_comment {
             continue;
@@ -1017,6 +1027,7 @@ fn is_likely_method_call(name: &str, source: &str, lang: Language) -> bool {
             source.contains(&dot_pattern)
         }
         Language::Python => name == "self" || name == "cls",
+        _ => false,
     }
 }
 
@@ -1102,6 +1113,7 @@ fn is_stub_body(body_lines: &[&str], lang: Language) -> bool {
                 || t == "return"
                 || t == "return nil"
         }),
+        _ => false,
     }
 }
 

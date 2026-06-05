@@ -49,6 +49,11 @@ pub fn compute_file_metrics(
     language: Language,
     file: &str,
 ) -> Result<Vec<FunctionMetrics>> {
+    // Languages without tree-sitter support cannot produce function metrics.
+    if !language.has_tree_sitter_grammar() {
+        return Ok(Vec::new());
+    }
+
     let tree = parser::parse(source, language)?;
     let root = tree.root_node();
     let mut metrics = Vec::new();
@@ -56,6 +61,7 @@ pub fn compute_file_metrics(
     match language {
         Language::Go => collect_go_functions(root, source, file, &mut metrics),
         Language::Python => collect_python_functions(root, source, file, &mut metrics),
+        _ => {} // Unreachable due to has_tree_sitter_grammar check above.
     }
 
     Ok(metrics)

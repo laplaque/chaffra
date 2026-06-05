@@ -386,6 +386,7 @@ fn has_llm_imports(imports: &[ImportInfo], lang: Language) -> bool {
     let patterns = match lang {
         Language::Python => LLM_PYTHON_IMPORTS,
         Language::Go => LLM_GO_IMPORTS,
+        _ => return false,
     };
 
     imports.iter().any(|imp| {
@@ -691,6 +692,7 @@ fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language
                     return false;
                 }
             }
+            _ => return false,
         };
         comment_body.contains(&suppression_pattern) || comment_body.contains(wildcard_pattern)
     };

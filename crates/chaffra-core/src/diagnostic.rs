@@ -45,6 +45,10 @@ impl Severity {
 pub enum Language {
     Go,
     Python,
+    Php,
+    Dart,
+    CSharp,
+    Rust,
 }
 
 impl fmt::Display for Language {
@@ -52,6 +56,10 @@ impl fmt::Display for Language {
         match self {
             Language::Go => write!(f, "go"),
             Language::Python => write!(f, "python"),
+            Language::Php => write!(f, "php"),
+            Language::Dart => write!(f, "dart"),
+            Language::CSharp => write!(f, "csharp"),
+            Language::Rust => write!(f, "rust"),
         }
     }
 }
@@ -62,8 +70,17 @@ impl Language {
         match ext {
             "go" => Some(Language::Go),
             "py" => Some(Language::Python),
+            "php" => Some(Language::Php),
+            "dart" => Some(Language::Dart),
+            "cs" => Some(Language::CSharp),
+            "rs" => Some(Language::Rust),
             _ => None,
         }
+    }
+
+    /// Whether this language has full tree-sitter grammar support.
+    pub fn has_tree_sitter_grammar(&self) -> bool {
+        matches!(self, Language::Go | Language::Python)
     }
 }
 
@@ -301,6 +318,10 @@ mod tests {
     fn test_language_display() {
         assert_eq!(Language::Go.to_string(), "go");
         assert_eq!(Language::Python.to_string(), "python");
+        assert_eq!(Language::Php.to_string(), "php");
+        assert_eq!(Language::Dart.to_string(), "dart");
+        assert_eq!(Language::CSharp.to_string(), "csharp");
+        assert_eq!(Language::Rust.to_string(), "rust");
     }
 
     #[test]
@@ -308,12 +329,25 @@ mod tests {
         let cases = vec![
             ("go", Some(Language::Go)),
             ("py", Some(Language::Python)),
-            ("rs", None),
+            ("php", Some(Language::Php)),
+            ("dart", Some(Language::Dart)),
+            ("cs", Some(Language::CSharp)),
+            ("rs", Some(Language::Rust)),
             ("js", None),
         ];
         for (ext, expected) in cases {
             assert_eq!(Language::from_extension(ext), expected, "ext: {ext}");
         }
+    }
+
+    #[test]
+    fn test_language_has_tree_sitter_grammar() {
+        assert!(Language::Go.has_tree_sitter_grammar());
+        assert!(Language::Python.has_tree_sitter_grammar());
+        assert!(!Language::Php.has_tree_sitter_grammar());
+        assert!(!Language::Dart.has_tree_sitter_grammar());
+        assert!(!Language::CSharp.has_tree_sitter_grammar());
+        assert!(!Language::Rust.has_tree_sitter_grammar());
     }
 
     #[test]
