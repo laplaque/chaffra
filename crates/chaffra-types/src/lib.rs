@@ -1,3 +1,5 @@
+// TODO(#19): coverage gate unenforceable until CI tooling lands
+
 //! Typed output contract for downstream consumers of chaffra analysis.
 //!
 //! This crate publishes stable, serializable types that external tools, CI

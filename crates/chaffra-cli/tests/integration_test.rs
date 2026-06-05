@@ -561,7 +561,6 @@ port = 50052
     assert_eq!(modules[2].port, Some(50052));
 }
 
-<<<<<<< HEAD
 // --- Phase 8: Autofix integration tests ---
 
 #[test]

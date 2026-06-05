@@ -1,3 +1,5 @@
+// TODO(#19): coverage gate unenforceable until CI tooling lands
+
 //! Model Context Protocol (MCP) server.
 //!
 //! Exposes chaffra analysis capabilities as MCP tools so that AI coding assistants
