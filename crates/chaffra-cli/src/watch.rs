@@ -43,8 +43,19 @@ fn is_source_file(path: &Path) -> bool {
         .is_some_and(|ext| {
             matches!(
                 ext,
-                "go" | "py" | "js" | "jsx" | "ts" | "tsx" | "java" | "c" | "h" | "cpp" | "cc"
-                    | "cxx" | "hpp" | "rs"
+                "go" | "py"
+                    | "js"
+                    | "jsx"
+                    | "ts"
+                    | "tsx"
+                    | "java"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "cc"
+                    | "cxx"
+                    | "hpp"
+                    | "rs"
             )
         })
 }
