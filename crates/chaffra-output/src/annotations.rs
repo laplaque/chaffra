@@ -22,15 +22,16 @@ impl Formatter for AnnotationsFormatter {
                 Severity::Warning => "warning",
                 Severity::Info => "notice",
             };
-            // GitHub Actions annotation format:
-            // ::error file={name},line={line},col={col}::{message}
+            let safe_msg = f
+                .message
+                .replace('\n', " ")
+                .replace('\r', "")
+                .replace("%0A", "")
+                .replace("%0D", "");
+            let safe_file = f.location.file.replace(',', "_");
             out.push_str(&format!(
-                "::{level} file={},line={},col={}::{} ({})\n",
-                f.location.file,
-                f.location.start_line,
-                f.location.start_column,
-                f.message,
-                f.rule_id,
+                "::{level} file={safe_file},line={},col={}::{safe_msg} ({})\n",
+                f.location.start_line, f.location.start_column, f.rule_id,
             ));
         }
         out
@@ -165,5 +166,44 @@ mod tests {
         };
         let output = f.format_result(&result, None);
         assert!(output.contains("::warning file=a.go"));
+    }
+
+    #[test]
+    fn test_annotations_sanitize_newlines() {
+        let f = AnnotationsFormatter;
+        let mut finding = make_finding("inject", "a.go", 1, Severity::Warning);
+        finding.message = "line1\n::set-env name=FOO::bar".to_owned();
+        let output = f.format_findings(&[finding]);
+        let line = output.trim_end();
+        assert!(
+            !line.contains('\n'),
+            "newlines in message should be stripped"
+        );
+        // The ::set-env text is safe because it's within the annotation body (not a new line).
+        // The critical property: no embedded newline that would start a new workflow command.
+        assert!(
+            line.contains("line1 ::set-env"),
+            "newline should be replaced with space"
+        );
+    }
+
+    #[test]
+    fn test_annotations_sanitize_file_commas() {
+        let f = AnnotationsFormatter;
+        let mut finding = make_finding("issue", "path,with,commas.go", 1, Severity::Error);
+        finding.message = "test".to_owned();
+        let output = f.format_findings(&[finding]);
+        assert!(!output.contains("path,with"));
+        assert!(output.contains("path_with_commas.go"));
+    }
+
+    #[test]
+    fn test_annotations_sanitize_percent_encoded() {
+        let f = AnnotationsFormatter;
+        let mut finding = make_finding("issue", "a.go", 1, Severity::Warning);
+        finding.message = "msg%0Ainjected%0Dline".to_owned();
+        let output = f.format_findings(&[finding]);
+        assert!(!output.contains("%0A"));
+        assert!(!output.contains("%0D"));
     }
 }

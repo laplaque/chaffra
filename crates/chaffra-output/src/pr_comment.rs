@@ -45,18 +45,24 @@ impl Formatter for PrCommentFormatter {
         }
 
         for (file, file_findings) in &by_file {
+            let safe_file = file
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
             out.push_str(&format!(
-                "<details>\n<summary><b>{file}</b> ({} issue{})</summary>\n\n",
+                "<details>\n<summary><b>{safe_file}</b> ({} issue{})</summary>\n\n",
                 file_findings.len(),
                 if file_findings.len() == 1 { "" } else { "s" }
             ));
             for f in file_findings {
+                let safe_msg = f.message.replace('<', "&lt;").replace('>', "&gt;");
+                let safe_rule = f.rule_id.replace('<', "&lt;").replace('>', "&gt;");
                 out.push_str(&format!(
                     "- {} **{}** (line {}): {}\n",
                     severity_icon(&f.severity),
-                    f.rule_id,
+                    safe_rule,
                     f.location.start_line,
-                    f.message
+                    safe_msg
                 ));
             }
             out.push_str("\n</details>\n\n");
@@ -169,5 +175,18 @@ mod tests {
         let output = f.format_result(&result, Some(&health));
         assert!(output.contains("Health: 90"));
         assert!(output.contains("Chaffra Analysis"));
+    }
+
+    #[test]
+    fn test_pr_comment_html_escaping() {
+        let f = PrCommentFormatter;
+        let mut finding = make_finding("rule", "file.go", 1, Severity::Warning);
+        finding.message = "</summary><script>alert(1)</script>".to_owned();
+        finding.location.file = "<img src=x>.go".to_owned();
+        let output = f.format_findings(&[finding]);
+        assert!(!output.contains("<script>"));
+        assert!(!output.contains("<img"));
+        assert!(output.contains("&lt;script&gt;"));
+        assert!(output.contains("&lt;img"));
     }
 }

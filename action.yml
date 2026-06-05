@@ -59,22 +59,27 @@ runs:
     - name: Build chaffra
       shell: bash
       run: |
-        cargo build --release -p chaffra-cli 2>/dev/null || cargo install --path crates/chaffra-cli
+        cargo build --release -p chaffra-cli || cargo install --path crates/chaffra-cli
 
     - name: Run chaffra
       id: run
       shell: bash
+      env:
+        CHAFFRA_CMD: ${{ inputs.command }}
+        CHAFFRA_PATH: ${{ inputs.path }}
+        CHAFFRA_FMT: ${{ inputs.format }}
+        CHAFFRA_CFG: ${{ inputs.config }}
       run: |
         CONFIG_FLAG=""
-        if [ -n "${{ inputs.config }}" ]; then
-          CONFIG_FLAG="--config ${{ inputs.config }}"
+        if [ -n "$CHAFFRA_CFG" ]; then
+          CONFIG_FLAG="--config $CHAFFRA_CFG"
         fi
 
         set +e
         OUTPUT=$(cargo run --release -p chaffra-cli -- \
-          --format "${{ inputs.format }}" \
+          --format "$CHAFFRA_FMT" \
           $CONFIG_FLAG \
-          ${{ inputs.command }} "${{ inputs.path }}" 2>&1)
+          "$CHAFFRA_CMD" "$CHAFFRA_PATH" 2>&1)
         EXIT_CODE=$?
         set -e
 

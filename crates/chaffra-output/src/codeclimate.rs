@@ -44,16 +44,21 @@ fn severity_to_codeclimate(severity: &Severity) -> &'static str {
 }
 
 fn compute_fingerprint(finding: &Finding) -> String {
-    // Simple deterministic fingerprint from rule + file + line.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    finding.rule_id.hash(&mut hasher);
-    finding.location.file.hash(&mut hasher);
-    finding.location.start_line.hash(&mut hasher);
-    finding.message.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use std::fmt::Write;
+    let mut input = String::new();
+    write!(
+        &mut input,
+        "{}:{}:{}:{}",
+        finding.location.file, finding.location.start_line, finding.rule_id, finding.message
+    )
+    .unwrap();
+    // Stable FNV-1a 64-bit hash — deterministic across Rust versions.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn findings_to_codeclimate(findings: &[Finding]) -> Vec<CodeClimateIssue> {
@@ -182,5 +187,15 @@ mod tests {
         let output = f.format_findings(&findings);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn test_codeclimate_fingerprint_stable_value() {
+        let f = make_finding("unused-function", "main.go", 5);
+        let fp = compute_fingerprint(&f);
+        // FNV-1a is a fixed algorithm — the fingerprint must be the same across runs.
+        assert_eq!(fp, compute_fingerprint(&f));
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

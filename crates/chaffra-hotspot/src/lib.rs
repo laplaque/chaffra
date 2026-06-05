@@ -68,7 +68,7 @@ pub fn compute_hotspots(
     }
 
     // Sort by hotspot score descending.
-    entries.sort_by(|a, b| b.hotspot_score.partial_cmp(&a.hotspot_score).unwrap());
+    entries.sort_by(|a, b| b.hotspot_score.total_cmp(&a.hotspot_score));
     Ok(entries)
 }
 
@@ -81,8 +81,9 @@ pub fn parse_commit_counts(config: &HashMap<String, String>) -> HashMap<String, 
 
     // Try JSON format first.
     if let Some(json_str) = config.get("commit-counts") {
-        if let Ok(parsed) = serde_json::from_str::<HashMap<String, u32>>(json_str) {
-            return parsed;
+        match serde_json::from_str::<HashMap<String, u32>>(json_str) {
+            Ok(parsed) => return parsed,
+            Err(e) => eprintln!("warning: failed to parse commit-counts JSON: {e}"),
         }
     }
 

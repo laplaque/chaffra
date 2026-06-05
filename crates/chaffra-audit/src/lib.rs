@@ -111,7 +111,10 @@ pub const BASELINE_FILE: &str = ".chaffra-baseline.json";
 /// Save findings to a baseline JSON file.
 pub fn save_baseline(findings: &[Finding], path: &Path) -> Result<()> {
     let baseline = Baseline {
-        timestamp: "now".to_owned(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "unknown".to_owned()),
         findings: findings.iter().map(BaselineFinding::from_finding).collect(),
     };
     let json = serde_json::to_string_pretty(&baseline)?;
@@ -173,7 +176,11 @@ pub fn compare_findings(
 
     AuditReport {
         verdict,
-        gate_mode: format!("{gate_mode:?}"),
+        gate_mode: match gate_mode {
+            GateMode::NewOnly => "new-only",
+            GateMode::All => "all",
+        }
+        .to_owned(),
         new_findings,
         resolved_count,
         total_current: current.len(),
@@ -267,8 +274,19 @@ impl AnalysisModule for AuditModule {
             .cloned()
             .unwrap_or_else(|| BASELINE_FILE.to_owned());
 
+        let bp = Path::new(&baseline_path);
+        if bp.is_absolute()
+            || bp
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(ChaffraError::Config(format!(
+                "baseline path must be relative and within the project directory: {baseline_path}"
+            )));
+        }
+
         // Load baseline (empty if not found).
-        let baseline = load_baseline(Path::new(&baseline_path)).unwrap_or(Baseline {
+        let baseline = load_baseline(bp).unwrap_or(Baseline {
             timestamp: "none".to_owned(),
             findings: Vec::new(),
         });
@@ -279,8 +297,9 @@ impl AnalysisModule for AuditModule {
         let mut current_findings: Vec<Finding> = Vec::new();
         for file in files {
             if file.path.ends_with(".json") {
-                if let Ok(findings) = serde_json::from_slice::<Vec<Finding>>(&file.content) {
-                    current_findings.extend(findings);
+                match serde_json::from_slice::<Vec<Finding>>(&file.content) {
+                    Ok(findings) => current_findings.extend(findings),
+                    Err(e) => eprintln!("warning: failed to parse {}: {e}", file.path),
                 }
             }
         }
@@ -325,7 +344,7 @@ impl AnalysisModule for AuditModule {
                 ),
                 severity: Severity::Warning,
                 location: Location {
-                    file: ".chaffra-baseline.json".to_owned(),
+                    file: baseline_path.clone(),
                     start_line: 1,
                     end_line: 1,
                     start_column: 0,
@@ -339,16 +358,18 @@ impl AnalysisModule for AuditModule {
 
         // Emit threshold-exceeded if verdict is fail.
         if report.verdict == Verdict::Fail {
+            let relevant = match gate_mode {
+                GateMode::NewOnly => report.new_findings.len(),
+                GateMode::All => report.total_current,
+            };
             findings.push(Finding {
                 rule_id: "threshold-exceeded".to_owned(),
                 message: format!(
-                    "audit verdict: FAIL ({} relevant findings exceed threshold {})",
-                    report.new_findings.len(),
-                    fail_threshold
+                    "audit verdict: FAIL ({relevant} relevant findings exceed threshold {fail_threshold})"
                 ),
                 severity: Severity::Error,
                 location: Location {
-                    file: ".chaffra-baseline.json".to_owned(),
+                    file: baseline_path.clone(),
                     start_line: 1,
                     end_line: 1,
                     start_column: 0,
@@ -766,5 +787,96 @@ mod tests {
         }];
         let result = module.analyze(&files, &HashMap::new()).unwrap();
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn test_baseline_path_traversal_rejected() {
+        let module = AuditModule::new();
+        let mut config = HashMap::new();
+        config.insert("baseline".to_owned(), "../../.env".to_owned());
+        let result = module.analyze(&[], &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("relative"));
+    }
+
+    #[test]
+    fn test_baseline_absolute_path_rejected() {
+        let module = AuditModule::new();
+        let mut config = HashMap::new();
+        config.insert("baseline".to_owned(), "/etc/passwd".to_owned());
+        let result = module.analyze(&[], &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gate_mode_serialization_matches_serde() {
+        let report = compare_findings(
+            &[],
+            &Baseline {
+                timestamp: "test".to_owned(),
+                findings: Vec::new(),
+            },
+            GateMode::NewOnly,
+            1,
+            5,
+        );
+        assert_eq!(report.gate_mode, "new-only");
+
+        let report = compare_findings(
+            &[],
+            &Baseline {
+                timestamp: "test".to_owned(),
+                findings: Vec::new(),
+            },
+            GateMode::All,
+            1,
+            5,
+        );
+        assert_eq!(report.gate_mode, "all");
+    }
+
+    #[test]
+    fn test_threshold_exceeded_uses_correct_count_in_all_mode() {
+        let module = AuditModule::new();
+        let many_findings: Vec<Finding> = (0..6)
+            .map(|i| make_finding("issue", &format!("f{i}.go"), i, &format!("issue {i}")))
+            .collect();
+        let findings_json = serde_json::to_vec(&many_findings).unwrap();
+        let files = vec![FileInfo {
+            path: "findings.json".to_owned(),
+            content: findings_json,
+        }];
+        let mut config = HashMap::new();
+        config.insert("gate-mode".to_owned(), "all".to_owned());
+        config.insert("fail-threshold".to_owned(), "5".to_owned());
+
+        let result = module.analyze(&files, &config).unwrap();
+        let threshold: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "threshold-exceeded")
+            .collect();
+        assert_eq!(threshold.len(), 1);
+        assert!(
+            threshold[0].message.contains("6 relevant"),
+            "should report total_current (6) in All mode, got: {}",
+            threshold[0].message
+        );
+    }
+
+    #[test]
+    fn test_save_baseline_has_real_timestamp() {
+        let dir = std::env::temp_dir().join("chaffra_audit_test_ts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(BASELINE_FILE);
+
+        save_baseline(&[], &path).unwrap();
+        let loaded = load_baseline(&path).unwrap();
+        assert_ne!(loaded.timestamp, "now");
+        assert!(loaded.timestamp.parse::<u64>().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

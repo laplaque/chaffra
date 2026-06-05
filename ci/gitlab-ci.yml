@@ -7,19 +7,20 @@
 # Or copy it into your project and include locally.
 
 .chaffra-base:
-  image: rust:latest
+  image: rust:1.87-slim
   cache:
     key: chaffra-${CI_COMMIT_REF_SLUG}
     paths:
       - target/
       - .cargo/registry/
   before_script:
-    - cargo build --release -p chaffra-cli 2>/dev/null || cargo install --path crates/chaffra-cli
+    - cargo build --release -p chaffra-cli || cargo install --path crates/chaffra-cli
 
 chaffra-health:
   extends: .chaffra-base
   stage: test
   script:
+    # chaffra exits 1 when findings exist; || true keeps the job green so the report is always uploaded.
     - cargo run --release -p chaffra-cli -- --format codeclimate health . > gl-code-quality-report.json || true
   artifacts:
     reports:
@@ -30,6 +31,7 @@ chaffra-dead-code:
   extends: .chaffra-base
   stage: test
   script:
+    # chaffra exits 1 when findings exist; || true keeps the job green so the report is always uploaded.
     - cargo run --release -p chaffra-cli -- --format codeclimate dead-code . > gl-dead-code-report.json || true
   artifacts:
     reports:
