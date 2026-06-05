@@ -104,26 +104,27 @@ pub fn finding_to_proto(f: &diagnostic::Finding) -> proto::Finding {
     }
 }
 
-pub fn finding_from_proto(f: &proto::Finding) -> diagnostic::Finding {
-    diagnostic::Finding {
+pub fn finding_from_proto(f: &proto::Finding) -> crate::error::Result<diagnostic::Finding> {
+    let location = f
+        .location
+        .as_ref()
+        .map(location_from_proto)
+        .ok_or_else(|| {
+            crate::error::ChaffraError::ProtoConversion(format!(
+                "finding '{}' is missing required location field",
+                f.rule_id
+            ))
+        })?;
+
+    Ok(diagnostic::Finding {
         rule_id: f.rule_id.clone(),
         message: f.message.clone(),
         severity: severity_from_string(&f.severity),
-        location: f
-            .location
-            .as_ref()
-            .map(location_from_proto)
-            .unwrap_or(diagnostic::Location {
-                file: String::new(),
-                start_line: 0,
-                end_line: 0,
-                start_column: 0,
-                end_column: 0,
-            }),
+        location,
         confidence: f.confidence,
         actions: f.actions.iter().map(action_from_proto).collect(),
         metadata: f.metadata.clone(),
-    }
+    })
 }
 
 // --- ModuleMetrics ---
@@ -153,17 +154,26 @@ pub fn analysis_result_to_proto(r: &diagnostic::AnalysisResult) -> proto::Analys
     }
 }
 
-pub fn analysis_result_from_proto(r: &proto::AnalysisResponse) -> diagnostic::AnalysisResult {
-    diagnostic::AnalysisResult {
-        findings: r.findings.iter().map(finding_from_proto).collect(),
-        metrics: r.metrics.as_ref().map(module_metrics_from_proto).unwrap_or(
-            diagnostic::ModuleMetrics {
-                files_analyzed: 0,
-                duration_ms: 0,
-                counters: std::collections::HashMap::new(),
-            },
-        ),
-    }
+pub fn analysis_result_from_proto(
+    r: &proto::AnalysisResponse,
+) -> crate::error::Result<diagnostic::AnalysisResult> {
+    let metrics = r
+        .metrics
+        .as_ref()
+        .map(module_metrics_from_proto)
+        .ok_or_else(|| {
+            crate::error::ChaffraError::ProtoConversion(
+                "AnalysisResponse is missing required metrics field".to_owned(),
+            )
+        })?;
+
+    let findings: crate::error::Result<Vec<_>> =
+        r.findings.iter().map(finding_from_proto).collect();
+
+    Ok(diagnostic::AnalysisResult {
+        findings: findings?,
+        metrics,
+    })
 }
 
 // --- Rule ---

@@ -5,7 +5,7 @@
 //! each trait impl as a tonic gRPC service and connects a tonic client directly
 //! to the server's `tower::Service` implementation -- no TCP socket, no network.
 //! All calls go through full proto serialization (prost encode/decode) with
-//! sub-microsecond transport overhead.
+//! low transport overhead (validated < 10ms/call in benchmarks).
 
 pub mod convert;
 
@@ -91,7 +91,8 @@ impl chaffra_proto::proto::analysis_module_server::AnalysisModule for GrpcModule
             .findings
             .iter()
             .map(convert::finding_from_proto)
-            .collect();
+            .collect::<crate::error::Result<Vec<_>>>()
+            .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
         let results = self
             .inner
@@ -135,7 +136,7 @@ impl GrpcModuleHandle {
     ///
     /// This starts the module as a tonic gRPC server using tower's in-process
     /// service (no TCP socket, no network). The returned handle dispatches
-    /// calls via proto serialization with sub-microsecond transport overhead.
+    /// calls via proto serialization with low transport overhead.
     pub fn from_module(module: Box<dyn AnalysisModule>) -> Self {
         let info = module.describe();
         let service = GrpcModuleService::new(Arc::from(module));
@@ -186,7 +187,7 @@ impl GrpcModuleHandle {
             .await
             .map_err(|e| ChaffraError::Analysis(format!("gRPC analyze failed: {e}")))?;
 
-        Ok(convert::analysis_result_from_proto(&response.into_inner()))
+        convert::analysis_result_from_proto(&response.into_inner())
     }
 
     /// Call `Explain` via gRPC.
@@ -241,55 +242,50 @@ pub struct GrpcModuleHost {
     runtime: RuntimeHandle,
 }
 
-/// Wrapper that either borrows the current tokio runtime or owns a dedicated one.
+/// Wrapper that either borrows the current tokio runtime or dispatches work
+/// onto a dedicated OS thread to avoid nested-runtime panics.
 enum RuntimeHandle {
     /// Reuse the caller's multi-thread tokio runtime via `block_in_place`.
     Current(tokio::runtime::Handle),
-    /// Own a dedicated single-threaded runtime (non-async path).
-    Owned(tokio::runtime::Runtime),
-}
-
-impl RuntimeHandle {
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        match self {
-            RuntimeHandle::Current(handle) => {
-                // When called from within an async context (e.g. `#[tokio::main]`),
-                // we must not call `handle.block_on()` directly because tokio
-                // forbids blocking the current scheduler thread.
-                // `block_in_place` moves off the scheduler thread (requires
-                // the multi-thread runtime, which `#[tokio::main]` uses).
-                tokio::task::block_in_place(|| handle.block_on(future))
-            }
-            RuntimeHandle::Owned(runtime) => runtime.block_on(future),
-        }
-    }
+    /// No usable runtime on the current thread — dispatch onto a fresh OS
+    /// thread with its own single-threaded runtime. This covers both the
+    /// "no runtime" case and the "current-thread runtime" case (where
+    /// nested `block_on` would panic).
+    ThreadDispatch,
 }
 
 impl RuntimeHandle {
     fn detect() -> Self {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                // Verify this is a multi-thread runtime that supports
-                // block_in_place. If it's current-thread (e.g. #[tokio::test]),
-                // fall through to creating an owned runtime.
-                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                    return RuntimeHandle::Current(handle);
-                }
-                // Current-thread runtime: create an owned one to avoid
-                // the "cannot block from within a runtime" panic.
-                RuntimeHandle::Owned(
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("failed to create tokio runtime"),
-                )
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                RuntimeHandle::Current(handle)
             }
-            Err(_) => RuntimeHandle::Owned(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to create tokio runtime"),
-            ),
+            _ => RuntimeHandle::ThreadDispatch,
+        }
+    }
+
+    fn block_on<F: std::future::Future + Send>(&self, future: F) -> F::Output
+    where
+        F::Output: Send,
+    {
+        match self {
+            RuntimeHandle::Current(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            RuntimeHandle::ThreadDispatch => {
+                // Run on a separate OS thread to avoid nested-runtime panics.
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to create tokio runtime");
+                        rt.block_on(future)
+                    })
+                    .join()
+                    .expect("runtime thread panicked")
+                })
+            }
         }
     }
 }
@@ -731,7 +727,7 @@ mod tests {
         };
 
         let proto = convert::finding_to_proto(&original);
-        let restored = convert::finding_from_proto(&proto);
+        let restored = convert::finding_from_proto(&proto).unwrap();
 
         assert_eq!(original.rule_id, restored.rule_id);
         assert_eq!(original.message, restored.message);
@@ -862,5 +858,79 @@ mod tests {
              Overhead: {:?}/call",
             grpc_per_call.saturating_sub(trait_per_call)
         );
+    }
+
+    /// Regression: sync host must not panic when called from a current-thread
+    /// tokio runtime (e.g. `#[tokio::test(flavor = "current_thread")]`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_grpc_host_from_current_thread_runtime() {
+        let mut host = GrpcModuleHost::new();
+        host.register(Box::new(TestModule)).unwrap();
+        let config = ChaffraConfig::default();
+        let files = vec![FileInfo {
+            path: "test.go".to_owned(),
+            content: b"package main".to_vec(),
+        }];
+        let result = host.analyze("test", &files, &config).unwrap();
+        assert_eq!(result.findings.len(), 1);
+
+        let explanation = host.explain("test:test-rule").unwrap();
+        assert_eq!(explanation.rule_id, "test-rule");
+    }
+
+    /// Regression: finding_from_proto rejects a finding with missing location.
+    #[test]
+    fn test_finding_from_proto_missing_location() {
+        let proto_finding = chaffra_proto::proto::Finding {
+            rule_id: "test-rule".to_owned(),
+            message: "bad finding".to_owned(),
+            severity: "warning".to_owned(),
+            location: None,
+            confidence: 0.9,
+            actions: vec![],
+            metadata: Default::default(),
+        };
+        let err = convert::finding_from_proto(&proto_finding).unwrap_err();
+        assert!(
+            matches!(err, ChaffraError::ProtoConversion(_)),
+            "expected ProtoConversion error, got: {err:?}"
+        );
+    }
+
+    /// Regression: analysis_result_from_proto rejects a response with missing metrics.
+    #[test]
+    fn test_analysis_result_from_proto_missing_metrics() {
+        let proto_response = chaffra_proto::proto::AnalysisResponse {
+            findings: vec![],
+            metrics: None,
+        };
+        let err = convert::analysis_result_from_proto(&proto_response).unwrap_err();
+        assert!(
+            matches!(err, ChaffraError::ProtoConversion(_)),
+            "expected ProtoConversion error, got: {err:?}"
+        );
+    }
+
+    /// Regression: analysis_result_from_proto rejects when a finding has missing location.
+    #[test]
+    fn test_analysis_result_from_proto_finding_missing_location() {
+        let proto_response = chaffra_proto::proto::AnalysisResponse {
+            findings: vec![chaffra_proto::proto::Finding {
+                rule_id: "bad".to_owned(),
+                message: "incomplete".to_owned(),
+                severity: "warning".to_owned(),
+                location: None,
+                confidence: 0.5,
+                actions: vec![],
+                metadata: Default::default(),
+            }],
+            metrics: Some(chaffra_proto::proto::ModuleMetrics {
+                files_analyzed: 1,
+                duration_ms: 0,
+                counters: Default::default(),
+            }),
+        };
+        let err = convert::analysis_result_from_proto(&proto_response).unwrap_err();
+        assert!(matches!(err, ChaffraError::ProtoConversion(_)));
     }
 }

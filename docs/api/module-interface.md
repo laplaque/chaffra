@@ -8,7 +8,7 @@ All module dispatch -- both built-in and external -- uses gRPC as the transport 
 
 ### Built-in modules (in-process gRPC)
 
-Built-in modules implement the Rust `AnalysisModule` trait. Each trait impl is wrapped in a `GrpcModuleService` (a tonic gRPC server) and connected to a tonic `AnalysisModuleClient` via the server's `tower::Service` implementation directly -- no TCP socket, no network. All calls go through full proto serialization (prost encode/decode) with sub-microsecond transport overhead.
+Built-in modules implement the Rust `AnalysisModule` trait. Each trait impl is wrapped in a `GrpcModuleService` (a tonic gRPC server) and connected to a tonic `AnalysisModuleClient` via the server's `tower::Service` implementation directly -- no TCP socket, no network. All calls go through full proto serialization (prost encode/decode) with low transport overhead (validated < 10ms/call in benchmarks).
 
 Key components:
 - `GrpcModuleService` -- implements the tonic server trait by delegating to `Arc<dyn AnalysisModule>`
