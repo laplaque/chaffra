@@ -15,9 +15,13 @@ members = [
     "crates/chaffra-mcp",
     "crates/chaffra-plugin",
     "crates/chaffra-frameworks",
+    "crates/chaffra-ai-quality",
+    "crates/chaffra-llm-defense",
     "crates/chaffra-monorepo",
     "crates/chaffra-impact",
     "crates/chaffra-migrate",
+    "crates/chaffra-autofix",
+    "crates/chaffra-tui",
     "crates/chaffra-cli",
 ]
 
@@ -44,6 +48,8 @@ tonic = "0.14"
 prost = "0.14"
 glob = "0.3"
 regex = "1"
+ratatui = "0.29"
+crossterm = "0.28"
 
 chaffra-core = { path = "crates/chaffra-core" }
 chaffra-parse = { path = "crates/chaffra-parse" }
@@ -59,6 +65,10 @@ chaffra-mcp = { path = "crates/chaffra-mcp" }
 chaffra-plugin = { path = "crates/chaffra-plugin" }
 chaffra-security = { path = "crates/chaffra-security" }
 chaffra-frameworks = { path = "crates/chaffra-frameworks" }
+chaffra-ai-quality = { path = "crates/chaffra-ai-quality" }
+chaffra-llm-defense = { path = "crates/chaffra-llm-defense" }
 chaffra-monorepo = { path = "crates/chaffra-monorepo" }
 chaffra-impact = { path = "crates/chaffra-impact" }
 chaffra-migrate = { path = "crates/chaffra-migrate" }
+chaffra-autofix = { path = "crates/chaffra-autofix" }
+chaffra-tui = { path = "crates/chaffra-tui" }
