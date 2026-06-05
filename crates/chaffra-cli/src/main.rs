@@ -5,6 +5,7 @@ use chaffra_ai_quality::AiQualityModule;
 use chaffra_audit::AuditModule;
 use chaffra_autofix::AutofixModule;
 use chaffra_autofix::hooks;
+use chaffra_cicd_security::CicdSecurityModule;
 use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
@@ -89,6 +90,13 @@ enum Command {
     /// Detect LLM integration risks: prompt injection, unsafe tools, unguarded loops.
     #[command(name = "llm-defense")]
     LlmDefense {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Scan CI/CD configuration files for security misconfigurations.
+    #[command(name = "cicd-security")]
+    CicdSecurity {
         /// Path to the repository root (defaults to current directory).
         #[arg(default_value = ".")]
         path: String,
@@ -201,6 +209,7 @@ fn build_module_host() -> ModuleHost {
     let _ = host.register(Box::new(AutofixModule::new()));
     let _ = host.register(Box::new(AiQualityModule::new()));
     let _ = host.register(Box::new(LlmDefenseModule::new()));
+    let _ = host.register(Box::new(CicdSecurityModule::new()));
     host
 }
 
@@ -429,6 +438,77 @@ fn cmd_llm_defense(
     let host = build_module_host();
     let result = host.analyze("llm-defense", &files, config)?;
     Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_cicd_security(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+) -> Result<String> {
+    let files = discover_all_files(root, config);
+    if files.is_empty() {
+        return Ok("No files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let result = host.analyze("cicd-security", &files, config)?;
+    if result.findings.is_empty() {
+        return Ok("No CI/CD security issues found.\n".to_owned());
+    }
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn discover_all_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo> {
+    let ignore_patterns = &config.project.ignore;
+    let mut files = Vec::new();
+    collect_files(root, root, ignore_patterns, &mut files);
+    files
+}
+
+fn collect_files(base: &Path, dir: &Path, ignore: &[String], out: &mut Vec<FileInfo>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let relative = path.strip_prefix(base).unwrap_or(&path);
+        let rel_str = relative.to_string_lossy();
+
+        if let Some(name) = path.file_name() {
+            let name = name.to_string_lossy();
+            if name.starts_with('.') && name != ".github" && name != ".gitlab-ci.yml" {
+                continue;
+            }
+            if name == "node_modules"
+                || name == "target"
+                || name == "vendor"
+                || name == "__pycache__"
+            {
+                continue;
+            }
+        }
+
+        if ignore.iter().any(|pat| rel_str.contains(pat)) {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_files(base, &path, ignore, out);
+        } else {
+            // Check file type by path BEFORE reading content to avoid
+            // eagerly loading files we will never analyze.
+            let file_type = chaffra_cicd_security::detect::detect_file_type(&rel_str);
+            if file_type == chaffra_cicd_security::detect::CicdFileType::Unknown {
+                continue;
+            }
+            if let Ok(content) = std::fs::read(&path) {
+                out.push(FileInfo {
+                    path: rel_str.to_string(),
+                    content,
+                });
+            }
+        }
+    }
 }
 
 fn cmd_fix(
@@ -883,6 +963,12 @@ async fn main() -> Result<()> {
             print!("{}", cmd_llm_defense(&root, &config, formatter.as_ref())?);
         }
 
+        Command::CicdSecurity { path } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!("{}", cmd_cicd_security(&root, &config, formatter.as_ref())?);
+        }
+
         Command::Dupes { .. } => {
             print!("{}", cmd_stub("dupes"));
         }
@@ -1007,7 +1093,7 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 9);
+        assert_eq!(modules.len(), 10);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
@@ -1018,6 +1104,7 @@ mod tests {
         assert!(ids.contains(&"autofix"));
         assert!(ids.contains(&"ai-quality"));
         assert!(ids.contains(&"llm-defense"));
+        assert!(ids.contains(&"cicd-security"));
     }
 
     #[test]
@@ -1364,6 +1451,10 @@ mod tests {
         assert!(
             output.contains("llm-defense"),
             "should list llm-defense module"
+        );
+        assert!(
+            output.contains("cicd-security"),
+            "should list cicd-security module"
         );
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));
@@ -1840,5 +1931,35 @@ mod tests {
         let config = ChaffraConfig::default();
         let output = cmd_tui(dir.path(), &config).unwrap();
         assert_eq!(output, "No source files found.\n");
+    }
+
+    // --- cmd_cicd_security tests ---
+
+    #[test]
+    fn test_cmd_explain_cicd_rule() {
+        let output = cmd_explain("cicd-security:actions-unpinned-action").unwrap();
+        assert!(output.contains("Unpinned action"));
+        assert!(output.contains("Rationale:"));
+    }
+
+    #[test]
+    fn test_cmd_cicd_security_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_cicd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        assert_eq!(output, "No files found.\n");
+    }
+
+    #[test]
+    fn test_cmd_cicd_security_with_fixtures() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cicd");
+        if !root.exists() {
+            return;
+        }
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_cicd_security(&root, &config, formatter.as_ref()).unwrap();
+        assert!(!output.is_empty());
     }
 }

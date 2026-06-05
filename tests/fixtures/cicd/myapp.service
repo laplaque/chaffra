@@ -1,0 +1,10 @@
+[Unit]
+Description=My Application
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/myapp
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
