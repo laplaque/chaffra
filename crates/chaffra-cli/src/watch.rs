@@ -4,11 +4,8 @@
 //! analysis on changed files.
 
 use anyhow::{Context, Result};
-use chaffra_complexity::ComplexityModule;
 use chaffra_core::config::ChaffraConfig;
 use chaffra_core::diagnostic::FileInfo;
-use chaffra_core::module::ModuleHost;
-use chaffra_deadcode::DeadCodeModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use notify_debouncer_full::{DebouncedEvent, new_debouncer, notify::RecursiveMode};
 use std::path::{Path, PathBuf};
@@ -38,19 +35,18 @@ impl WatchConfig {
     }
 }
 
-/// Build a module host with all built-in modules.
-fn build_module_host() -> ModuleHost {
-    let mut host = ModuleHost::new();
-    let _ = host.register(Box::new(DeadCodeModule::new()));
-    let _ = host.register(Box::new(ComplexityModule::new()));
-    host
-}
-
 /// Check if a path is a source file we should analyze.
+/// Covers all languages supported by chaffra's tree-sitter parsing.
 fn is_source_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| matches!(ext, "go" | "py"))
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "go" | "py" | "js" | "jsx" | "ts" | "tsx" | "java" | "c" | "h" | "cpp" | "cc"
+                    | "cxx" | "hpp" | "rs"
+            )
+        })
 }
 
 /// Run analysis on changed files and print results.
@@ -86,7 +82,7 @@ pub fn run_analysis_on_changes(
         return Ok(String::new());
     }
 
-    let host = build_module_host();
+    let host = crate::build_module_host();
     let formatter = create_formatter(format);
     let mut output = String::new();
 
@@ -183,6 +179,16 @@ mod tests {
     fn test_is_source_file() {
         assert!(is_source_file(Path::new("main.go")));
         assert!(is_source_file(Path::new("app.py")));
+        assert!(is_source_file(Path::new("index.js")));
+        assert!(is_source_file(Path::new("App.jsx")));
+        assert!(is_source_file(Path::new("index.ts")));
+        assert!(is_source_file(Path::new("App.tsx")));
+        assert!(is_source_file(Path::new("Main.java")));
+        assert!(is_source_file(Path::new("main.c")));
+        assert!(is_source_file(Path::new("util.h")));
+        assert!(is_source_file(Path::new("main.cpp")));
+        assert!(is_source_file(Path::new("main.cc")));
+        assert!(is_source_file(Path::new("main.rs")));
         assert!(!is_source_file(Path::new("readme.md")));
         assert!(!is_source_file(Path::new("Cargo.toml")));
         assert!(!is_source_file(Path::new("no_extension")));

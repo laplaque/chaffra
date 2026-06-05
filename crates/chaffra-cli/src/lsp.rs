@@ -4,16 +4,11 @@
 //! Communicates via JSON-RPC 2.0 over stdio, using the Language Server Protocol.
 
 use anyhow::Result;
-use chaffra_complexity::ComplexityModule;
-use chaffra_core::config::ChaffraConfig;
-use chaffra_core::diagnostic::{FileInfo, Finding, Severity};
-use chaffra_core::module::ModuleHost;
-use chaffra_deadcode::DeadCodeModule;
+use chaffra_core::diagnostic::{Finding, Severity};
 use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// JSON-RPC request envelope for LSP.
 #[derive(Debug, Deserialize)]
@@ -101,6 +96,10 @@ pub fn analyze_file_for_diagnostics(
     file_path: &str,
     content: &[u8],
 ) -> HashMap<String, Vec<Diagnostic>> {
+    use chaffra_core::config::ChaffraConfig;
+    use chaffra_core::diagnostic::FileInfo;
+    use std::path::Path;
+
     let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
 
     let relative = Path::new(file_path)
@@ -114,9 +113,7 @@ pub fn analyze_file_for_diagnostics(
         content: content.to_vec(),
     }];
 
-    let mut host = ModuleHost::new();
-    let _ = host.register(Box::new(DeadCodeModule::new()));
-    let _ = host.register(Box::new(ComplexityModule::new()));
+    let host = crate::build_module_host();
     let config = ChaffraConfig::default();
 
     // Run dead-code analysis.
@@ -144,6 +141,8 @@ pub fn analyze_file_for_diagnostics(
 
 /// Build the hover response content for complexity information.
 pub fn build_hover_content(file_path: &str, content: &[u8], line: u32) -> Option<String> {
+    use std::path::Path;
+
     let ext = Path::new(file_path).extension()?.to_str()?;
     let language = chaffra_core::diagnostic::Language::from_extension(ext)?;
 
@@ -161,25 +160,52 @@ pub fn build_hover_content(file_path: &str, content: &[u8], line: u32) -> Option
     None
 }
 
+/// Parse the Content-Length value from LSP headers.
+/// Returns None if no valid Content-Length header is found before the
+/// blank-line separator.
+async fn read_content_length(reader: &mut BufReader<tokio::io::Stdin>) -> Result<Option<usize>> {
+    let mut content_length: Option<usize> = None;
+
+    loop {
+        let mut header_line = String::new();
+        let n = reader.read_line(&mut header_line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+
+        let trimmed = header_line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+
+    Ok(content_length)
+}
+
 /// Run the LSP server loop over stdio.
+///
+/// Implements proper Content-Length-based message framing per the LSP spec:
+/// reads `Content-Length: N\r\n...\r\n` headers, then reads exactly N bytes
+/// of JSON payload.
 pub async fn run_lsp_server() -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(stdin);
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim().to_owned();
-        if line.is_empty() {
-            continue;
-        }
+    loop {
+        let content_length = match read_content_length(&mut reader).await? {
+            Some(len) => len,
+            None => break,
+        };
 
-        // Skip Content-Length headers (simplified -- not full HTTP framing).
-        if line.starts_with("Content-Length:") || line.starts_with("Content-Type:") {
-            continue;
-        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).await?;
 
-        let request: LspRequest = match serde_json::from_str(&line) {
+        let request: LspRequest = match serde_json::from_slice(&body) {
             Ok(req) => req,
             Err(_) => continue,
         };

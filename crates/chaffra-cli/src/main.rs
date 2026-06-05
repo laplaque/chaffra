@@ -204,7 +204,7 @@ enum HooksAction {
     },
 }
 
-fn build_module_host() -> ModuleHost {
+pub(crate) fn build_module_host() -> ModuleHost {
     let mut host = ModuleHost::new();
     // Register built-in modules.
     let _ = host.register(Box::new(DeadCodeModule::new()));
