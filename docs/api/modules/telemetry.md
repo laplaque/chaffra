@@ -54,13 +54,13 @@ Control via `--telemetry on|off|user-only|operator-only`.
 | Stderr | JSON lines | `--telemetry-backend stderr` |
 | Prometheus | `/metrics` exposition | watch/server mode only |
 
-### Cloud
+### Cloud (preview — payload generation only, no network export)
 
-| Backend | Protocol | Activation |
-|---------|----------|------------|
-| OTLP | gRPC to OTLP collector | `--telemetry-backend otlp --telemetry-endpoint URL` |
+| Backend | Status | Activation |
+|---------|--------|------------|
+| OTLP | Preview: serializes OTLP payload, does not export | `--telemetry-backend otlp --telemetry-endpoint URL` |
 | StatsD | UDP push | `--telemetry-backend statsd` |
-| CloudWatch | PutMetricData | `cloudwatch` feature flag |
+| CloudWatch | Preview: generates PutMetricData payload, does not export | `cloudwatch` feature flag |
 
 ## Configuration
 
@@ -89,10 +89,10 @@ chaffra telemetry inspect  # Dry-run: show metric payload
 
 Tool name: `chaffra/telemetry`
 
-Actions:
-- `status` -- backend connectivity status
-- `snapshot` -- current telemetry snapshot
-- `backends` -- configured backend details
+Actions (returns default configuration, not live analysis state):
+- `status` -- default backend configuration and availability
+- `snapshot` -- preview metrics snapshot (core metrics registered but no analysis data)
+- `backends` -- list of default backend definitions and their types
 
 ## gRPC Service
 

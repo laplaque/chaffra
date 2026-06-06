@@ -1279,7 +1279,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                cmd_dupes(&root, &config, formatter.as_ref(), &mode, &min_tokens)?
+                run_with_telemetry(&tel_config, "duplication", || cmd_dupes(
+                    &root,
+                    &config,
+                    formatter.as_ref(),
+                    &mode,
+                    &min_tokens
+                ))?
             );
         }
 
@@ -1288,7 +1294,12 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                cmd_boundaries(&root, &config, formatter.as_ref(), preset.as_deref())?
+                run_with_telemetry(&tel_config, "architecture", || cmd_boundaries(
+                    &root,
+                    &config,
+                    formatter.as_ref(),
+                    preset.as_deref()
+                ))?
             );
         }
 
@@ -1318,7 +1329,15 @@ async fn main() -> Result<()> {
         } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_fix(&root, &config, dry_run, rule.as_deref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "fix", || cmd_fix(
+                    &root,
+                    &config,
+                    dry_run,
+                    rule.as_deref()
+                ))?
+            );
         }
 
         Command::Hooks { action } => match action {
@@ -1386,14 +1405,14 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                cmd_impact(
+                run_with_telemetry(&tel_config, "impact", || cmd_impact(
                     &root,
                     &config,
                     save_snapshot.as_deref(),
                     baseline.as_deref(),
-                    label,
+                    label.clone(),
                     format,
-                )?
+                ))?
             );
         }
 
