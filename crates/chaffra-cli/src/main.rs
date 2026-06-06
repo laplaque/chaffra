@@ -219,10 +219,16 @@ enum Command {
         #[arg(default_value = ".")]
         path: String,
     },
-    /// Telemetry commands: status, test, inspect.
+    /// Telemetry commands: status, test, inspect, dashboard, audit-log.
     Telemetry {
         #[command(subcommand)]
         action: TelemetryAction,
+    },
+    /// Start the management HTTP server with embedded web dashboard.
+    Management {
+        /// Port to bind the management server to.
+        #[arg(long, default_value = "9100")]
+        port: u16,
     },
 }
 
@@ -234,6 +240,21 @@ enum TelemetryAction {
     Test,
     /// Dry-run: show what telemetry payload would be emitted.
     Inspect,
+    /// Generate an import-ready Grafana dashboard JSON.
+    Dashboard {
+        /// Datasource type: prometheus (default) or otlp.
+        #[arg(long, default_value = "prometheus")]
+        datasource: String,
+        /// Print to stdout instead of writing a file.
+        #[arg(long)]
+        stdout: bool,
+    },
+    /// Display the telemetry audit log for GDPR accountability.
+    AuditLog {
+        /// Export events as JSON array for GDPR data subject access requests.
+        #[arg(long)]
+        export: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1179,6 +1200,34 @@ fn cmd_telemetry_inspect(tel_config: &chaffra_telemetry::TelemetryConfig) -> Res
     Ok(out)
 }
 
+fn cmd_telemetry_dashboard(datasource_str: &str, to_stdout: bool) -> Result<String> {
+    let datasource =
+        chaffra_telemetry::dashboard::DashboardDatasource::from_str_loose(datasource_str)
+            .unwrap_or(chaffra_telemetry::dashboard::DashboardDatasource::Prometheus);
+
+    let dashboard = chaffra_telemetry::dashboard::generate_dashboard(datasource);
+    let json = serde_json::to_string_pretty(&dashboard)?;
+
+    if to_stdout {
+        return Ok(json);
+    }
+
+    let filename = "chaffra-grafana-dashboard.json";
+    std::fs::write(filename, &json)?;
+    Ok(format!("Dashboard written to {filename}\n"))
+}
+
+fn cmd_telemetry_audit_log(export: bool) -> String {
+    let log_path = std::path::Path::new(chaffra_telemetry::audit_log::AUDIT_LOG_FILE);
+    let events = chaffra_telemetry::audit_log::read_log(log_path);
+
+    if export {
+        chaffra_telemetry::audit_log::export_for_gdpr(&events)
+    } else {
+        chaffra_telemetry::audit_log::format_log_display(&events)
+    }
+}
+
 fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
     let workspaces = chaffra_monorepo::detect_workspaces(root);
 
@@ -1568,7 +1617,27 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             },
+            TelemetryAction::Dashboard { datasource, stdout } => {
+                match cmd_telemetry_dashboard(datasource, *stdout) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            TelemetryAction::AuditLog { export } => {
+                print!("{}", cmd_telemetry_audit_log(*export));
+            }
         },
+
+        Command::Management { port } => {
+            let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
+            collector.register_core_metrics();
+            let config = chaffra_management::ManagementConfig { port };
+            let server = chaffra_management::ManagementServer::new(config, collector);
+            server.run().await?;
+        }
     }
 
     Ok(())

@@ -26,6 +26,7 @@ members = [
     "crates/chaffra-types",
     "crates/chaffra-proto",
     "crates/chaffra-telemetry",
+    "crates/chaffra-management",
     "crates/chaffra-cli",
 ]
 
@@ -63,6 +64,8 @@ notify = { version = "8", features = ["macos_fsevent"] }
 notify-debouncer-full = "0.5"
 lsp-types = "0.97"
 tower = "0.5"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
 
 chaffra-core = { path = "crates/chaffra-core" }
 chaffra-parse = { path = "crates/chaffra-parse" }
@@ -89,3 +92,4 @@ chaffra-tui = { path = "crates/chaffra-tui" }
 chaffra-types = { path = "crates/chaffra-types" }
 chaffra-proto = { path = "crates/chaffra-proto" }
 chaffra-telemetry = { path = "crates/chaffra-telemetry" }
+chaffra-management = { path = "crates/chaffra-management" }

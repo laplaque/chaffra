@@ -123,12 +123,57 @@ sampling-rate = 1.0          # 0.0–1.0
 sampling-strategy = "rate"   # rate | on-change
 ```
 
+## Parse Cache Metrics
+
+Track incremental parse cache effectiveness in watch mode and LSP.
+
+| Metric | Kind | Description |
+|--------|------|-------------|
+| `chaffra.parse.cache_hits` | counter | Files served from parse cache |
+| `chaffra.parse.cache_misses` | counter | Files re-parsed (cache miss) |
+| `chaffra.parse.cache_hit_rate` | gauge | Hit rate: hits / (hits + misses) |
+| `chaffra.parse.cache_size_bytes` | gauge | Current cache memory usage |
+| `chaffra.parse.cache_evictions` | counter | Cache entries evicted |
+
+These metrics activate when the parse cache is available (watch mode / LSP).
+
+## Grafana Dashboard Generator
+
+Generate an import-ready Grafana dashboard JSON for the full chaffra metric set.
+
+```
+chaffra telemetry dashboard                         # Write chaffra-grafana-dashboard.json
+chaffra telemetry dashboard --datasource otlp       # OTLP datasource variant
+chaffra telemetry dashboard --stdout                # Print to stdout
+```
+
+Panels: health score trend, finding count by module, finding churn, module call duration, findings by severity, error rates, startup time.
+
+Row grouping: Overview (health + findings), Per-module detail, Operational (timing + errors).
+
+Template variables: `tenant_id`, `environment`, `project`.
+
+## Telemetry Audit Log
+
+Append-only local log for GDPR accountability. Records telemetry configuration changes.
+
+Location: `.chaffra-telemetry-audit.log` (JSON lines format).
+
+Events: telemetry enabled/disabled, backend added/removed/modified, tenant-id changed, path-mode changed, sampling rate changed.
+
+```
+chaffra telemetry audit-log            # Display the audit log
+chaffra telemetry audit-log --export   # Export as JSON array for GDPR data subject access requests
+```
+
 ## CLI
 
 ```
-chaffra telemetry status   # Show backends and connection status
-chaffra telemetry test     # Emit test metric, report success/failure
-chaffra telemetry inspect  # Dry-run: show metric payload
+chaffra telemetry status      # Show backends and connection status
+chaffra telemetry test        # Emit test metric, report success/failure
+chaffra telemetry inspect     # Dry-run: show metric payload
+chaffra telemetry dashboard   # Generate Grafana dashboard JSON
+chaffra telemetry audit-log   # Display telemetry audit log
 
 # Global flags on all commands:
 --telemetry on|off|user-only|operator-only
