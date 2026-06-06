@@ -1274,6 +1274,13 @@ where
                 .as_millis() as u64,
         };
         let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+    } else {
+        let (backends, _) =
+            chaffra_telemetry::backends::create_backends(&effective_config.backends);
+        let snapshot = collector.snapshot();
+        for backend in &backends {
+            let _ = backend.flush(&snapshot);
+        }
     }
 
     result
@@ -2706,5 +2713,67 @@ mod tests {
             "prior churn state should be preserved after a failed run"
         );
         assert_eq!(loaded.findings_hash, 12345);
+    }
+
+    #[test]
+    fn test_failed_run_flushes_error_telemetry() {
+        let dir = TempDir::new().unwrap();
+        let telemetry_path = dir.path().join("telemetry.json");
+        let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
+
+        let prior_state = chaffra_telemetry::churn::ChurnState {
+            fingerprints: [chaffra_telemetry::churn::FindingFingerprint::new(
+                "dc:unused",
+                "a.go",
+                10,
+            )]
+            .into_iter()
+            .collect(),
+            findings_hash: 99999,
+            timestamp_ms: 2000,
+        };
+        chaffra_telemetry::churn::save_state(&prior_state, &state_file).unwrap();
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(telemetry_path.to_str().unwrap().to_owned()),
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated analysis failure")
+        });
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_err());
+
+        assert!(
+            telemetry_path.exists(),
+            "telemetry JSON should be flushed even on failed runs"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["operator_summary"]["module_error_counts"]["failing-cmd"], 1,
+            "error metric should be recorded in flushed telemetry"
+        );
+
+        let loaded = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        assert_eq!(
+            loaded.fingerprints, prior_state.fingerprints,
+            "prior churn state should be unchanged after a failed run"
+        );
+        assert_eq!(loaded.findings_hash, 99999);
+        assert_eq!(loaded.timestamp_ms, 2000);
     }
 }
