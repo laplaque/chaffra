@@ -262,6 +262,7 @@ dependencies = [
  "chaffra-parse",
  "chaffra-plugin",
  "chaffra-security",
+ "chaffra-telemetry",
  "chaffra-tui",
  "chaffra-types",
  "clap",
@@ -378,6 +379,7 @@ dependencies = [
  "chaffra-core",
  "chaffra-deadcode",
  "chaffra-parse",
+ "chaffra-telemetry",
  "serde",
  "serde_json",
  "thiserror",
@@ -466,6 +468,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tree-sitter",
+]
+
+[[package]]
+name = "chaffra-telemetry"
+version = "0.1.0"
+dependencies = [
+ "chaffra-core",
+ "chaffra-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

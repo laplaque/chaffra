@@ -928,6 +928,8 @@ mod tests {
                 files_analyzed: 1,
                 duration_ms: 0,
                 counters: Default::default(),
+                metrics: vec![],
+                spans: vec![],
             }),
         };
         let err = convert::analysis_result_from_proto(&proto_response).unwrap_err();

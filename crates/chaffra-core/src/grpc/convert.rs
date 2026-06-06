@@ -136,6 +136,8 @@ pub fn module_metrics_to_proto(m: &diagnostic::ModuleMetrics) -> proto::ModuleMe
         files_analyzed: m.files_analyzed,
         duration_ms: m.duration_ms,
         counters: m.counters.clone(),
+        metrics: vec![],
+        spans: vec![],
     }
 }
 

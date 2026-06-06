@@ -47,7 +47,7 @@ fn test_mcp_full_session() {
         .handle_message(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
         .unwrap();
     let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-    assert_eq!(tools.len(), 3);
+    assert_eq!(tools.len(), 4);
     let tool_names: Vec<String> = tools
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_owned())
@@ -55,6 +55,7 @@ fn test_mcp_full_session() {
     assert!(tool_names.contains(&"chaffra/health".to_owned()));
     assert!(tool_names.contains(&"chaffra/dead-code".to_owned()));
     assert!(tool_names.contains(&"chaffra/explain".to_owned()));
+    assert!(tool_names.contains(&"chaffra/telemetry".to_owned()));
 
     // Call explain tool.
     let resp = server
