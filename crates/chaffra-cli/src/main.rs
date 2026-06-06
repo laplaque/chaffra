@@ -1237,42 +1237,44 @@ where
     let failed = result.is_err();
     collector.record_module_call(command_name, duration_ms, failed);
 
-    let current_fingerprints = collector.finding_fingerprints();
-    let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
-    let previous_state = chaffra_telemetry::churn::load_state(state_path);
+    if !failed {
+        let current_fingerprints = collector.finding_fingerprints();
+        let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
+        let previous_state = chaffra_telemetry::churn::load_state(state_path);
 
-    let current_hash = chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
+        let current_hash = chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
 
-    if let Some(ref prev) = previous_state {
-        let churn = chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
-        collector.record_finding_churn(&churn);
-    }
-
-    let decision = chaffra_telemetry::sampling::should_sample(
-        effective_config.sampling_strategy,
-        effective_config.sampling_rate,
-        current_hash,
-        previous_state.as_ref().map(|s| s.findings_hash),
-    );
-
-    if decision == chaffra_telemetry::SamplingDecision::Emit {
-        let (backends, _) =
-            chaffra_telemetry::backends::create_backends(&effective_config.backends);
-        let snapshot = collector.snapshot();
-        for backend in &backends {
-            let _ = backend.flush(&snapshot);
+        if let Some(ref prev) = previous_state {
+            let churn = chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
+            collector.record_finding_churn(&churn);
         }
-    }
 
-    let new_state = chaffra_telemetry::churn::ChurnState {
-        fingerprints: current_fingerprints,
-        findings_hash: current_hash,
-        timestamp_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    };
-    let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+        let decision = chaffra_telemetry::sampling::should_sample(
+            effective_config.sampling_strategy,
+            effective_config.sampling_rate,
+            current_hash,
+            previous_state.as_ref().map(|s| s.findings_hash),
+        );
+
+        if decision == chaffra_telemetry::SamplingDecision::Emit {
+            let (backends, _) =
+                chaffra_telemetry::backends::create_backends(&effective_config.backends);
+            let snapshot = collector.snapshot();
+            for backend in &backends {
+                let _ = backend.flush(&snapshot);
+            }
+        }
+
+        let new_state = chaffra_telemetry::churn::ChurnState {
+            fingerprints: current_fingerprints,
+            findings_hash: current_hash,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+    }
 
     result
 }
@@ -2660,5 +2662,49 @@ mod tests {
             !state.fingerprints.is_empty(),
             "churn state should contain real fingerprints, not an empty set"
         );
+    }
+
+    #[test]
+    fn test_failed_run_preserves_prior_churn_state() {
+        let dir = TempDir::new().unwrap();
+        let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
+
+        let prior_state = chaffra_telemetry::churn::ChurnState {
+            fingerprints: [chaffra_telemetry::churn::FindingFingerprint::new(
+                "dc:unused",
+                "a.go",
+                10,
+            )]
+            .into_iter()
+            .collect(),
+            findings_hash: 12345,
+            timestamp_ms: 1000,
+        };
+        chaffra_telemetry::churn::save_state(&prior_state, &state_file).unwrap();
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            backends: vec![],
+            ..Default::default()
+        };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated analysis failure")
+        });
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_err());
+
+        let loaded = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        assert_eq!(
+            loaded.fingerprints, prior_state.fingerprints,
+            "prior churn state should be preserved after a failed run"
+        );
+        assert_eq!(loaded.findings_hash, 12345);
     }
 }
