@@ -208,7 +208,13 @@ impl AnalysisModule for DeadCodeModule {
                         }
                     }
                     // No import analysis for stub-parsed languages.
-                    Language::Php | Language::Dart | Language::CSharp | Language::Rust => true,
+                    Language::Php
+                    | Language::Dart
+                    | Language::CSharp
+                    | Language::Rust
+                    | Language::JavaScript
+                    | Language::TypeScript
+                    | Language::Java => true,
                 };
 
                 if !import_used {
@@ -506,7 +512,13 @@ fn is_entry_point(sym: &Symbol, lang: Language, file: &str) -> bool {
             false
         }
         // Languages without full analysis support: treat all symbols as entry points.
-        Language::Php | Language::Dart | Language::CSharp | Language::Rust => true,
+        Language::Php
+        | Language::Dart
+        | Language::CSharp
+        | Language::Rust
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Java => true,
     }
 }
 

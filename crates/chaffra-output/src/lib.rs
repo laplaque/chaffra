@@ -11,6 +11,7 @@ pub mod codeclimate;
 pub mod json;
 pub mod markdown;
 pub mod pr_comment;
+pub mod sarif;
 pub mod terminal;
 
 /// Output format selection.
@@ -23,6 +24,7 @@ pub enum OutputFormat {
     Annotations,
     CodeClimate,
     Badge,
+    Sarif,
 }
 
 impl OutputFormat {
@@ -38,6 +40,7 @@ impl OutputFormat {
                 Some(OutputFormat::CodeClimate)
             }
             "badge" | "shields" => Some(OutputFormat::Badge),
+            "sarif" => Some(OutputFormat::Sarif),
             _ => None,
         }
     }
@@ -65,6 +68,7 @@ pub fn create_formatter(format: OutputFormat) -> Box<dyn Formatter> {
         OutputFormat::Annotations => Box::new(annotations::AnnotationsFormatter),
         OutputFormat::CodeClimate => Box::new(codeclimate::CodeClimateFormatter),
         OutputFormat::Badge => Box::new(badge::BadgeFormatter),
+        OutputFormat::Sarif => Box::new(sarif::SarifFormatter),
     }
 }
 
@@ -102,6 +106,7 @@ mod tests {
             ("gitlab", Some(OutputFormat::CodeClimate)),
             ("badge", Some(OutputFormat::Badge)),
             ("shields", Some(OutputFormat::Badge)),
+            ("sarif", Some(OutputFormat::Sarif)),
             ("unknown", None),
         ];
         for (input, expected) in cases {
@@ -123,6 +128,7 @@ mod tests {
             OutputFormat::Annotations,
             OutputFormat::CodeClimate,
             OutputFormat::Badge,
+            OutputFormat::Sarif,
         ] {
             let formatter = create_formatter(fmt);
             let output = formatter.format_findings(&[]);
