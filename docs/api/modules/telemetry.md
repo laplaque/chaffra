@@ -139,11 +139,10 @@ Integration into the watch mode and LSP parse cache producers is planned for a f
 
 ## Grafana Dashboard Generator
 
-Generate an import-ready Grafana dashboard JSON for the full chaffra metric set.
+Generate an import-ready Grafana dashboard JSON (Prometheus datasource) for the full chaffra metric set.
 
 ```
 chaffra telemetry dashboard                         # Write chaffra-grafana-dashboard.json
-chaffra telemetry dashboard --datasource otlp       # OTLP datasource variant
 chaffra telemetry dashboard --stdout                # Print to stdout
 ```
 

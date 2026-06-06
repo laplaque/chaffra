@@ -244,11 +244,8 @@ enum TelemetryAction {
     Test,
     /// Dry-run: show what telemetry payload would be emitted.
     Inspect,
-    /// Generate an import-ready Grafana dashboard JSON.
+    /// Generate an import-ready Grafana dashboard JSON (Prometheus datasource).
     Dashboard {
-        /// Datasource type: prometheus (default) or otlp.
-        #[arg(long, default_value = "prometheus")]
-        datasource: String,
         /// Print to stdout instead of writing a file.
         #[arg(long)]
         stdout: bool,
@@ -1204,12 +1201,8 @@ fn cmd_telemetry_inspect(tel_config: &chaffra_telemetry::TelemetryConfig) -> Res
     Ok(out)
 }
 
-fn cmd_telemetry_dashboard(datasource_str: &str, to_stdout: bool) -> Result<String> {
-    let datasource =
-        chaffra_telemetry::dashboard::DashboardDatasource::from_str_loose(datasource_str)
-            .unwrap_or(chaffra_telemetry::dashboard::DashboardDatasource::Prometheus);
-
-    let dashboard = chaffra_telemetry::dashboard::generate_dashboard(datasource);
+fn cmd_telemetry_dashboard(to_stdout: bool) -> Result<String> {
+    let dashboard = chaffra_telemetry::dashboard::generate_dashboard();
     let json = serde_json::to_string_pretty(&dashboard)?;
 
     if to_stdout {
@@ -1621,15 +1614,13 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             },
-            TelemetryAction::Dashboard { datasource, stdout } => {
-                match cmd_telemetry_dashboard(datasource, *stdout) {
-                    Ok(output) => print!("{output}"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
+            TelemetryAction::Dashboard { stdout } => match cmd_telemetry_dashboard(*stdout) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
                 }
-            }
+            },
             TelemetryAction::AuditLog { export } => {
                 print!("{}", cmd_telemetry_audit_log(*export));
             }

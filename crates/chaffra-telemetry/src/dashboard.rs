@@ -12,58 +12,18 @@ pub const PROM_FINDINGS_CHURN_RATE: &str = "chaffra_findings_churn_rate";
 pub const PROM_MODULE_STARTUP: &str = "chaffra_module_startup_duration_ms";
 pub const PROM_STARTUP_TOTAL: &str = "chaffra_startup_total_duration_ms";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DashboardDatasource {
-    Prometheus,
-    Otlp,
-}
-
-impl DashboardDatasource {
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "prometheus" | "prom" => Some(Self::Prometheus),
-            "otlp" | "otel" | "opentelemetry" => Some(Self::Otlp),
-            _ => None,
-        }
-    }
-
-    fn datasource_type(&self) -> &str {
-        match self {
-            Self::Prometheus => "prometheus",
-            Self::Otlp => "prometheus",
-        }
-    }
-
-    fn datasource_uid(&self) -> &str {
-        match self {
-            Self::Prometheus => "${DS_PROMETHEUS}",
-            Self::Otlp => "${DS_OTLP}",
-        }
-    }
-}
-
-pub fn generate_dashboard(datasource: DashboardDatasource) -> Value {
-    let ds = json!({ "type": datasource.datasource_type(), "uid": datasource.datasource_uid() });
+pub fn generate_dashboard() -> Value {
+    let ds = json!({ "type": "prometheus", "uid": "${DS_PROMETHEUS}" });
 
     let templating = json!({
         "list": [
             {
                 "name": "DS_PROMETHEUS",
                 "type": "datasource",
-                "query": datasource.datasource_type(),
+                "query": "prometheus",
                 "current": {},
-                "hide": if datasource == DashboardDatasource::Prometheus { 0 } else { 2 },
+                "hide": 0,
             },
-            {
-                "name": "DS_OTLP",
-                "type": "datasource",
-                "query": datasource.datasource_type(),
-                "current": {},
-                "hide": if datasource == DashboardDatasource::Otlp { 0 } else { 2 },
-            },
-            template_var("tenant_id", PROM_FINDINGS_TOTAL, "tenant_id"),
-            template_var("environment", PROM_FINDINGS_TOTAL, "environment"),
-            template_var("project", PROM_FINDINGS_TOTAL, "project"),
         ]
     });
 
@@ -83,10 +43,10 @@ pub fn generate_dashboard(datasource: DashboardDatasource) -> Value {
     json!({
         "__inputs": [
             {
-                "name": datasource.datasource_uid().trim_start_matches('$').trim_matches(|c| c == '{' || c == '}'),
-                "label": if datasource == DashboardDatasource::Prometheus { "Prometheus" } else { "OTLP" },
+                "name": "DS_PROMETHEUS",
+                "label": "Prometheus",
                 "type": "datasource",
-                "pluginId": datasource.datasource_type(),
+                "pluginId": "prometheus",
             }
         ],
         "annotations": { "list": [] },
@@ -106,19 +66,6 @@ pub fn generate_dashboard(datasource: DashboardDatasource) -> Value {
         "uid": Value::Null,
         "version": 1,
         "refresh": "5m",
-    })
-}
-
-fn template_var(name: &str, metric: &str, label: &str) -> Value {
-    json!({
-        "name": name,
-        "type": "query",
-        "query": format!("label_values({metric}, {label})"),
-        "refresh": 2,
-        "multi": false,
-        "includeAll": true,
-        "allValue": ".*",
-        "current": { "text": "All", "value": "$__all" },
     })
 }
 
@@ -157,8 +104,8 @@ fn health_score_trend_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             "overrides": [],
         },
         "targets": [{
-            "expr": format!("avg({{__name__=~\"chaffra_module_.*_health_score\",tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}})"),
-            "legendFormat": "{{project}}",
+            "expr": "{__name__=~\"chaffra_module_.*_health_score\"}",
+            "legendFormat": "{{module}}",
             "refId": "A",
         }],
     })
@@ -173,7 +120,7 @@ fn finding_count_by_module_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "gridPos": { "h": 8, "w": 12, "x": 12, "y": grid_y },
         "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
         "targets": [{
-            "expr": format!("{PROM_FINDINGS_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
+            "expr": format!("{PROM_FINDINGS_TOTAL}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -200,9 +147,9 @@ fn finding_churn_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             ],
         },
         "targets": [
-            { "expr": format!("{PROM_FINDINGS_NEW}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"), "legendFormat": "New", "refId": "A" },
-            { "expr": format!("{PROM_FINDINGS_RESOLVED}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"), "legendFormat": "Resolved", "refId": "B" },
-            { "expr": format!("{PROM_FINDINGS_UNCHANGED}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"), "legendFormat": "Unchanged", "refId": "C" },
+            { "expr": format!("{PROM_FINDINGS_NEW}"), "legendFormat": "New", "refId": "A" },
+            { "expr": format!("{PROM_FINDINGS_RESOLVED}"), "legendFormat": "Resolved", "refId": "B" },
+            { "expr": format!("{PROM_FINDINGS_UNCHANGED}"), "legendFormat": "Unchanged", "refId": "C" },
         ],
     })
 }
@@ -216,7 +163,7 @@ fn module_call_duration_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "gridPos": { "h": 8, "w": 12, "x": 0, "y": grid_y },
         "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
         "targets": [{
-            "expr": format!("{PROM_MODULE_CALL_DURATION}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
+            "expr": format!("{PROM_MODULE_CALL_DURATION}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -239,7 +186,7 @@ fn module_finding_breakdown_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             ],
         },
         "targets": [{
-            "expr": format!("sum by (severity) ({PROM_FINDINGS_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}})"),
+            "expr": format!("sum by (severity) ({PROM_FINDINGS_TOTAL})"),
             "legendFormat": "{{severity}}",
             "refId": "A",
         }],
@@ -267,7 +214,7 @@ fn error_rate_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             "overrides": [],
         },
         "targets": [{
-            "expr": format!("{PROM_MODULE_ERROR_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
+            "expr": format!("{PROM_MODULE_ERROR_TOTAL}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -284,12 +231,12 @@ fn startup_time_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
         "targets": [
             {
-                "expr": format!("{PROM_STARTUP_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
+                "expr": format!("{PROM_STARTUP_TOTAL}"),
                 "legendFormat": "Total",
                 "refId": "A",
             },
             {
-                "expr": format!("{PROM_MODULE_STARTUP}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
+                "expr": format!("{PROM_MODULE_STARTUP}"),
                 "legendFormat": "{{module}}",
                 "refId": "B",
             },
@@ -303,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_generate_prometheus_dashboard() {
-        let dashboard = generate_dashboard(DashboardDatasource::Prometheus);
+        let dashboard = generate_dashboard();
         assert_eq!(dashboard["title"], "Chaffra Codebase Intelligence");
         assert_eq!(dashboard["schemaVersion"], 39);
 
@@ -321,23 +268,13 @@ mod tests {
             .iter()
             .filter_map(|v| v["name"].as_str())
             .collect();
-        assert!(var_names.contains(&"tenant_id"));
-        assert!(var_names.contains(&"environment"));
-        assert!(var_names.contains(&"project"));
-    }
-
-    #[test]
-    fn test_generate_otlp_dashboard() {
-        let dashboard = generate_dashboard(DashboardDatasource::Otlp);
-        assert_eq!(dashboard["title"], "Chaffra Codebase Intelligence");
-
-        let inputs = dashboard["__inputs"].as_array().unwrap();
-        assert_eq!(inputs[0]["name"], "DS_OTLP");
+        assert!(var_names.contains(&"DS_PROMETHEUS"));
+        assert_eq!(var_names.len(), 1);
     }
 
     #[test]
     fn test_dashboard_has_required_panels() {
-        let dashboard = generate_dashboard(DashboardDatasource::Prometheus);
+        let dashboard = generate_dashboard();
         let panels = dashboard["panels"].as_array().unwrap();
 
         let titles: Vec<&str> = panels.iter().filter_map(|p| p["title"].as_str()).collect();
@@ -350,24 +287,29 @@ mod tests {
     }
 
     #[test]
-    fn test_datasource_from_str() {
-        assert_eq!(
-            DashboardDatasource::from_str_loose("prometheus"),
-            Some(DashboardDatasource::Prometheus)
-        );
-        assert_eq!(
-            DashboardDatasource::from_str_loose("OTLP"),
-            Some(DashboardDatasource::Otlp)
-        );
-        assert_eq!(DashboardDatasource::from_str_loose("unknown"), None);
-    }
-
-    #[test]
     fn test_dashboard_json_is_valid() {
-        let dashboard = generate_dashboard(DashboardDatasource::Prometheus);
+        let dashboard = generate_dashboard();
         let json_str = serde_json::to_string_pretty(&dashboard).unwrap();
         let reparsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(dashboard, reparsed);
+    }
+
+    #[test]
+    fn test_dashboard_no_phantom_label_selectors() {
+        let dashboard = generate_dashboard();
+        let json_str = serde_json::to_string(&dashboard).unwrap();
+        assert!(
+            !json_str.contains("tenant_id"),
+            "dashboard should not reference tenant_id label"
+        );
+        assert!(
+            !json_str.contains("environment"),
+            "dashboard should not reference environment label"
+        );
+        assert!(
+            !json_str.contains("$project"),
+            "dashboard should not reference project template variable"
+        );
     }
 
     #[test]
@@ -413,7 +355,7 @@ mod tests {
             .cloned()
             .collect();
 
-        let dashboard = generate_dashboard(DashboardDatasource::Prometheus);
+        let dashboard = generate_dashboard();
         let panels = dashboard["panels"].as_array().unwrap();
 
         let mut query_metrics = Vec::new();
@@ -452,6 +394,7 @@ mod tests {
         let must_be_emitted = [
             PROM_FINDINGS_TOTAL,
             PROM_MODULE_CALL_DURATION,
+            PROM_MODULE_ERROR_TOTAL,
             PROM_FINDINGS_NEW,
             PROM_FINDINGS_RESOLVED,
             PROM_FINDINGS_UNCHANGED,
@@ -471,5 +414,59 @@ mod tests {
                 "dashboard queries metric {metric} which is not in the collector's emitted data points or registered definitions"
             );
         }
+    }
+
+    #[test]
+    fn test_dashboard_severity_labels_emitted() {
+        use crate::collector::TelemetryCollector;
+
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_findings(
+            "dead-code",
+            5,
+            &[("warning".to_owned(), 3), ("info".to_owned(), 2)]
+                .into_iter()
+                .collect(),
+        );
+
+        let snapshot = collector.snapshot();
+        let severity_dps: Vec<_> = snapshot
+            .data_points
+            .iter()
+            .filter(|dp| {
+                dp.name == "chaffra.analysis.findings_total" && dp.labels.contains_key("severity")
+            })
+            .collect();
+
+        assert!(
+            severity_dps.len() >= 2,
+            "collector should emit per-severity data points"
+        );
+
+        let severities: std::collections::HashSet<&str> = severity_dps
+            .iter()
+            .map(|dp| dp.labels["severity"].as_str())
+            .collect();
+        assert!(severities.contains("warning"));
+        assert!(severities.contains("info"));
+    }
+
+    #[test]
+    fn test_dashboard_error_data_point_emitted() {
+        use crate::collector::TelemetryCollector;
+
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 100, true);
+
+        let snapshot = collector.snapshot();
+        let error_dps: Vec<_> = snapshot
+            .data_points
+            .iter()
+            .filter(|dp| dp.name == "chaffra.module.error_total")
+            .collect();
+
+        assert_eq!(error_dps.len(), 1);
+        assert_eq!(error_dps[0].labels["module"], "dead-code");
+        assert_eq!(error_dps[0].value, 1.0);
     }
 }
