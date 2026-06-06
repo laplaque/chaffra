@@ -4,7 +4,7 @@ use crate::config::TelemetryConfig;
 use crate::error::Result;
 use crate::metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +81,7 @@ struct CollectorInner {
     findings_by_severity: HashMap<String, u64>,
     files_total: u64,
     analysis_start_ms: u64,
+    finding_fingerprints: HashSet<crate::churn::FindingFingerprint>,
 }
 
 fn now_ms() -> u64 {
@@ -381,6 +382,21 @@ impl TelemetryCollector {
             },
         ];
         self.record_data_points(points);
+    }
+
+    /// Store finding fingerprints produced by the current analysis run.
+    pub fn set_finding_fingerprints(
+        &self,
+        fingerprints: HashSet<crate::churn::FindingFingerprint>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.finding_fingerprints = fingerprints;
+    }
+
+    /// Retrieve finding fingerprints stored during the current run.
+    pub fn finding_fingerprints(&self) -> HashSet<crate::churn::FindingFingerprint> {
+        let inner = self.inner.lock().unwrap();
+        inner.finding_fingerprints.clone()
     }
 
     /// Register the core metric definitions.
