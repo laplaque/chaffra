@@ -253,22 +253,49 @@ enum HooksAction {
 }
 
 pub(crate) fn build_module_host() -> GrpcModuleHost {
+    build_module_host_with_telemetry(None)
+}
+
+fn build_module_host_with_telemetry(
+    collector: Option<&chaffra_telemetry::TelemetryCollector>,
+) -> GrpcModuleHost {
+    let total_start = std::time::Instant::now();
     let mut host = GrpcModuleHost::new();
-    // Register built-in modules. Each module is wrapped in a GrpcModuleHandle
-    // that starts an in-process gRPC service (tower::Service, no TCP).
-    let _ = host.register(Box::new(DeadCodeModule::new()));
-    let _ = host.register(Box::new(ComplexityModule::new()));
-    let _ = host.register(Box::new(SecurityModule::new()));
-    let _ = host.register(Box::new(FrameworksModule::new()));
-    let _ = host.register(Box::new(AuditModule::new()));
-    let _ = host.register(Box::new(HotspotModule::new()));
-    let _ = host.register(Box::new(AutofixModule::new()));
-    let _ = host.register(Box::new(AiQualityModule::new()));
-    let _ = host.register(Box::new(LlmDefenseModule::new()));
-    let _ = host.register(Box::new(CicdSecurityModule::new()));
-    let _ = host.register(Box::new(TelemetryModule::new()));
-    let _ = host.register(Box::new(DuplicationModule::new()));
-    let _ = host.register(Box::new(ArchModule::new()));
+
+    let modules: Vec<(&str, Box<dyn chaffra_core::module::AnalysisModule>)> = vec![
+        ("dead-code", Box::new(DeadCodeModule::new())),
+        ("complexity", Box::new(ComplexityModule::new())),
+        ("security", Box::new(SecurityModule::new())),
+        ("frameworks", Box::new(FrameworksModule::new())),
+        ("audit", Box::new(AuditModule::new())),
+        ("hotspot", Box::new(HotspotModule::new())),
+        ("autofix", Box::new(AutofixModule::new())),
+        ("ai-quality", Box::new(AiQualityModule::new())),
+        ("llm-defense", Box::new(LlmDefenseModule::new())),
+        ("cicd-security", Box::new(CicdSecurityModule::new())),
+        ("telemetry", Box::new(TelemetryModule::new())),
+        ("duplication", Box::new(DuplicationModule::new())),
+        ("architecture", Box::new(ArchModule::new())),
+    ];
+
+    for (id, module) in modules {
+        let start = std::time::Instant::now();
+        let result = host.register(module);
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if let Some(c) = collector {
+            c.record_module_startup(id, duration_ms);
+            if result.is_err() {
+                c.record_module_load_error(id, "registration_failed");
+            }
+        }
+    }
+
+    if let Some(c) = collector {
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        c.record_startup_total(total_ms);
+    }
+
     host
 }
 
@@ -1011,7 +1038,11 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
         chaffra_telemetry::TelemetryConfig::default().backends
     };
 
-    chaffra_telemetry::TelemetryConfig { audience, backends }
+    chaffra_telemetry::TelemetryConfig {
+        audience,
+        backends,
+        ..Default::default()
+    }
 }
 
 fn cmd_telemetry_status(tel_config: &chaffra_telemetry::TelemetryConfig) -> String {
@@ -1149,11 +1180,41 @@ where
     let failed = result.is_err();
     collector.record_module_call(command_name, duration_ms, failed);
 
-    let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
-    let snapshot = collector.snapshot();
-    for backend in &backends {
-        let _ = backend.flush(&snapshot);
+    let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
+    let previous_state = chaffra_telemetry::churn::load_state(state_path);
+
+    let current_fingerprints = std::collections::HashSet::new();
+    let current_hash = chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
+
+    if let Some(ref prev) = previous_state {
+        let churn = chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
+        collector.record_finding_churn(&churn);
     }
+
+    let decision = chaffra_telemetry::sampling::should_sample(
+        tel_config.sampling_strategy,
+        tel_config.sampling_rate,
+        current_hash,
+        previous_state.as_ref().map(|s| s.findings_hash),
+    );
+
+    if decision == chaffra_telemetry::SamplingDecision::Emit {
+        let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+        let snapshot = collector.snapshot();
+        for backend in &backends {
+            let _ = backend.flush(&snapshot);
+        }
+    }
+
+    let new_state = chaffra_telemetry::churn::ChurnState {
+        fingerprints: current_fingerprints,
+        findings_hash: current_hash,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
 
     result
 }

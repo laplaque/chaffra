@@ -22,6 +22,7 @@ target
 
 # Telemetry output
 chaffra-telemetry.json
+.chaffra-telemetry-state.json
 
 # Claude Code
 .claude/
