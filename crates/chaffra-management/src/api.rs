@@ -191,25 +191,25 @@ pub async fn get_findings_churn(
     let churn_new = snapshot
         .data_points
         .iter()
-        .find(|p| p.name == "chaffra.finding_churn.new_count")
+        .find(|p| p.name == "chaffra.findings.new")
         .map(|p| p.value as u64)
         .unwrap_or(0);
     let churn_resolved = snapshot
         .data_points
         .iter()
-        .find(|p| p.name == "chaffra.finding_churn.resolved_count")
+        .find(|p| p.name == "chaffra.findings.resolved")
         .map(|p| p.value as u64)
         .unwrap_or(0);
     let churn_unchanged = snapshot
         .data_points
         .iter()
-        .find(|p| p.name == "chaffra.finding_churn.unchanged_count")
+        .find(|p| p.name == "chaffra.findings.unchanged")
         .map(|p| p.value as u64)
         .unwrap_or(0);
     let churn_rate = snapshot
         .data_points
         .iter()
-        .find(|p| p.name == "chaffra.finding_churn.churn_rate")
+        .find(|p| p.name == "chaffra.findings.churn_rate")
         .map(|p| p.value)
         .unwrap_or(0.0);
 
@@ -226,7 +226,7 @@ pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<H
     let score = snapshot
         .data_points
         .iter()
-        .find(|p| p.name == "chaffra.health.score")
+        .find(|p| p.name == "chaffra.module.health.health_score")
         .map(|p| p.value);
 
     let grade = match score {

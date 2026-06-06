@@ -119,8 +119,8 @@ Active configuration (redacted secrets).
 
 ## Lifecycle
 
-- Runs standalone via `chaffra management` for ad-hoc inspection
-- Shares the tokio runtime when co-located with watch/MCP/LSP modes
+- **Standalone mode** (`chaffra management`): starts an empty collector with core metric definitions registered. Useful for verifying the dashboard UI, API shape, and backend connectivity. Does not contain analysis data.
+- **Co-located mode** (watch/MCP/LSP): the management server shares the live `TelemetryCollector` used by analysis, exposing real-time metrics, findings, and churn data. Wiring into these modes is planned for a future phase.
 - Clean shutdown on Ctrl+C
 - Binds to `127.0.0.1` only (localhost)
 

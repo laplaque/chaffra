@@ -1,5 +1,17 @@
 use serde_json::{Value, json};
 
+pub const PROM_ANALYSIS_DURATION: &str = "chaffra_analysis_duration_ms";
+pub const PROM_ANALYSIS_FILES: &str = "chaffra_analysis_files_total";
+pub const PROM_FINDINGS_TOTAL: &str = "chaffra_analysis_findings_total";
+pub const PROM_MODULE_CALL_DURATION: &str = "chaffra_module_call_duration_ms";
+pub const PROM_MODULE_ERROR_TOTAL: &str = "chaffra_module_error_total";
+pub const PROM_FINDINGS_NEW: &str = "chaffra_findings_new";
+pub const PROM_FINDINGS_RESOLVED: &str = "chaffra_findings_resolved";
+pub const PROM_FINDINGS_UNCHANGED: &str = "chaffra_findings_unchanged";
+pub const PROM_FINDINGS_CHURN_RATE: &str = "chaffra_findings_churn_rate";
+pub const PROM_MODULE_STARTUP: &str = "chaffra_module_startup_duration_ms";
+pub const PROM_STARTUP_TOTAL: &str = "chaffra_startup_total_duration_ms";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardDatasource {
     Prometheus,
@@ -49,9 +61,9 @@ pub fn generate_dashboard(datasource: DashboardDatasource) -> Value {
                 "current": {},
                 "hide": if datasource == DashboardDatasource::Otlp { 0 } else { 2 },
             },
-            template_var("tenant_id", "chaffra_health_score", "tenant_id"),
-            template_var("environment", "chaffra_health_score", "environment"),
-            template_var("project", "chaffra_health_score", "project"),
+            template_var("tenant_id", PROM_FINDINGS_TOTAL, "tenant_id"),
+            template_var("environment", PROM_FINDINGS_TOTAL, "environment"),
+            template_var("project", PROM_FINDINGS_TOTAL, "project"),
         ]
     });
 
@@ -145,7 +157,7 @@ fn health_score_trend_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             "overrides": [],
         },
         "targets": [{
-            "expr": "chaffra_health_score{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+            "expr": format!("chaffra_module_health_health_score{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
             "legendFormat": "{{project}}",
             "refId": "A",
         }],
@@ -161,7 +173,7 @@ fn finding_count_by_module_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "gridPos": { "h": 8, "w": 12, "x": 12, "y": grid_y },
         "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
         "targets": [{
-            "expr": "chaffra_module_finding_count{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+            "expr": format!("{PROM_FINDINGS_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -188,9 +200,9 @@ fn finding_churn_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             ],
         },
         "targets": [
-            { "expr": "chaffra_finding_churn_new{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}", "legendFormat": "New", "refId": "A" },
-            { "expr": "chaffra_finding_churn_resolved{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}", "legendFormat": "Resolved", "refId": "B" },
-            { "expr": "chaffra_finding_churn_unchanged{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}", "legendFormat": "Unchanged", "refId": "C" },
+            { "expr": format!("{PROM_FINDINGS_NEW}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"), "legendFormat": "New", "refId": "A" },
+            { "expr": format!("{PROM_FINDINGS_RESOLVED}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"), "legendFormat": "Resolved", "refId": "B" },
+            { "expr": format!("{PROM_FINDINGS_UNCHANGED}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"), "legendFormat": "Unchanged", "refId": "C" },
         ],
     })
 }
@@ -204,7 +216,7 @@ fn module_call_duration_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "gridPos": { "h": 8, "w": 12, "x": 0, "y": grid_y },
         "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
         "targets": [{
-            "expr": "chaffra_module_call_duration_ms{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+            "expr": format!("{PROM_MODULE_CALL_DURATION}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -227,7 +239,7 @@ fn module_finding_breakdown_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             ],
         },
         "targets": [{
-            "expr": "chaffra_findings_by_severity{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+            "expr": format!("sum by (severity) ({PROM_FINDINGS_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}})"),
             "legendFormat": "{{severity}}",
             "refId": "A",
         }],
@@ -255,7 +267,7 @@ fn error_rate_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             "overrides": [],
         },
         "targets": [{
-            "expr": "chaffra_module_error_count{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+            "expr": format!("{PROM_MODULE_ERROR_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -272,12 +284,12 @@ fn startup_time_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
         "targets": [
             {
-                "expr": "chaffra_startup_total_duration_ms{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+                "expr": format!("{PROM_STARTUP_TOTAL}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
                 "legendFormat": "Total",
                 "refId": "A",
             },
             {
-                "expr": "chaffra_module_startup_duration_ms{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}",
+                "expr": format!("{PROM_MODULE_STARTUP}{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
                 "legendFormat": "{{module}}",
                 "refId": "B",
             },
@@ -356,5 +368,92 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&dashboard).unwrap();
         let reparsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(dashboard, reparsed);
+    }
+
+    #[test]
+    fn test_dashboard_queries_match_collector_metrics() {
+        use crate::collector::TelemetryCollector;
+
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("dead-code", 100, true);
+        collector.record_module_findings(
+            "dead-code",
+            3,
+            &[("warning".to_owned(), 3)].into_iter().collect(),
+        );
+        collector.record_module_startup("dead-code", 10);
+        collector.record_startup_total(50);
+
+        let churn = crate::churn::ChurnResult {
+            new_count: 1,
+            resolved_count: 2,
+            unchanged_count: 5,
+            churn_rate: 0.125,
+        };
+        collector.record_finding_churn(&churn);
+
+        let snapshot = collector.snapshot();
+
+        let emitted_dp_names: std::collections::HashSet<String> = snapshot
+            .data_points
+            .iter()
+            .map(|dp| dp.name.replace('.', "_"))
+            .collect();
+
+        let registered_def_names: std::collections::HashSet<String> = snapshot
+            .definitions
+            .keys()
+            .map(|k| k.replace('.', "_"))
+            .collect();
+
+        let all_known: std::collections::HashSet<String> = emitted_dp_names
+            .union(&registered_def_names)
+            .cloned()
+            .collect();
+
+        let dashboard = generate_dashboard(DashboardDatasource::Prometheus);
+        let panels = dashboard["panels"].as_array().unwrap();
+
+        let mut query_metrics = Vec::new();
+        for panel in panels {
+            if let Some(targets) = panel["targets"].as_array() {
+                for target in targets {
+                    if let Some(expr) = target["expr"].as_str() {
+                        let metric = expr.split('{').next().unwrap_or(expr);
+                        let metric = metric
+                            .trim_start_matches("sum by (severity) (")
+                            .trim_end_matches(')');
+                        query_metrics.push(metric.to_owned());
+                    }
+                }
+            }
+        }
+
+        let must_be_emitted = [
+            PROM_FINDINGS_TOTAL,
+            PROM_MODULE_CALL_DURATION,
+            PROM_FINDINGS_NEW,
+            PROM_FINDINGS_RESOLVED,
+            PROM_FINDINGS_UNCHANGED,
+            PROM_MODULE_STARTUP,
+            PROM_STARTUP_TOTAL,
+        ];
+        for name in &must_be_emitted {
+            assert!(
+                emitted_dp_names.contains(&name.to_string()),
+                "collector should emit data point {name}, but emitted: {emitted_dp_names:?}"
+            );
+        }
+
+        for metric in &query_metrics {
+            if metric.starts_with("chaffra_module_health_") {
+                continue;
+            }
+            assert!(
+                all_known.contains(metric),
+                "dashboard queries metric {metric} which is not in the collector's emitted data points or registered definitions"
+            );
+        }
     }
 }

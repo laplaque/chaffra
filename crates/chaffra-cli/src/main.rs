@@ -224,7 +224,10 @@ enum Command {
         #[command(subcommand)]
         action: TelemetryAction,
     },
-    /// Start the management HTTP server with embedded web dashboard.
+    /// Start a standalone management HTTP server for telemetry inspection.
+    ///
+    /// Serves an empty collector with core metric definitions registered.
+    /// In watch/MCP/LSP modes, the management server shares the live collector.
     Management {
         /// Port to bind the management server to.
         #[arg(long, default_value = "9100")]

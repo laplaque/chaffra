@@ -167,6 +167,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_findings_churn_returns_real_values() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let churn = chaffra_telemetry::churn::ChurnResult {
+            new_count: 3,
+            resolved_count: 1,
+            unchanged_count: 8,
+            churn_rate: 0.27,
+        };
+        collector.record_finding_churn(&churn);
+
+        let state = Arc::new(SharedState { collector });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/findings/churn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["new_count"], 3);
+        assert_eq!(parsed["resolved_count"], 1);
+        assert_eq!(parsed["unchanged_count"], 8);
+        assert!((parsed["churn_rate"].as_f64().unwrap() - 0.27).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
     async fn test_health_endpoint() {
         let app = build_router(test_state());
         let resp = app
