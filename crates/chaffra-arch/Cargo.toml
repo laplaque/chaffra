@@ -10,3 +10,6 @@ description = "Architecture boundary validation with built-in presets (layered, 
 [dependencies]
 chaffra-core = { workspace = true }
 chaffra-parse = { workspace = true }
+glob = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

@@ -47,6 +47,10 @@ tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.26"
 tree-sitter-go = "0.25"
 tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+sha2 = "0.10"
 gix = { version = "0.72", default-features = false, features = ["max-performance-safe"] }
 tonic = "0.14"
 prost = "0.14"

@@ -49,6 +49,9 @@ pub enum Language {
     Dart,
     CSharp,
     Rust,
+    JavaScript,
+    TypeScript,
+    Java,
 }
 
 impl fmt::Display for Language {
@@ -60,6 +63,9 @@ impl fmt::Display for Language {
             Language::Dart => write!(f, "dart"),
             Language::CSharp => write!(f, "csharp"),
             Language::Rust => write!(f, "rust"),
+            Language::JavaScript => write!(f, "javascript"),
+            Language::TypeScript => write!(f, "typescript"),
+            Language::Java => write!(f, "java"),
         }
     }
 }
@@ -74,13 +80,23 @@ impl Language {
             "dart" => Some(Language::Dart),
             "cs" => Some(Language::CSharp),
             "rs" => Some(Language::Rust),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
+            "java" => Some(Language::Java),
             _ => None,
         }
     }
 
     /// Whether this language has full tree-sitter grammar support.
     pub fn has_tree_sitter_grammar(&self) -> bool {
-        matches!(self, Language::Go | Language::Python)
+        matches!(
+            self,
+            Language::Go
+                | Language::Python
+                | Language::JavaScript
+                | Language::TypeScript
+                | Language::Java
+        )
     }
 }
 
@@ -357,6 +373,9 @@ mod tests {
         assert_eq!(Language::Dart.to_string(), "dart");
         assert_eq!(Language::CSharp.to_string(), "csharp");
         assert_eq!(Language::Rust.to_string(), "rust");
+        assert_eq!(Language::JavaScript.to_string(), "javascript");
+        assert_eq!(Language::TypeScript.to_string(), "typescript");
+        assert_eq!(Language::Java.to_string(), "java");
     }
 
     #[test]
@@ -368,7 +387,12 @@ mod tests {
             ("dart", Some(Language::Dart)),
             ("cs", Some(Language::CSharp)),
             ("rs", Some(Language::Rust)),
-            ("js", None),
+            ("js", Some(Language::JavaScript)),
+            ("jsx", Some(Language::JavaScript)),
+            ("ts", Some(Language::TypeScript)),
+            ("tsx", Some(Language::TypeScript)),
+            ("java", Some(Language::Java)),
+            ("txt", None),
         ];
         for (ext, expected) in cases {
             assert_eq!(Language::from_extension(ext), expected, "ext: {ext}");
@@ -379,6 +403,9 @@ mod tests {
     fn test_language_has_tree_sitter_grammar() {
         assert!(Language::Go.has_tree_sitter_grammar());
         assert!(Language::Python.has_tree_sitter_grammar());
+        assert!(Language::JavaScript.has_tree_sitter_grammar());
+        assert!(Language::TypeScript.has_tree_sitter_grammar());
+        assert!(Language::Java.has_tree_sitter_grammar());
         assert!(!Language::Php.has_tree_sitter_grammar());
         assert!(!Language::Dart.has_tree_sitter_grammar());
         assert!(!Language::CSharp.has_tree_sitter_grammar());

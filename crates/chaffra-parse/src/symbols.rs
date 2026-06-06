@@ -70,6 +70,8 @@ pub fn extract_symbols(tree: &Tree, source: &[u8], language: Language, file: &st
     match language {
         Language::Go => extract_go_symbols(root, source, file),
         Language::Python => extract_python_symbols(root, source, file),
+        Language::JavaScript | Language::TypeScript => extract_js_symbols(root, source, file),
+        Language::Java => extract_java_symbols(root, source, file),
         // Languages without tree-sitter support return empty symbol lists.
         Language::Php | Language::Dart | Language::CSharp | Language::Rust => Vec::new(),
     }
@@ -81,6 +83,8 @@ pub fn extract_imports(tree: &Tree, source: &[u8], language: Language) -> Vec<Im
     match language {
         Language::Go => extract_go_imports(root, source),
         Language::Python => extract_python_imports(root, source),
+        Language::JavaScript | Language::TypeScript => extract_js_imports(root, source),
+        Language::Java => extract_java_imports(root, source),
         Language::Php | Language::Dart | Language::CSharp | Language::Rust => Vec::new(),
     }
 }
@@ -448,11 +452,278 @@ fn is_definition_name(node: Node<'_>, language: Language) -> bool {
                     }
                 }
             }
+            Language::JavaScript | Language::TypeScript => {
+                if matches!(
+                    parent_kind,
+                    "function_declaration" | "class_declaration" | "method_definition"
+                ) {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        return name_node.id() == node.id();
+                    }
+                }
+            }
+            Language::Java => {
+                if matches!(
+                    parent_kind,
+                    "method_declaration" | "class_declaration" | "interface_declaration"
+                ) {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        return name_node.id() == node.id();
+                    }
+                }
+            }
             // No tree-sitter AST for these languages, so no definition names to check.
             Language::Php | Language::Dart | Language::CSharp | Language::Rust => {}
         }
     }
     false
+}
+
+// --- JavaScript/TypeScript symbol extraction ---
+
+fn extract_js_symbols(root: Node<'_>, source: &[u8], file: &str) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    walk_js_symbols(root, source, file, &mut symbols);
+    symbols
+}
+
+fn walk_js_symbols(node: Node<'_>, source: &[u8], file: &str, symbols: &mut Vec<Symbol>) {
+    match node.kind() {
+        "function_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(name_node, source);
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Function,
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    exported: false,
+                    file: file.to_owned(),
+                });
+            }
+        }
+        "class_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(name_node, source);
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Type,
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    exported: false,
+                    file: file.to_owned(),
+                });
+            }
+        }
+        "export_statement" => {
+            // Check for exported declarations.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "function_declaration" => {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let name = node_text(name_node, source);
+                            symbols.push(Symbol {
+                                name,
+                                kind: SymbolKind::Function,
+                                start_line: child.start_position().row as u32 + 1,
+                                end_line: child.end_position().row as u32 + 1,
+                                exported: true,
+                                file: file.to_owned(),
+                            });
+                        }
+                    }
+                    "class_declaration" => {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let name = node_text(name_node, source);
+                            symbols.push(Symbol {
+                                name,
+                                kind: SymbolKind::Type,
+                                start_line: child.start_position().row as u32 + 1,
+                                end_line: child.end_position().row as u32 + 1,
+                                exported: true,
+                                file: file.to_owned(),
+                            });
+                        }
+                    }
+                    "lexical_declaration" => {
+                        // export const foo = ...
+                        let mut inner = child.walk();
+                        for decl in child.children(&mut inner) {
+                            if decl.kind() == "variable_declarator" {
+                                if let Some(name_node) = decl.child_by_field_name("name") {
+                                    let name = node_text(name_node, source);
+                                    symbols.push(Symbol {
+                                        name,
+                                        kind: SymbolKind::Variable,
+                                        start_line: decl.start_position().row as u32 + 1,
+                                        end_line: decl.end_position().row as u32 + 1,
+                                        exported: true,
+                                        file: file.to_owned(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            walk_js_symbols(child, source, file, symbols);
+        }
+    }
+}
+
+fn extract_js_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        if child.kind() == "import_statement" {
+            let mut path = String::new();
+            let mut names = Vec::new();
+
+            let mut inner = child.walk();
+            for node in child.children(&mut inner) {
+                if node.kind() == "string" || node.kind() == "string_fragment" {
+                    path = node_text(node, source)
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_owned();
+                } else if node.kind() == "import_clause" {
+                    let mut clause_cursor = node.walk();
+                    for clause_child in node.children(&mut clause_cursor) {
+                        if clause_child.kind() == "identifier" {
+                            names.push(node_text(clause_child, source));
+                        } else if clause_child.kind() == "named_imports" {
+                            let mut named_cursor = clause_child.walk();
+                            for named in clause_child.children(&mut named_cursor) {
+                                if named.kind() == "import_specifier" {
+                                    // Check for alias.
+                                    if let Some(alias_node) = named.child_by_field_name("alias") {
+                                        names.push(node_text(alias_node, source));
+                                    } else if let Some(name_node) =
+                                        named.child_by_field_name("name")
+                                    {
+                                        names.push(node_text(name_node, source));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !path.is_empty() {
+                imports.push(ImportInfo {
+                    path,
+                    alias: None,
+                    names,
+                    line: child.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
+    imports
+}
+
+// --- Java symbol extraction ---
+
+fn extract_java_symbols(root: Node<'_>, source: &[u8], file: &str) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    walk_java_symbols(root, source, file, &mut symbols);
+    symbols
+}
+
+fn walk_java_symbols(node: Node<'_>, source: &[u8], file: &str, symbols: &mut Vec<Symbol>) {
+    match node.kind() {
+        "class_declaration" | "interface_declaration" | "enum_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(name_node, source);
+                // In Java, public/protected = exported.
+                let exported = has_java_modifier(node, source, "public")
+                    || has_java_modifier(node, source, "protected");
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Type,
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    exported,
+                    file: file.to_owned(),
+                });
+            }
+        }
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(name_node, source);
+                let exported = has_java_modifier(node, source, "public")
+                    || has_java_modifier(node, source, "protected");
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Function,
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    exported,
+                    file: file.to_owned(),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_java_symbols(child, source, file, symbols);
+    }
+}
+
+fn has_java_modifier(node: Node<'_>, source: &[u8], modifier: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let mut mod_cursor = child.walk();
+            for m in child.children(&mut mod_cursor) {
+                if node_text(m, source) == modifier {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn extract_java_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        if child.kind() == "import_declaration" {
+            let text = node_text(child, source);
+            // Parse "import com.example.Foo;" or "import static com.example.Foo.bar;"
+            let path = text
+                .trim_start_matches("import")
+                .trim_start_matches("static")
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_owned();
+            if !path.is_empty() {
+                imports.push(ImportInfo {
+                    path,
+                    alias: None,
+                    names: Vec::new(),
+                    line: child.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
+    imports
 }
 
 fn node_text(node: Node<'_>, source: &[u8]) -> String {

@@ -10,3 +10,6 @@ description = "Clone detection using suffix-tree algorithms with four sensitivit
 [dependencies]
 chaffra-core = { workspace = true }
 chaffra-parse = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
