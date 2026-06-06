@@ -220,7 +220,7 @@ impl TelemetryCollector {
 
         for (severity, count) in severity_counts {
             inner.data_points.push(MetricDataPoint {
-                name: "chaffra.analysis.findings_total".to_owned(),
+                name: "chaffra.analysis.findings_by_severity".to_owned(),
                 value: *count as f64,
                 labels: {
                     let mut m = HashMap::new();
@@ -445,7 +445,13 @@ impl TelemetryCollector {
             MetricDefinition {
                 name: "chaffra.analysis.findings_total".to_owned(),
                 kind: MetricKind::Counter,
-                description: "Total findings by severity and module".to_owned(),
+                description: "Total findings per module".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.analysis.findings_by_severity".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Findings per module and severity".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {

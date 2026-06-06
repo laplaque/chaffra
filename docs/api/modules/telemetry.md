@@ -150,8 +150,6 @@ Panels: health score trend, finding count by module, finding churn, module call 
 
 Row grouping: Overview (health + findings), Per-module detail, Operational (timing + errors).
 
-Template variables: `tenant_id`, `environment`, `project`.
-
 ## Telemetry Audit Log (helper API)
 
 Library helper for GDPR-style accountability logging. Provides event types, append/read functions, and display/export formatters for telemetry configuration change records.

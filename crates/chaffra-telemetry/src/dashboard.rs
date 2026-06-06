@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 pub const PROM_ANALYSIS_DURATION: &str = "chaffra_analysis_duration_ms";
 pub const PROM_ANALYSIS_FILES: &str = "chaffra_analysis_files_total";
 pub const PROM_FINDINGS_TOTAL: &str = "chaffra_analysis_findings_total";
+pub const PROM_FINDINGS_BY_SEVERITY: &str = "chaffra_analysis_findings_by_severity";
 pub const PROM_MODULE_CALL_DURATION: &str = "chaffra_module_call_duration_ms";
 pub const PROM_MODULE_ERROR_TOTAL: &str = "chaffra_module_error_total";
 pub const PROM_FINDINGS_NEW: &str = "chaffra_findings_new";
@@ -186,7 +187,7 @@ fn module_finding_breakdown_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             ],
         },
         "targets": [{
-            "expr": format!("sum by (severity) ({PROM_FINDINGS_TOTAL})"),
+            "expr": format!("sum by (severity) ({PROM_FINDINGS_BY_SEVERITY})"),
             "legendFormat": "{{severity}}",
             "refId": "A",
         }],
@@ -393,6 +394,7 @@ mod tests {
 
         let must_be_emitted = [
             PROM_FINDINGS_TOTAL,
+            PROM_FINDINGS_BY_SEVERITY,
             PROM_MODULE_CALL_DURATION,
             PROM_MODULE_ERROR_TOTAL,
             PROM_FINDINGS_NEW,
@@ -433,14 +435,24 @@ mod tests {
         let severity_dps: Vec<_> = snapshot
             .data_points
             .iter()
-            .filter(|dp| {
-                dp.name == "chaffra.analysis.findings_total" && dp.labels.contains_key("severity")
-            })
+            .filter(|dp| dp.name == "chaffra.analysis.findings_by_severity")
             .collect();
 
         assert!(
             severity_dps.len() >= 2,
-            "collector should emit per-severity data points"
+            "collector should emit per-severity data points with distinct metric name"
+        );
+
+        let aggregate_dps: Vec<_> = snapshot
+            .data_points
+            .iter()
+            .filter(|dp| dp.name == "chaffra.analysis.findings_total")
+            .collect();
+        assert!(
+            aggregate_dps
+                .iter()
+                .all(|dp| !dp.labels.contains_key("severity")),
+            "aggregate findings_total should not have severity labels"
         );
 
         let severities: std::collections::HashSet<&str> = severity_dps

@@ -111,14 +111,62 @@ function closeDetail(){
   el('detail-overlay').style.display='none';
   el('detail-panel').style.display='none';
 }
+function renderTable(headers,rows){
+  let h='<table><thead><tr>'+headers.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>';
+  for(const r of rows)h+='<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>';
+  return h+'</tbody></table>';
+}
 async function showDetail(endpoint,title){
-  el('detail-title').textContent=title+' — '+endpoint;
+  el('detail-title').textContent=title;
+  let html='';
   try{
-    const data=await fetchJSON(endpoint);
-    el('detail-body').innerHTML='<pre>'+JSON.stringify(data,null,2).replace(/</g,'&lt;')+'</pre>';
+    const metrics=await fetchJSON('/metrics');
+    if(endpoint==='/health'){
+      const health=await fetchJSON('/health');
+      html+='<h4 style="margin:12px 0 8px;color:#8b949e">Aggregate</h4>';
+      html+=renderTable(['Metric','Value'],[['Score',health.score!=null?health.score:'—'],['Grade',health.grade]]);
+      const hps=metrics.data_points.filter(p=>p.name.includes('.health_score'));
+      if(hps.length){
+        html+='<h4 style="margin:16px 0 8px;color:#8b949e">Per-module Health Scores</h4>';
+        html+=renderTable(['Module','Score'],hps.map(p=>[p.labels.module||'—',p.value.toFixed(1)]));
+      }
+    }else if(endpoint==='/modules'){
+      const mods=await fetchJSON('/modules');
+      html+='<h4 style="margin:12px 0 8px;color:#8b949e">Module Details</h4>';
+      html+=renderTable(['Module','Status','Findings','Duration','Capabilities'],
+        (mods.modules||[]).map(m=>[m.id,m.status,m.finding_count,m.duration_ms+'ms',m.capabilities.join(', ')]));
+      const mdps=metrics.data_points.filter(p=>p.labels&&p.labels.module);
+      if(mdps.length){
+        html+='<h4 style="margin:16px 0 8px;color:#8b949e">Module Data Points</h4>';
+        html+=renderTable(['Metric','Module','Value'],mdps.map(p=>[p.name,p.labels.module,p.value]));
+      }
+    }else if(endpoint==='/findings/summary'){
+      const fs=await fetchJSON('/findings/summary');
+      html+='<h4 style="margin:12px 0 8px;color:#8b949e">By Module</h4>';
+      html+=renderTable(['Module','Count'],Object.entries(fs.by_module).map(([k,v])=>[k,v]));
+      html+='<h4 style="margin:16px 0 8px;color:#8b949e">By Severity</h4>';
+      html+=renderTable(['Severity','Count'],Object.entries(fs.by_severity).map(([k,v])=>[k,v]));
+    }else if(endpoint==='/findings/churn'){
+      const ch=await fetchJSON('/findings/churn');
+      html+=renderTable(['Metric','Value'],[['New',ch.new_count],['Resolved',ch.resolved_count],['Unchanged',ch.unchanged_count],['Churn Rate',(ch.churn_rate*100).toFixed(1)+'%']]);
+    }else if(endpoint==='/metrics'){
+      html+='<h4 style="margin:12px 0 8px;color:#8b949e">Backends</h4>';
+      html+=renderTable(['Name','Kind','Connected','Message'],
+        (metrics.backends||[]).map(b=>[b.name,b.kind,b.connected?'Yes':'No',b.message]));
+      html+='<h4 style="margin:16px 0 8px;color:#8b949e">All Data Points ('+metrics.data_points.length+')</h4>';
+      html+=renderTable(['Name','Value','Labels'],
+        metrics.data_points.map(p=>[p.name,p.value,Object.entries(p.labels).map(([k,v])=>k+'='+v).join(', ')||'—']));
+    }else if(endpoint==='/config'){
+      const cfg=await fetchJSON('/config');
+      html+=renderTable(['Setting','Value'],[['Audience',cfg.audience],['Sampling Rate',cfg.sampling_rate],['Strategy',cfg.sampling_strategy],['Backends',cfg.backends.join(', ')||'—']]);
+    }else{
+      const data=await fetchJSON(endpoint);
+      html='<pre>'+JSON.stringify(data,null,2).replace(/</g,'&lt;')+'</pre>';
+    }
   }catch(e){
-    el('detail-body').innerHTML='<pre>Error: '+e.message+'</pre>';
+    html='<pre>Error: '+e.message+'</pre>';
   }
+  el('detail-body').innerHTML=html;
   el('detail-overlay').style.display='block';
   el('detail-panel').style.display='flex';
 }
