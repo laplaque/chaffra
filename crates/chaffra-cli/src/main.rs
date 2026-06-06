@@ -5,6 +5,7 @@ mod watch;
 
 use anyhow::{Context, Result};
 use chaffra_ai_quality::AiQualityModule;
+use chaffra_arch::ArchModule;
 use chaffra_audit::AuditModule;
 use chaffra_autofix::AutofixModule;
 use chaffra_autofix::hooks;
@@ -14,6 +15,7 @@ use chaffra_core::config::{CONFIG_FILE_NAME, CONFIG_TEMPLATE, ChaffraConfig};
 use chaffra_core::diagnostic::FileInfo;
 use chaffra_core::grpc::GrpcModuleHost;
 use chaffra_deadcode::DeadCodeModule;
+use chaffra_duplication::DuplicationModule;
 use chaffra_frameworks::FrameworksModule;
 use chaffra_hotspot::HotspotModule;
 use chaffra_llm_defense::LlmDefenseModule;
@@ -35,7 +37,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Output format: json, markdown, terminal, pr-comment, annotations, codeclimate, badge.
+    /// Output format: json, markdown, terminal, pr-comment, annotations, codeclimate, badge, sarif.
     #[arg(long, global = true, default_value = "terminal")]
     format: String,
 
@@ -64,6 +66,24 @@ enum Command {
         /// Path to the repository root (defaults to current directory).
         #[arg(default_value = ".")]
         path: String,
+
+        /// Detection mode: strict, mild, weak, or semantic.
+        #[arg(long, default_value = "strict")]
+        mode: String,
+
+        /// Minimum token count for a clone (default: 50).
+        #[arg(long, default_value = "50")]
+        min_tokens: String,
+    },
+    /// Validate architecture boundaries and detect circular dependencies.
+    Boundaries {
+        /// Path to the repository root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Architecture preset: layered, hexagonal, feature-sliced, clean.
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Run a PR audit: compare against baseline and emit a pass/fail verdict.
     Audit {
@@ -218,6 +238,8 @@ pub(crate) fn build_module_host() -> GrpcModuleHost {
     let _ = host.register(Box::new(AiQualityModule::new()));
     let _ = host.register(Box::new(LlmDefenseModule::new()));
     let _ = host.register(Box::new(CicdSecurityModule::new()));
+    let _ = host.register(Box::new(DuplicationModule::new()));
+    let _ = host.register(Box::new(ArchModule::new()));
     host
 }
 
@@ -272,6 +294,51 @@ fn cmd_dead_code(
     }
     let host = build_module_host();
     let result = host.analyze("dead-code", &files, config)?;
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_dupes(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+    mode: &str,
+    min_tokens: &str,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let mut module_config = config.module_config("duplication");
+    module_config.insert("mode".to_owned(), mode.to_owned());
+    module_config.insert("min-tokens".to_owned(), min_tokens.to_owned());
+
+    let result = host.analyze_with_config("duplication", &files, &module_config)?;
+    if result.findings.is_empty() {
+        return Ok("No duplicates found.\n".to_owned());
+    }
+    Ok(formatter.format_findings(&result.findings))
+}
+
+fn cmd_boundaries(
+    root: &Path,
+    config: &ChaffraConfig,
+    formatter: &dyn chaffra_output::Formatter,
+    preset: Option<&str>,
+) -> Result<String> {
+    let files = discover_and_read_files(root, config);
+    if files.is_empty() {
+        return Ok("No source files found.\n".to_owned());
+    }
+    let host = build_module_host();
+    let mut module_config = config.module_config("architecture");
+    if let Some(p) = preset {
+        module_config.insert("preset".to_owned(), p.to_owned());
+    }
+    let result = host.analyze_with_config("architecture", &files, &module_config)?;
+    if result.findings.is_empty() {
+        return Ok("No architecture violations found.\n".to_owned());
+    }
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -723,10 +790,6 @@ fn run_tui(findings: Vec<chaffra_core::diagnostic::Finding>, root: &Path) -> Res
     Ok(())
 }
 
-fn cmd_stub(_name: &str) -> String {
-    "not yet implemented\n".to_owned()
-}
-
 fn cmd_explain(id: &str) -> Result<String> {
     let host = build_module_host();
     let explanation = host.explain(id)?;
@@ -977,8 +1040,26 @@ async fn main() -> Result<()> {
             print!("{}", cmd_cicd_security(&root, &config, formatter.as_ref())?);
         }
 
-        Command::Dupes { .. } => {
-            print!("{}", cmd_stub("dupes"));
+        Command::Dupes {
+            path,
+            mode,
+            min_tokens,
+        } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!(
+                "{}",
+                cmd_dupes(&root, &config, formatter.as_ref(), &mode, &min_tokens)?
+            );
+        }
+
+        Command::Boundaries { path, preset } => {
+            let root = Path::new(&path).canonicalize().context("invalid path")?;
+            let config = load_config(cli.config.as_deref(), &root)?;
+            print!(
+                "{}",
+                cmd_boundaries(&root, &config, formatter.as_ref(), preset.as_deref())?
+            );
         }
 
         Command::Watch { path } => {
@@ -1116,7 +1197,7 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 10);
+        assert_eq!(modules.len(), 12);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
@@ -1128,6 +1209,8 @@ mod tests {
         assert!(ids.contains(&"ai-quality"));
         assert!(ids.contains(&"llm-defense"));
         assert!(ids.contains(&"cicd-security"));
+        assert!(ids.contains(&"duplication"));
+        assert!(ids.contains(&"architecture"));
     }
 
     #[test]
@@ -1276,8 +1359,22 @@ mod tests {
     // --- stub commands ---
 
     #[test]
-    fn test_cmd_stub_dupes() {
-        assert_eq!(cmd_stub("dupes"), "not yet implemented\n");
+    fn test_cmd_dupes_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = cmd_dupes(dir.path(), &config, formatter.as_ref(), "strict", "50").unwrap();
+        assert_eq!(output, "No source files found.\n");
+    }
+
+    #[test]
+    fn test_cmd_boundaries_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = ChaffraConfig::default();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output =
+            cmd_boundaries(dir.path(), &config, formatter.as_ref(), Some("layered")).unwrap();
+        assert_eq!(output, "No source files found.\n");
     }
 
     #[test]
@@ -1316,10 +1413,7 @@ mod tests {
         assert_eq!(output, "No source files found.\n");
     }
 
-    #[test]
-    fn test_cmd_stub_watch() {
-        assert_eq!(cmd_stub("watch"), "not yet implemented\n");
-    }
+    // Note: watch command is fully implemented; no stub test needed.
 
     // --- cmd_fix tests ---
 
@@ -1500,6 +1594,14 @@ mod tests {
         assert!(
             output.contains("cicd-security"),
             "should list cicd-security module"
+        );
+        assert!(
+            output.contains("duplication"),
+            "should list duplication module"
+        );
+        assert!(
+            output.contains("architecture"),
+            "should list architecture module"
         );
         assert!(output.contains("Languages:"));
         assert!(output.contains("Capabilities:"));

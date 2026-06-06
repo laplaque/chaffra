@@ -357,6 +357,39 @@ impl GrpcModuleHost {
         Ok(result)
     }
 
+    /// Run analysis with a pre-built module config map, bypassing `ChaffraConfig` lookup.
+    ///
+    /// Use this when the caller has already merged CLI overrides into the config.
+    pub fn analyze_with_config(
+        &self,
+        module_id: &str,
+        files: &[FileInfo],
+        module_config: &HashMap<String, String>,
+    ) -> Result<AnalysisResult> {
+        let handle = self
+            .modules
+            .get(module_id)
+            .ok_or_else(|| ChaffraError::ModuleNotFound(module_id.to_owned()))?;
+
+        let mut telemetry = ModuleTelemetry::new(module_id);
+        telemetry.start();
+
+        let mut result = self
+            .runtime
+            .block_on(handle.analyze(files, module_config))?;
+
+        telemetry.stop();
+        telemetry.increment("files_analyzed", result.metrics.files_analyzed);
+        telemetry.increment("findings", result.findings.len() as u64);
+
+        result.metrics.duration_ms = telemetry.duration_ms();
+        for (k, v) in telemetry.counters() {
+            result.metrics.counters.insert(k.clone(), *v);
+        }
+
+        Ok(result)
+    }
+
     /// Explain a rule, routing to the correct module based on rule ID prefix.
     ///
     /// Rule IDs are formatted as "module-id:rule-name".
@@ -876,6 +909,81 @@ mod tests {
 
         let explanation = host.explain("test:test-rule").unwrap();
         assert_eq!(explanation.rule_id, "test-rule");
+    }
+
+    struct ConfigEchoModule;
+
+    impl AnalysisModule for ConfigEchoModule {
+        fn describe(&self) -> ModuleInfo {
+            ModuleInfo {
+                id: "config-echo".to_owned(),
+                name: "Config Echo".to_owned(),
+                version: "0.1.0".to_owned(),
+                languages: vec![],
+                capabilities: vec!["analyze".to_owned()],
+                rules: vec![],
+            }
+        }
+
+        fn analyze(
+            &self,
+            files: &[FileInfo],
+            config: &HashMap<String, String>,
+        ) -> Result<AnalysisResult> {
+            let mut metadata = HashMap::new();
+            for (k, v) in config {
+                metadata.insert(k.clone(), v.clone());
+            }
+            Ok(AnalysisResult {
+                findings: vec![Finding {
+                    rule_id: "echo".to_owned(),
+                    message: "config echo".to_owned(),
+                    severity: Severity::Info,
+                    location: Location {
+                        file: "echo".to_owned(),
+                        start_line: 1,
+                        end_line: 1,
+                        start_column: 0,
+                        end_column: 0,
+                    },
+                    confidence: 1.0,
+                    actions: vec![],
+                    metadata,
+                }],
+                metrics: empty_metrics(files.len() as u64),
+            })
+        }
+
+        fn explain(&self, rule_id: &str) -> Result<RuleExplanation> {
+            Err(ChaffraError::RuleNotFound(rule_id.to_owned()))
+        }
+
+        fn fix(&self, _findings: &[Finding], _dry_run: bool) -> Result<Vec<FixResult>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_analyze_with_config_passes_overrides() {
+        let mut host = GrpcModuleHost::new();
+        host.register(Box::new(ConfigEchoModule)).unwrap();
+
+        let files = vec![FileInfo {
+            path: "test.go".to_owned(),
+            content: b"package main".to_vec(),
+        }];
+
+        let mut module_config = HashMap::new();
+        module_config.insert("mode".to_owned(), "weak".to_owned());
+        module_config.insert("min-tokens".to_owned(), "20".to_owned());
+
+        let result = host
+            .analyze_with_config("config-echo", &files, &module_config)
+            .unwrap();
+        assert_eq!(result.findings.len(), 1);
+        let metadata = &result.findings[0].metadata;
+        assert_eq!(metadata.get("mode"), Some(&"weak".to_owned()));
+        assert_eq!(metadata.get("min-tokens"), Some(&"20".to_owned()));
     }
 
     /// Regression: finding_from_proto rejects a finding with missing location.

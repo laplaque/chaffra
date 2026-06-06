@@ -15,6 +15,9 @@ pub fn parse(source: &[u8], language: Language) -> Result<Tree> {
     let ts_language = match language {
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
         Language::Php | Language::Dart | Language::CSharp | Language::Rust => {
             return Err(ChaffraError::Parse(format!(
                 "no tree-sitter grammar available for {language}; use stub parsing"
