@@ -157,7 +157,7 @@ fn health_score_trend_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             "overrides": [],
         },
         "targets": [{
-            "expr": format!("chaffra_module_health_health_score{{tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}}"),
+            "expr": format!("avg({{__name__=~\"chaffra_module_.*_health_score\",tenant_id=~\"$tenant_id\",environment=~\"$environment\",project=~\"$project\"}})"),
             "legendFormat": "{{project}}",
             "refId": "A",
         }],
@@ -384,6 +384,7 @@ mod tests {
         );
         collector.record_module_startup("dead-code", 10);
         collector.record_startup_total(50);
+        collector.record_module_summary_metric("complexity", "health_score", 85.0);
 
         let churn = crate::churn::ChurnResult {
             new_count: 1,
@@ -416,10 +417,15 @@ mod tests {
         let panels = dashboard["panels"].as_array().unwrap();
 
         let mut query_metrics = Vec::new();
+        let mut has_health_regex_query = false;
         for panel in panels {
             if let Some(targets) = panel["targets"].as_array() {
                 for target in targets {
                     if let Some(expr) = target["expr"].as_str() {
+                        if expr.contains("__name__=~") && expr.contains("health_score") {
+                            has_health_regex_query = true;
+                            continue;
+                        }
                         let metric = expr.split('{').next().unwrap_or(expr);
                         let metric = metric
                             .trim_start_matches("sum by (severity) (")
@@ -429,6 +435,19 @@ mod tests {
                 }
             }
         }
+
+        assert!(
+            has_health_regex_query,
+            "dashboard should contain a regex query for per-module health_score metrics"
+        );
+
+        let health_dp = emitted_dp_names
+            .iter()
+            .any(|n| n.starts_with("chaffra_module_") && n.ends_with("_health_score"));
+        assert!(
+            health_dp,
+            "collector should emit at least one chaffra_module_*_health_score data point"
+        );
 
         let must_be_emitted = [
             PROM_FINDINGS_TOTAL,
@@ -447,9 +466,6 @@ mod tests {
         }
 
         for metric in &query_metrics {
-            if metric.starts_with("chaffra_module_health_") {
-                continue;
-            }
             assert!(
                 all_known.contains(metric),
                 "dashboard queries metric {metric} which is not in the collector's emitted data points or registered definitions"

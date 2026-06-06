@@ -123,9 +123,9 @@ sampling-rate = 1.0          # 0.0–1.0
 sampling-strategy = "rate"   # rate | on-change
 ```
 
-## Parse Cache Metrics
+## Parse Cache Metrics (helper API)
 
-Track incremental parse cache effectiveness in watch mode and LSP.
+Library helper for tracking incremental parse cache effectiveness. Provides atomic counters and a `flush_to_collector()` method for integration into cache-aware code paths.
 
 | Metric | Kind | Description |
 |--------|------|-------------|
@@ -135,7 +135,7 @@ Track incremental parse cache effectiveness in watch mode and LSP.
 | `chaffra.parse.cache_size_bytes` | gauge | Current cache memory usage |
 | `chaffra.parse.cache_evictions` | counter | Cache entries evicted |
 
-These metrics activate when the parse cache is available (watch mode / LSP).
+Integration into the watch mode and LSP parse cache producers is planned for a future phase. Until then, these metrics are available as a library API for downstream consumers to call directly.
 
 ## Grafana Dashboard Generator
 
@@ -153,13 +153,15 @@ Row grouping: Overview (health + findings), Per-module detail, Operational (timi
 
 Template variables: `tenant_id`, `environment`, `project`.
 
-## Telemetry Audit Log
+## Telemetry Audit Log (helper API)
 
-Append-only local log for GDPR accountability. Records telemetry configuration changes.
+Library helper for GDPR-style accountability logging. Provides event types, append/read functions, and display/export formatters for telemetry configuration change records.
 
 Location: `.chaffra-telemetry-audit.log` (JSON lines format).
 
-Events: telemetry enabled/disabled, backend added/removed/modified, tenant-id changed, path-mode changed, sampling rate changed.
+Event types: telemetry enabled/disabled, backend added/removed/modified, tenant-id changed, path-mode changed, sampling rate changed.
+
+Integration into the actual configuration mutation paths (CLI config changes, MCP config updates) is planned for a future phase. Until then, the writer functions (`log_telemetry_enabled`, `log_backend_added`, etc.) are available as a library API. The CLI reader is available now:
 
 ```
 chaffra telemetry audit-log            # Display the audit log

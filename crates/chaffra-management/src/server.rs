@@ -209,6 +209,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_health_endpoint_with_module_score() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.record_module_summary_metric("complexity", "health_score", 85.0);
+
+        let state = Arc::new(SharedState { collector });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["score"], 85.0);
+        assert_eq!(parsed["grade"], "B");
+    }
+
+    #[tokio::test]
     async fn test_config_endpoint() {
         let app = build_router(test_state());
         let resp = app

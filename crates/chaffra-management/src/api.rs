@@ -223,11 +223,17 @@ pub async fn get_findings_churn(
 
 pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<HealthResponse> {
     let snapshot = state.collector.snapshot();
-    let score = snapshot
+    let health_scores: Vec<f64> = snapshot
         .data_points
         .iter()
-        .find(|p| p.name == "chaffra.module.health.health_score")
-        .map(|p| p.value);
+        .filter(|p| p.name.starts_with("chaffra.module.") && p.name.ends_with(".health_score"))
+        .map(|p| p.value)
+        .collect();
+    let score = if health_scores.is_empty() {
+        None
+    } else {
+        Some(health_scores.iter().sum::<f64>() / health_scores.len() as f64)
+    };
 
     let grade = match score {
         Some(s) if s >= 90.0 => "A",

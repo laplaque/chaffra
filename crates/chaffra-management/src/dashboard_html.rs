@@ -31,6 +31,13 @@ table th{color:#8b949e;font-size:13px;font-weight:600}
 .sparkline .bar{background:#58a6ff;min-width:3px;border-radius:1px 1px 0 0}
 .refresh-info{color:#8b949e;font-size:12px;text-align:right;margin-top:8px}
 #error-banner{display:none;background:#f8514922;border:1px solid #f85149;color:#f85149;padding:12px;border-radius:8px;margin-bottom:16px}
+.api-nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+.api-nav a{background:#21262d;color:#58a6ff;border:1px solid #30363d;border-radius:6px;padding:6px 12px;font-size:13px;text-decoration:none;font-family:monospace}
+.api-nav a:hover{background:#30363d;border-color:#58a6ff}
+.section h2 a{color:inherit;text-decoration:none}
+.section h2 a:hover{color:#58a6ff}
+.section h2 a .link-icon{font-size:14px;margin-left:6px;opacity:0;transition:opacity 0.15s}
+.section h2 a:hover .link-icon{opacity:1}
 </style>
 </head>
 <body>
@@ -40,31 +47,43 @@ table th{color:#8b949e;font-size:13px;font-weight:600}
 </div>
 <div class="container">
 <div id="error-banner"></div>
+<div class="section">
+<h2>API Endpoints</h2>
+<div class="api-nav">
+<a href="/api/v1/metrics">/metrics</a>
+<a href="/api/v1/metrics/history?window=7d">/metrics/history</a>
+<a href="/api/v1/modules">/modules</a>
+<a href="/api/v1/findings/summary">/findings/summary</a>
+<a href="/api/v1/findings/churn">/findings/churn</a>
+<a href="/api/v1/health">/health</a>
+<a href="/api/v1/config">/config</a>
+</div>
+</div>
 <div class="grid" id="summary-cards"></div>
 <div class="section">
-<h2>Modules</h2>
+<h2><a href="/api/v1/modules">Modules <span class="link-icon">&#8599;</span></a></h2>
 <table id="modules-table">
 <thead><tr><th>Module</th><th>Status</th><th>Findings</th><th>Duration</th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
 <div class="section">
-<h2>Telemetry Backends</h2>
+<h2><a href="/api/v1/metrics">Telemetry Backends <span class="link-icon">&#8599;</span></a></h2>
 <table id="backends-table">
 <thead><tr><th>Backend</th><th>Type</th><th>Status</th><th>Message</th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
 <div class="section">
-<h2>Finding Churn</h2>
+<h2><a href="/api/v1/findings/churn">Finding Churn <span class="link-icon">&#8599;</span></a></h2>
 <div class="grid" id="churn-cards"></div>
 </div>
-<div class="refresh-info">Auto-refreshes every 10s | <a href="/api/v1/metrics" style="color:#58a6ff">API</a></div>
+<div class="refresh-info">Auto-refreshes every 10s</div>
 </div>
 <script>
 const BASE='/api/v1';
 function el(id){return document.getElementById(id)}
-function card(title,value,cls){return `<div class="card"><h3>${title}</h3><div class="value ${cls||''}">${value}</div></div>`}
+function card(title,value,cls,href){return `<div class="card"${href?` onclick="location.href='${href}'" style="cursor:pointer"`:``}><h3>${title}</h3><div class="value ${cls||''}">${value}</div></div>`}
 async function fetchJSON(path){
   const r=await fetch(BASE+path);
   if(!r.ok)throw new Error(r.statusText);
@@ -81,10 +100,10 @@ async function refresh(){
     el('status-badge').style.background='#238636';
     let cards='';
     cards+=card('Health Score',health.score!=null?health.score:'—',
-      health.score>=80?'green':health.score>=60?'yellow':'red');
-    cards+=card('Total Findings',findings.total!=null?findings.total:'—');
-    cards+=card('Files Analyzed',metrics.files_total!=null?metrics.files_total:'—');
-    cards+=card('Analysis Duration',metrics.analysis_duration_ms!=null?metrics.analysis_duration_ms+'ms':'—');
+      health.score>=80?'green':health.score>=60?'yellow':'red','/api/v1/health');
+    cards+=card('Total Findings',findings.total!=null?findings.total:'—','','/api/v1/findings/summary');
+    cards+=card('Files Analyzed',metrics.files_total!=null?metrics.files_total:'—','','/api/v1/metrics');
+    cards+=card('Analysis Duration',metrics.analysis_duration_ms!=null?metrics.analysis_duration_ms+'ms':'—','','/api/v1/metrics');
     el('summary-cards').innerHTML=cards;
     let mrows='';
     if(modules.modules){for(const m of modules.modules){
