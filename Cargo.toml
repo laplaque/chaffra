@@ -25,6 +25,7 @@ members = [
     "crates/chaffra-tui",
     "crates/chaffra-types",
     "crates/chaffra-proto",
+    "crates/chaffra-telemetry",
     "crates/chaffra-cli",
 ]
 
@@ -87,3 +88,4 @@ chaffra-autofix = { path = "crates/chaffra-autofix" }
 chaffra-tui = { path = "crates/chaffra-tui" }
 chaffra-types = { path = "crates/chaffra-types" }
 chaffra-proto = { path = "crates/chaffra-proto" }
+chaffra-telemetry = { path = "crates/chaffra-telemetry" }

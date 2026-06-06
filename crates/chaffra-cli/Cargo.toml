@@ -34,6 +34,7 @@ chaffra-impact = { workspace = true }
 chaffra-migrate = { workspace = true }
 chaffra-autofix = { workspace = true }
 chaffra-tui = { workspace = true }
+chaffra-telemetry = { workspace = true }
 chaffra-types = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

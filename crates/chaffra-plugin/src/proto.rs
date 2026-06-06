@@ -288,6 +288,7 @@ impl From<AnalysisResponse> for AnalysisResult {
             files_analyzed: 0,
             duration_ms: 0,
             counters: HashMap::new(),
+            ..Default::default()
         });
         AnalysisResult {
             findings: p.findings.into_iter().map(Finding::from).collect(),
@@ -302,6 +303,7 @@ impl From<ModuleMetricsProto> for ModuleMetrics {
             files_analyzed: p.files_analyzed,
             duration_ms: p.duration_ms,
             counters: p.counters,
+            ..Default::default()
         }
     }
 }

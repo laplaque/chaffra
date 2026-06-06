@@ -86,10 +86,48 @@ message TextEdit {
   string new_text = 4;
 }
 
+// --- Telemetry types ---
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  METRIC_KIND_COUNTER = 1;
+  METRIC_KIND_GAUGE = 2;
+  METRIC_KIND_HISTOGRAM = 3;
+}
+
+message MetricDefinition {
+  string name = 1;
+  MetricKind kind = 2;
+  string description = 3;
+  string unit = 4;
+}
+
+message MetricDataPoint {
+  string name = 1;
+  double value = 2;
+  map<string, string> labels = 3;
+  uint64 timestamp_ms = 4;
+}
+
+message SpanData {
+  string name = 1;
+  string trace_id = 2;
+  string span_id = 3;
+  string parent_span_id = 4;
+  uint64 start_time_ms = 5;
+  uint64 end_time_ms = 6;
+  map<string, string> attributes = 7;
+  string status = 8;
+}
+
+// --- ModuleMetrics (extended with inline telemetry) ---
+
 message ModuleMetrics {
   uint64 files_analyzed = 1;
   uint64 duration_ms = 2;
   map<string, uint64> counters = 3;
+  repeated MetricDataPoint metrics = 4;
+  repeated SpanData spans = 5;
 }
 
 message ExplainRequest {
@@ -120,4 +158,39 @@ message FixResult {
   bool applied = 2;
   repeated TextEdit edits = 3;
   string reason = 4;
+}
+
+// --- TelemetryCollector gRPC service ---
+
+service TelemetryCollector {
+  rpc RegisterMetrics(RegisterMetricsRequest) returns (RegisterMetricsResponse);
+  rpc RecordMetrics(RecordMetricsRequest) returns (RecordMetricsResponse);
+  rpc RecordSpan(RecordSpanRequest) returns (RecordSpanResponse);
+}
+
+message RegisterMetricsRequest {
+  string module_id = 1;
+  repeated MetricDefinition definitions = 2;
+}
+
+message RegisterMetricsResponse {
+  bool success = 1;
+}
+
+message RecordMetricsRequest {
+  string module_id = 1;
+  repeated MetricDataPoint data_points = 2;
+}
+
+message RecordMetricsResponse {
+  uint64 accepted = 1;
+}
+
+message RecordSpanRequest {
+  string module_id = 1;
+  repeated SpanData spans = 2;
+}
+
+message RecordSpanResponse {
+  uint64 accepted = 1;
 }

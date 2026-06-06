@@ -1,0 +1,23 @@
+//! Telemetry collection, aggregation, and backend sinks for chaffra analysis.
+//!
+//! Implements the `TelemetryCollector` gRPC service. Receives metrics from all
+//! modules, aggregates them, and sinks to configurable backends (JSON file,
+//! stderr, Prometheus, OTLP, StatsD, CloudWatch).
+//!
+//! Two telemetry audiences:
+//! - **User-facing**: analysis duration, finding counts, health scores (included in output).
+//! - **Operator**: call latencies, error rates, memory pressure (sunk to backends).
+
+pub mod backends;
+pub mod collector;
+pub mod config;
+pub mod error;
+pub mod grpc_service;
+pub mod metrics;
+pub mod module;
+
+pub use collector::TelemetryCollector;
+pub use config::{BackendConfig, BackendKind, TelemetryAudience, TelemetryConfig};
+pub use error::TelemetryError;
+pub use metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
+pub use module::TelemetryModule;

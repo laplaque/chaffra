@@ -131,11 +131,61 @@ pub fn finding_from_proto(f: &proto::Finding) -> crate::error::Result<diagnostic
 
 // --- ModuleMetrics ---
 
+pub fn inline_metric_to_proto(m: &diagnostic::InlineMetric) -> proto::MetricDataPoint {
+    proto::MetricDataPoint {
+        name: m.name.clone(),
+        value: m.value,
+        labels: m.labels.clone(),
+        timestamp_ms: m.timestamp_ms,
+    }
+}
+
+pub fn inline_metric_from_proto(m: &proto::MetricDataPoint) -> diagnostic::InlineMetric {
+    diagnostic::InlineMetric {
+        name: m.name.clone(),
+        value: m.value,
+        labels: m.labels.clone(),
+        timestamp_ms: m.timestamp_ms,
+    }
+}
+
+pub fn inline_span_to_proto(s: &diagnostic::InlineSpan) -> proto::SpanData {
+    proto::SpanData {
+        name: s.name.clone(),
+        trace_id: s.trace_id.clone(),
+        span_id: s.span_id.clone(),
+        parent_span_id: s.parent_span_id.clone(),
+        start_time_ms: s.start_time_ms,
+        end_time_ms: s.end_time_ms,
+        attributes: s.attributes.clone(),
+        status: s.status.clone(),
+    }
+}
+
+pub fn inline_span_from_proto(s: &proto::SpanData) -> diagnostic::InlineSpan {
+    diagnostic::InlineSpan {
+        name: s.name.clone(),
+        trace_id: s.trace_id.clone(),
+        span_id: s.span_id.clone(),
+        parent_span_id: s.parent_span_id.clone(),
+        start_time_ms: s.start_time_ms,
+        end_time_ms: s.end_time_ms,
+        attributes: s.attributes.clone(),
+        status: s.status.clone(),
+    }
+}
+
 pub fn module_metrics_to_proto(m: &diagnostic::ModuleMetrics) -> proto::ModuleMetrics {
     proto::ModuleMetrics {
         files_analyzed: m.files_analyzed,
         duration_ms: m.duration_ms,
         counters: m.counters.clone(),
+        metrics: m
+            .inline_metrics
+            .iter()
+            .map(inline_metric_to_proto)
+            .collect(),
+        spans: m.inline_spans.iter().map(inline_span_to_proto).collect(),
     }
 }
 
@@ -144,6 +194,8 @@ pub fn module_metrics_from_proto(m: &proto::ModuleMetrics) -> diagnostic::Module
         files_analyzed: m.files_analyzed,
         duration_ms: m.duration_ms,
         counters: m.counters.clone(),
+        inline_metrics: m.metrics.iter().map(inline_metric_from_proto).collect(),
+        inline_spans: m.spans.iter().map(inline_span_from_proto).collect(),
     }
 }
 

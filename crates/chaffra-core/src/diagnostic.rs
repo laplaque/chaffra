@@ -197,12 +197,47 @@ pub struct ModuleInfo {
     pub rules: Vec<Rule>,
 }
 
+/// An inline metric data point returned by a module.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InlineMetric {
+    pub name: String,
+    pub value: f64,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub timestamp_ms: u64,
+}
+
+/// An inline span returned by a module.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InlineSpan {
+    pub name: String,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub span_id: String,
+    #[serde(default)]
+    pub parent_span_id: String,
+    #[serde(default)]
+    pub start_time_ms: u64,
+    #[serde(default)]
+    pub end_time_ms: u64,
+    #[serde(default)]
+    pub attributes: HashMap<String, String>,
+    #[serde(default)]
+    pub status: String,
+}
+
 /// Metrics from an analysis run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModuleMetrics {
     pub files_analyzed: u64,
     pub duration_ms: u64,
     pub counters: HashMap<String, u64>,
+    #[serde(default)]
+    pub inline_metrics: Vec<InlineMetric>,
+    #[serde(default)]
+    pub inline_spans: Vec<InlineSpan>,
 }
 
 /// Result of an analysis run.

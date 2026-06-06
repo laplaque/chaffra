@@ -12,6 +12,7 @@ chaffra-core = { workspace = true }
 chaffra-parse = { workspace = true }
 chaffra-deadcode = { workspace = true }
 chaffra-complexity = { workspace = true }
+chaffra-telemetry = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

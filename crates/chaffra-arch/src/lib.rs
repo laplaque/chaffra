@@ -347,6 +347,7 @@ impl AnalysisModule for ArchModule {
                 files_analyzed: files.len() as u64,
                 duration_ms: 0,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         })
     }

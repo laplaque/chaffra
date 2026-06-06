@@ -301,6 +301,7 @@ impl AnalysisModule for DuplicationModule {
                 files_analyzed: files.len() as u64,
                 duration_ms: 0,
                 counters,
+                ..Default::default()
             },
         })
     }

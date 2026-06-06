@@ -20,6 +20,21 @@ pub fn build_module_host() -> GrpcModuleHost {
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
+            name: "chaffra/telemetry".to_owned(),
+            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action to perform: 'status', 'snapshot', or 'backends'",
+                        "enum": ["status", "snapshot", "backends"]
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
             name: "chaffra/health".to_owned(),
             description: "Compute a composite health score for the codebase. Returns score (0-100), grade (A-F), and per-file breakdown.".to_owned(),
             input_schema: serde_json::json!({
@@ -151,12 +166,63 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
     }
 }
 
+/// Execute the chaffra/telemetry tool.
+///
+/// Returns default configuration and backend info. Does not share state with
+/// a running analysis — use CLI `chaffra telemetry inspect` for live previews.
+pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
+    let action = params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("status");
+
+    let config = chaffra_telemetry::TelemetryConfig::default();
+    let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
+    collector.register_core_metrics();
+
+    match action {
+        "status" => {
+            let (_, statuses) = chaffra_telemetry::backends::create_backends(&config.backends);
+            match serde_json::to_string_pretty(&statuses) {
+                Ok(json) => ToolCallResult::text(json),
+                Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+            }
+        }
+        "snapshot" => {
+            let snapshot = collector.snapshot();
+            match serde_json::to_string_pretty(&snapshot) {
+                Ok(json) => ToolCallResult::text(json),
+                Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+            }
+        }
+        "backends" => {
+            let backends_info: Vec<serde_json::Value> = config
+                .backends
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "kind": format!("{:?}", b.kind),
+                        "endpoint": b.endpoint,
+                        "path": b.path,
+                    })
+                })
+                .collect();
+            match serde_json::to_string_pretty(&backends_info) {
+                Ok(json) => ToolCallResult::text(json),
+                Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+            }
+        }
+        _ => ToolCallResult::error(format!("Unknown telemetry action: {action}")),
+    }
+}
+
 /// Dispatch a tool call by name.
 pub fn dispatch_tool(name: &str, params: &serde_json::Value) -> ToolCallResult {
     match name {
         "chaffra/health" => execute_health(params),
         "chaffra/dead-code" => execute_dead_code(params),
         "chaffra/explain" => execute_explain(params),
+        "chaffra/telemetry" => execute_telemetry(params),
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -168,7 +234,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -178,6 +244,7 @@ mod tests {
         assert!(names.contains(&"chaffra/health"));
         assert!(names.contains(&"chaffra/dead-code"));
         assert!(names.contains(&"chaffra/explain"));
+        assert!(names.contains(&"chaffra/telemetry"));
     }
 
     #[test]

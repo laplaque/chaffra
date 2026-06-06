@@ -145,8 +145,7 @@ impl std::fmt::Debug for ModuleHost {
 pub fn empty_metrics(files_analyzed: u64) -> ModuleMetrics {
     ModuleMetrics {
         files_analyzed,
-        duration_ms: 0,
-        counters: HashMap::new(),
+        ..Default::default()
     }
 }
 

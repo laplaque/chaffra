@@ -1036,6 +1036,8 @@ mod tests {
                 files_analyzed: 1,
                 duration_ms: 0,
                 counters: Default::default(),
+                metrics: vec![],
+                spans: vec![],
             }),
         };
         let err = convert::analysis_result_from_proto(&proto_response).unwrap_err();
@@ -1092,5 +1094,54 @@ mod tests {
         };
         let err = convert::rule_explanation_from_proto(&proto_explanation).unwrap_err();
         assert!(matches!(err, ChaffraError::ProtoConversion(_)));
+    }
+
+    #[test]
+    fn test_module_metrics_roundtrip_inline_telemetry() {
+        use crate::diagnostic::{InlineMetric, InlineSpan};
+
+        let metrics = crate::diagnostic::ModuleMetrics {
+            files_analyzed: 10,
+            duration_ms: 42,
+            counters: {
+                let mut m = HashMap::new();
+                m.insert("findings".to_owned(), 3);
+                m
+            },
+            inline_metrics: vec![InlineMetric {
+                name: "call_latency_ms".to_owned(),
+                value: 42.5,
+                labels: {
+                    let mut l = HashMap::new();
+                    l.insert("module".to_owned(), "dead-code".to_owned());
+                    l
+                },
+                timestamp_ms: 1000,
+            }],
+            inline_spans: vec![InlineSpan {
+                name: "analyze".to_owned(),
+                trace_id: "abc123".to_owned(),
+                span_id: "span1".to_owned(),
+                parent_span_id: String::new(),
+                start_time_ms: 100,
+                end_time_ms: 142,
+                attributes: HashMap::new(),
+                status: "ok".to_owned(),
+            }],
+        };
+
+        let proto = convert::module_metrics_to_proto(&metrics);
+        assert_eq!(proto.metrics.len(), 1);
+        assert_eq!(proto.metrics[0].name, "call_latency_ms");
+        assert_eq!(proto.spans.len(), 1);
+        assert_eq!(proto.spans[0].name, "analyze");
+
+        let roundtrip = convert::module_metrics_from_proto(&proto);
+        assert_eq!(roundtrip.inline_metrics.len(), 1);
+        assert_eq!(roundtrip.inline_metrics[0].name, "call_latency_ms");
+        assert!((roundtrip.inline_metrics[0].value - 42.5).abs() < 0.01);
+        assert_eq!(roundtrip.inline_spans.len(), 1);
+        assert_eq!(roundtrip.inline_spans[0].name, "analyze");
+        assert_eq!(roundtrip.inline_spans[0].trace_id, "abc123");
     }
 }

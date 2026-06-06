@@ -179,6 +179,7 @@ impl AnalysisModule for SecurityModule {
                 files_analyzed,
                 duration_ms: 0,
                 counters,
+                ..Default::default()
             },
         })
     }

@@ -21,6 +21,7 @@ use chaffra_hotspot::HotspotModule;
 use chaffra_llm_defense::LlmDefenseModule;
 use chaffra_output::{OutputFormat, create_formatter};
 use chaffra_security::SecurityModule;
+use chaffra_telemetry::TelemetryModule;
 use chaffra_tui::App;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -44,6 +45,18 @@ struct Cli {
     /// Path to configuration file.
     #[arg(long, global = true)]
     config: Option<String>,
+
+    /// Telemetry mode: on, off, user-only, operator-only.
+    #[arg(long, global = true, default_value = "on")]
+    telemetry: String,
+
+    /// Override telemetry backend (json-file, stderr, prometheus, otlp, statsd).
+    #[arg(long = "telemetry-backend", global = true)]
+    telemetry_backend: Option<String>,
+
+    /// Override OTLP endpoint.
+    #[arg(long = "telemetry-endpoint", global = true)]
+    telemetry_endpoint: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -206,6 +219,21 @@ enum Command {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Telemetry commands: status, test, inspect.
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TelemetryAction {
+    /// Show telemetry backends and connection status.
+    Status,
+    /// Emit a test metric and report success or failure.
+    Test,
+    /// Dry-run: show what telemetry payload would be emitted.
+    Inspect,
 }
 
 #[derive(Subcommand)]
@@ -238,6 +266,7 @@ pub(crate) fn build_module_host() -> GrpcModuleHost {
     let _ = host.register(Box::new(AiQualityModule::new()));
     let _ = host.register(Box::new(LlmDefenseModule::new()));
     let _ = host.register(Box::new(CicdSecurityModule::new()));
+    let _ = host.register(Box::new(TelemetryModule::new()));
     let _ = host.register(Box::new(DuplicationModule::new()));
     let _ = host.register(Box::new(ArchModule::new()));
     host
@@ -956,6 +985,116 @@ fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<Strin
     Ok(out)
 }
 
+fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
+    let audience = chaffra_telemetry::TelemetryAudience::from_str_loose(&cli.telemetry)
+        .unwrap_or(chaffra_telemetry::TelemetryAudience::On);
+
+    let backends = if let Some(ref backend_str) = cli.telemetry_backend {
+        if let Some(kind) = chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
+            vec![chaffra_telemetry::BackendConfig {
+                kind,
+                endpoint: cli.telemetry_endpoint.clone(),
+                path: None,
+                options: HashMap::new(),
+            }]
+        } else {
+            chaffra_telemetry::TelemetryConfig::default().backends
+        }
+    } else if let Some(ref endpoint) = cli.telemetry_endpoint {
+        vec![chaffra_telemetry::BackendConfig {
+            kind: chaffra_telemetry::BackendKind::Otlp,
+            endpoint: Some(endpoint.clone()),
+            path: None,
+            options: HashMap::new(),
+        }]
+    } else {
+        chaffra_telemetry::TelemetryConfig::default().backends
+    };
+
+    chaffra_telemetry::TelemetryConfig { audience, backends }
+}
+
+fn cmd_telemetry_status(tel_config: &chaffra_telemetry::TelemetryConfig) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Telemetry mode: {:?}\n\n", tel_config.audience));
+    out.push_str("Backends:\n");
+
+    let (_, statuses) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+    for status in &statuses {
+        let icon = if status.connected { "OK" } else { "FAIL" };
+        out.push_str(&format!(
+            "  [{icon}] {} ({}) -- {}\n",
+            status.name, status.kind, status.message
+        ));
+    }
+
+    if statuses.is_empty() {
+        out.push_str("  (no backends configured)\n");
+    }
+
+    out
+}
+
+fn cmd_telemetry_test(tel_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
+    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
+    collector.register_core_metrics();
+
+    // Emit a test data point.
+    collector.record_data_point(chaffra_telemetry::MetricDataPoint {
+        name: "chaffra.telemetry.test".to_owned(),
+        value: 1.0,
+        labels: HashMap::new(),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    });
+
+    let snapshot = collector.snapshot();
+    let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+
+    let mut out = String::new();
+    for backend in &backends {
+        match backend.flush(&snapshot) {
+            Ok(()) => out.push_str(&format!("[OK] {} -- test metric flushed\n", backend.name())),
+            Err(e) => out.push_str(&format!("[FAIL] {} -- {e}\n", backend.name())),
+        }
+    }
+
+    if backends.is_empty() {
+        out.push_str("No backends configured.\n");
+    }
+
+    Ok(out)
+}
+
+fn cmd_telemetry_inspect(tel_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
+    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
+    collector.register_core_metrics();
+    collector.set_files_total(0);
+
+    // Simulate some data.
+    collector.record_module_call("example-module", 100, false);
+    let mut sev = HashMap::new();
+    sev.insert("warning".to_owned(), 2);
+    collector.record_module_findings("example-module", 2, &sev);
+
+    let snapshot = collector.snapshot();
+    let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+
+    let mut out = String::new();
+    for backend in &backends {
+        out.push_str(&format!("--- {} ---\n", backend.name()));
+        match backend.inspect(&snapshot) {
+            Ok(payload) => out.push_str(&payload),
+            Err(e) => out.push_str(&format!("Error: {e}")),
+        }
+        out.push_str("\n\n");
+    }
+
+    Ok(out)
+}
+
 fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
     let workspaces = chaffra_monorepo::detect_workspaces(root);
 
@@ -985,59 +1124,150 @@ fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
     }
 }
 
+fn run_with_telemetry<F>(
+    tel_config: &chaffra_telemetry::TelemetryConfig,
+    command_name: &str,
+    f: F,
+) -> Result<String>
+where
+    F: FnOnce() -> Result<String>,
+{
+    if matches!(
+        tel_config.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        return f();
+    }
+
+    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
+    collector.register_core_metrics();
+    let start = std::time::Instant::now();
+
+    let result = f();
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let failed = result.is_err();
+    collector.record_module_call(command_name, duration_ms, failed);
+
+    let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+    let snapshot = collector.snapshot();
+    for backend in &backends {
+        let _ = backend.flush(&snapshot);
+    }
+
+    result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_str_loose(&cli.format).unwrap_or(OutputFormat::Terminal);
     let formatter = create_formatter(format);
+    let tel_config = build_telemetry_config(&cli);
 
     match cli.command {
         Command::Health { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_health(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "health", || cmd_health(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::DeadCode { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_dead_code(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "dead-code", || cmd_dead_code(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Security { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_security(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "security", || cmd_security(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Audit { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_audit(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "audit", || cmd_audit(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Hotspot { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_hotspot(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "hotspot", || cmd_hotspot(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::AiQuality { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_ai_quality(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "ai-quality", || cmd_ai_quality(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::LlmDefense { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_llm_defense(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "llm-defense", || cmd_llm_defense(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::CicdSecurity { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_cicd_security(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "cicd-security", || cmd_cicd_security(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Dupes {
@@ -1049,7 +1279,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                cmd_dupes(&root, &config, formatter.as_ref(), &mode, &min_tokens)?
+                run_with_telemetry(&tel_config, "duplication", || cmd_dupes(
+                    &root,
+                    &config,
+                    formatter.as_ref(),
+                    &mode,
+                    &min_tokens
+                ))?
             );
         }
 
@@ -1058,7 +1294,12 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                cmd_boundaries(&root, &config, formatter.as_ref(), preset.as_deref())?
+                run_with_telemetry(&tel_config, "architecture", || cmd_boundaries(
+                    &root,
+                    &config,
+                    formatter.as_ref(),
+                    preset.as_deref()
+                ))?
             );
         }
 
@@ -1088,7 +1329,15 @@ async fn main() -> Result<()> {
         } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_fix(&root, &config, dry_run, rule.as_deref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "fix", || cmd_fix(
+                    &root,
+                    &config,
+                    dry_run,
+                    rule.as_deref()
+                ))?
+            );
         }
 
         Command::Hooks { action } => match action {
@@ -1156,14 +1405,14 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                cmd_impact(
+                run_with_telemetry(&tel_config, "impact", || cmd_impact(
                     &root,
                     &config,
                     save_snapshot.as_deref(),
                     baseline.as_deref(),
-                    label,
+                    label.clone(),
                     format,
-                )?
+                ))?
             );
         }
 
@@ -1182,6 +1431,26 @@ async fn main() -> Result<()> {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             print!("{}", cmd_workspaces(&root, format));
         }
+
+        Command::Telemetry { ref action } => match action {
+            TelemetryAction::Status => {
+                print!("{}", cmd_telemetry_status(&tel_config));
+            }
+            TelemetryAction::Test => match cmd_telemetry_test(&tel_config) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            },
+            TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            },
+        },
     }
 
     Ok(())
@@ -1197,7 +1466,7 @@ mod tests {
     fn test_build_module_host() {
         let host = build_module_host();
         let modules = host.list();
-        assert_eq!(modules.len(), 12);
+        assert_eq!(modules.len(), 13);
         let ids: Vec<&str> = modules.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"dead-code"));
         assert!(ids.contains(&"complexity"));
@@ -1209,6 +1478,7 @@ mod tests {
         assert!(ids.contains(&"ai-quality"));
         assert!(ids.contains(&"llm-defense"));
         assert!(ids.contains(&"cicd-security"));
+        assert!(ids.contains(&"telemetry"));
         assert!(ids.contains(&"duplication"));
         assert!(ids.contains(&"architecture"));
     }

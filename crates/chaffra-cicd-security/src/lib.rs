@@ -230,6 +230,7 @@ impl AnalysisModule for CicdSecurityModule {
                 files_analyzed,
                 duration_ms: 0,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         })
     }
