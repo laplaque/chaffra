@@ -81,6 +81,21 @@ impl AnalysisModule for TelemetryModule {
                     default_severity: Severity::Info,
                     category: "telemetry".to_owned(),
                 },
+                Rule {
+                    id: "finding-churn".to_owned(),
+                    name: "Finding churn".to_owned(),
+                    description: "Reports new, resolved, and unchanged findings between runs"
+                        .to_owned(),
+                    default_severity: Severity::Info,
+                    category: "telemetry".to_owned(),
+                },
+                Rule {
+                    id: "sampling-status".to_owned(),
+                    name: "Sampling status".to_owned(),
+                    description: "Reports operator telemetry sampling configuration".to_owned(),
+                    default_severity: Severity::Info,
+                    category: "telemetry".to_owned(),
+                },
             ],
         }
     }
@@ -179,6 +194,29 @@ impl AnalysisModule for TelemetryModule {
                     "Telemetry: 42 files, 15 data points, 3 spans".to_owned(),
                 ],
             }),
+            "finding-churn" => Ok(RuleExplanation {
+                rule_id: "finding-churn".to_owned(),
+                name: "Finding churn".to_owned(),
+                description: "Tracks deltas between analysis runs: new findings, resolved findings, and unchanged findings. Computes a churn rate (new / (new + unchanged)) to measure codebase stability.".to_owned(),
+                rationale: "Teams need to know whether the codebase is improving or regressing between analysis runs.".to_owned(),
+                default_severity: Severity::Info,
+                suppression_syntax: "// chaffra:ignore finding-churn".to_owned(),
+                examples: vec![
+                    "Finding churn: 3 new, 1 resolved, 5 unchanged (churn rate: 0.38)".to_owned(),
+                ],
+            }),
+            "sampling-status" => Ok(RuleExplanation {
+                rule_id: "sampling-status".to_owned(),
+                name: "Sampling status".to_owned(),
+                description: "Reports the operator telemetry sampling configuration: rate-based or on-change strategy, and the effective sampling rate.".to_owned(),
+                rationale: "In high-volume environments, sampling reduces backend noise while preserving signal.".to_owned(),
+                default_severity: Severity::Info,
+                suppression_syntax: "// chaffra:ignore sampling-status".to_owned(),
+                examples: vec![
+                    "Sampling: rate strategy at 0.10 (10% of runs)".to_owned(),
+                    "Sampling: on-change strategy (emit only when findings change)".to_owned(),
+                ],
+            }),
             _ => Err(ChaffraError::RuleNotFound(rule_id.to_owned())),
         }
     }
@@ -237,7 +275,7 @@ mod tests {
         let info = module.describe();
         assert_eq!(info.id, "telemetry");
         assert_eq!(info.name, "Telemetry");
-        assert_eq!(info.rules.len(), 2);
+        assert_eq!(info.rules.len(), 4);
     }
 
     #[test]
@@ -292,6 +330,22 @@ mod tests {
         let module = TelemetryModule::new();
         let explanation = module.explain("metric-summary").unwrap();
         assert_eq!(explanation.rule_id, "metric-summary");
+    }
+
+    #[test]
+    fn test_module_explain_finding_churn() {
+        let module = TelemetryModule::new();
+        let explanation = module.explain("finding-churn").unwrap();
+        assert_eq!(explanation.rule_id, "finding-churn");
+        assert!(explanation.description.contains("churn"));
+    }
+
+    #[test]
+    fn test_module_explain_sampling_status() {
+        let module = TelemetryModule::new();
+        let explanation = module.explain("sampling-status").unwrap();
+        assert_eq!(explanation.rule_id, "sampling-status");
+        assert!(explanation.description.contains("sampling"));
     }
 
     #[test]

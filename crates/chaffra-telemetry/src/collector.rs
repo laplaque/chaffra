@@ -4,7 +4,7 @@ use crate::config::TelemetryConfig;
 use crate::error::Result;
 use crate::metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +81,7 @@ struct CollectorInner {
     findings_by_severity: HashMap<String, u64>,
     files_total: u64,
     analysis_start_ms: u64,
+    finding_fingerprints: HashSet<crate::churn::FindingFingerprint>,
 }
 
 fn now_ms() -> u64 {
@@ -283,6 +284,121 @@ impl TelemetryCollector {
         };
     }
 
+    /// Record a module load error.
+    pub fn record_module_load_error(&self, module_id: &str, error_type: &str) {
+        let ts = now_ms();
+        self.record_data_point(MetricDataPoint {
+            name: "chaffra.module.load_error_total".to_owned(),
+            value: 1.0,
+            labels: {
+                let mut m = HashMap::new();
+                m.insert("module".to_owned(), module_id.to_owned());
+                m.insert("error_type".to_owned(), error_type.to_owned());
+                m
+            },
+            timestamp_ms: ts,
+        });
+    }
+
+    /// Record a config parse error.
+    pub fn record_config_parse_error(&self) {
+        let ts = now_ms();
+        self.record_data_point(MetricDataPoint {
+            name: "chaffra.config.parse_error_total".to_owned(),
+            value: 1.0,
+            labels: HashMap::new(),
+            timestamp_ms: ts,
+        });
+    }
+
+    /// Record a plugin (external module) connection error.
+    pub fn record_plugin_connect_error(&self, module_id: &str) {
+        let ts = now_ms();
+        self.record_data_point(MetricDataPoint {
+            name: "chaffra.plugin.connect_error_total".to_owned(),
+            value: 1.0,
+            labels: {
+                let mut m = HashMap::new();
+                m.insert("module".to_owned(), module_id.to_owned());
+                m
+            },
+            timestamp_ms: ts,
+        });
+    }
+
+    /// Record per-module startup/initialization duration.
+    pub fn record_module_startup(&self, module_id: &str, duration_ms: u64) {
+        let ts = now_ms();
+        self.record_data_point(MetricDataPoint {
+            name: "chaffra.module.startup_duration_ms".to_owned(),
+            value: duration_ms as f64,
+            labels: {
+                let mut m = HashMap::new();
+                m.insert("module".to_owned(), module_id.to_owned());
+                m
+            },
+            timestamp_ms: ts,
+        });
+    }
+
+    /// Record total startup duration (all modules ready).
+    pub fn record_startup_total(&self, duration_ms: u64) {
+        let ts = now_ms();
+        self.record_data_point(MetricDataPoint {
+            name: "chaffra.startup.total_duration_ms".to_owned(),
+            value: duration_ms as f64,
+            labels: HashMap::new(),
+            timestamp_ms: ts,
+        });
+    }
+
+    /// Record finding churn metrics from a churn result.
+    pub fn record_finding_churn(&self, churn: &crate::churn::ChurnResult) {
+        let ts = now_ms();
+        let points = vec![
+            MetricDataPoint {
+                name: "chaffra.findings.new".to_owned(),
+                value: churn.new_count as f64,
+                labels: HashMap::new(),
+                timestamp_ms: ts,
+            },
+            MetricDataPoint {
+                name: "chaffra.findings.resolved".to_owned(),
+                value: churn.resolved_count as f64,
+                labels: HashMap::new(),
+                timestamp_ms: ts,
+            },
+            MetricDataPoint {
+                name: "chaffra.findings.unchanged".to_owned(),
+                value: churn.unchanged_count as f64,
+                labels: HashMap::new(),
+                timestamp_ms: ts,
+            },
+            MetricDataPoint {
+                name: "chaffra.findings.churn_rate".to_owned(),
+                value: churn.churn_rate,
+                labels: HashMap::new(),
+                timestamp_ms: ts,
+            },
+        ];
+        self.record_data_points(points);
+    }
+
+    /// Store finding fingerprints produced by the current analysis run.
+    pub fn set_finding_fingerprints(
+        &self,
+        fingerprints: HashSet<crate::churn::FindingFingerprint>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.finding_fingerprints = fingerprints;
+    }
+
+    /// Retrieve finding fingerprints stored during the current run.
+    pub fn finding_fingerprints(&self) -> HashSet<crate::churn::FindingFingerprint> {
+        let inner = self.inner.lock().unwrap();
+        inner.finding_fingerprints.clone()
+    }
+
     /// Register the core metric definitions.
     pub fn register_core_metrics(&self) {
         let defs = vec![
@@ -315,6 +431,60 @@ impl TelemetryCollector {
                 kind: MetricKind::Counter,
                 description: "Per-module error count".to_owned(),
                 unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.findings.new".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Findings not in previous run".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.findings.resolved".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Findings in previous run but not current".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.findings.unchanged".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Findings present in both runs".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.findings.churn_rate".to_owned(),
+                kind: MetricKind::Gauge,
+                description: "Churn rate: new / (new + unchanged)".to_owned(),
+                unit: "ratio".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.module.load_error_total".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Module load failures by module_id and error_type".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.config.parse_error_total".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Config parse failures".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.plugin.connect_error_total".to_owned(),
+                kind: MetricKind::Counter,
+                description: "External module gRPC connection failures".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.module.startup_duration_ms".to_owned(),
+                kind: MetricKind::Histogram,
+                description: "Per-module initialization time".to_owned(),
+                unit: "ms".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.startup.total_duration_ms".to_owned(),
+                kind: MetricKind::Gauge,
+                description: "Total time from process start to all modules ready".to_owned(),
+                unit: "ms".to_owned(),
             },
         ];
         let _ = self.register_metrics("core", defs);
@@ -439,6 +609,129 @@ mod tests {
         assert_eq!(
             snapshot.operator_summary.module_error_counts.get("failing"),
             Some(&2)
+        );
+    }
+
+    #[test]
+    fn test_collector_module_load_error() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_load_error("security", "missing_dependency");
+        let snapshot = collector.snapshot();
+        let dp = snapshot
+            .data_points
+            .iter()
+            .find(|p| p.name == "chaffra.module.load_error_total")
+            .unwrap();
+        assert!((dp.value - 1.0).abs() < f64::EPSILON);
+        assert_eq!(dp.labels.get("module").unwrap(), "security");
+        assert_eq!(dp.labels.get("error_type").unwrap(), "missing_dependency");
+    }
+
+    #[test]
+    fn test_collector_config_parse_error() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_config_parse_error();
+        let snapshot = collector.snapshot();
+        assert!(
+            snapshot
+                .data_points
+                .iter()
+                .any(|p| p.name == "chaffra.config.parse_error_total")
+        );
+    }
+
+    #[test]
+    fn test_collector_plugin_connect_error() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_plugin_connect_error("fastapi-module");
+        let snapshot = collector.snapshot();
+        let dp = snapshot
+            .data_points
+            .iter()
+            .find(|p| p.name == "chaffra.plugin.connect_error_total")
+            .unwrap();
+        assert_eq!(dp.labels.get("module").unwrap(), "fastapi-module");
+    }
+
+    #[test]
+    fn test_collector_module_startup() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_startup("dead-code", 15);
+        collector.record_module_startup("complexity", 8);
+        let snapshot = collector.snapshot();
+        let startup_points: Vec<_> = snapshot
+            .data_points
+            .iter()
+            .filter(|p| p.name == "chaffra.module.startup_duration_ms")
+            .collect();
+        assert_eq!(startup_points.len(), 2);
+    }
+
+    #[test]
+    fn test_collector_startup_total() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_startup_total(250);
+        let snapshot = collector.snapshot();
+        let dp = snapshot
+            .data_points
+            .iter()
+            .find(|p| p.name == "chaffra.startup.total_duration_ms")
+            .unwrap();
+        assert!((dp.value - 250.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_collector_finding_churn() {
+        let collector = TelemetryCollector::with_defaults();
+        let churn = crate::churn::ChurnResult {
+            new_count: 3,
+            resolved_count: 1,
+            unchanged_count: 5,
+            churn_rate: 0.375,
+        };
+        collector.record_finding_churn(&churn);
+        let snapshot = collector.snapshot();
+
+        let new_dp = snapshot
+            .data_points
+            .iter()
+            .find(|p| p.name == "chaffra.findings.new")
+            .unwrap();
+        assert!((new_dp.value - 3.0).abs() < f64::EPSILON);
+
+        let rate_dp = snapshot
+            .data_points
+            .iter()
+            .find(|p| p.name == "chaffra.findings.churn_rate")
+            .unwrap();
+        assert!((rate_dp.value - 0.375).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_core_metrics_include_phase13() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        let snapshot = collector.snapshot();
+        assert!(snapshot.definitions.contains_key("chaffra.findings.new"));
+        assert!(
+            snapshot
+                .definitions
+                .contains_key("chaffra.findings.churn_rate")
+        );
+        assert!(
+            snapshot
+                .definitions
+                .contains_key("chaffra.module.load_error_total")
+        );
+        assert!(
+            snapshot
+                .definitions
+                .contains_key("chaffra.module.startup_duration_ms")
+        );
+        assert!(
+            snapshot
+                .definitions
+                .contains_key("chaffra.startup.total_duration_ms")
         );
     }
 

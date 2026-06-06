@@ -9,15 +9,18 @@
 //! - **Operator**: call latencies, error rates, memory pressure (sunk to backends).
 
 pub mod backends;
+pub mod churn;
 pub mod collector;
 pub mod config;
 pub mod error;
 pub mod grpc_service;
 pub mod metrics;
 pub mod module;
+pub mod sampling;
 
 pub use collector::TelemetryCollector;
 pub use config::{BackendConfig, BackendKind, TelemetryAudience, TelemetryConfig};
 pub use error::TelemetryError;
 pub use metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 pub use module::TelemetryModule;
+pub use sampling::{SamplingDecision, SamplingStrategy};

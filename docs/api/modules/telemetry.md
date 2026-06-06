@@ -12,6 +12,8 @@ Collects, aggregates, and sinks metrics and spans from all analysis modules. Sup
 |---------|------|-------------------|----------|-------------|
 | `backend-status` | Backend status | info | telemetry | Reports telemetry backend connectivity status |
 | `metric-summary` | Metric summary | info | telemetry | Summary of collected telemetry metrics from the current run |
+| `finding-churn` | Finding churn | info | telemetry | Reports new, resolved, and unchanged findings between runs |
+| `sampling-status` | Sampling status | info | telemetry | Reports operator telemetry sampling configuration |
 
 ## Core Metrics (auto-collected)
 
@@ -22,6 +24,38 @@ Collects, aggregates, and sinks metrics and spans from all analysis modules. Sup
 | `chaffra.analysis.findings_total` | counter | Findings by severity and module |
 | `chaffra.module.call_duration_ms` | histogram | Per-module call duration |
 | `chaffra.module.error_total` | counter | Per-module error count |
+
+## Finding Churn Metrics
+
+Track deltas between analysis runs to measure codebase stability.
+
+| Metric | Kind | Description |
+|--------|------|-------------|
+| `chaffra.findings.new` | counter | Findings not in previous run |
+| `chaffra.findings.resolved` | counter | Findings in previous run but not current |
+| `chaffra.findings.unchanged` | counter | Findings present in both runs |
+| `chaffra.findings.churn_rate` | gauge | Churn rate: new / (new + unchanged) |
+
+State is persisted in `.chaffra-telemetry-state.json` for non-audit runs that don't have an explicit baseline.
+
+## Error Metrics
+
+Emitted when modules fail to load, configs are malformed, or plugins are unreachable.
+
+| Metric | Kind | Description |
+|--------|------|-------------|
+| `chaffra.module.load_error_total` | counter | Module load failures by module_id and error_type |
+| `chaffra.config.parse_error_total` | counter | Config parse failures |
+| `chaffra.plugin.connect_error_total` | counter | External module gRPC connection failures |
+
+## Startup Timing Metrics
+
+Per-module initialization time (relevant post-Phase 11 when all modules are gRPC servers).
+
+| Metric | Kind | Description |
+|--------|------|-------------|
+| `chaffra.module.startup_duration_ms` | histogram | Per-module initialization time |
+| `chaffra.startup.total_duration_ms` | gauge | Total time from process start to all modules ready |
 
 ## Per-Category Summary Metrics
 
@@ -62,14 +96,31 @@ Control via `--telemetry on|off|user-only|operator-only`.
 | StatsD | UDP push | `--telemetry-backend statsd` |
 | CloudWatch | Preview: generates PutMetricData payload, does not export | `cloudwatch` feature flag |
 
+## Sampling
+
+Configurable sampling rate for operator telemetry in high-volume environments.
+
+```toml
+[modules.telemetry]
+sampling-rate = 1.0        # 1.0 = every run, 0.1 = 10% of runs, 0 = off
+sampling-strategy = "rate"  # rate | on-change
+```
+
+| Strategy | Behavior |
+|----------|----------|
+| `rate` | Emit operator metrics on a random fraction of runs |
+| `on-change` | Emit only when findings change compared to the previous run |
+
 ## Configuration
 
 ```toml
 [modules.telemetry]
-audience = "on"          # on | off | user-only | operator-only
-backend = "json-file"    # json-file | stderr | prometheus | otlp | statsd | cloudwatch
-endpoint = ""            # For OTLP/StatsD/CloudWatch
+audience = "on"              # on | off | user-only | operator-only
+backend = "json-file"        # json-file | stderr | prometheus | otlp | statsd | cloudwatch
+endpoint = ""                # For OTLP/StatsD/CloudWatch
 path = "chaffra-telemetry.json"  # For json-file backend
+sampling-rate = 1.0          # 0.0–1.0
+sampling-strategy = "rate"   # rate | on-change
 ```
 
 ## CLI

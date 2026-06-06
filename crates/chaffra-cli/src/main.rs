@@ -24,7 +24,7 @@ use chaffra_security::SecurityModule;
 use chaffra_telemetry::TelemetryModule;
 use chaffra_tui::App;
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Parser)]
@@ -253,22 +253,49 @@ enum HooksAction {
 }
 
 pub(crate) fn build_module_host() -> GrpcModuleHost {
+    build_module_host_with_telemetry(None)
+}
+
+fn build_module_host_with_telemetry(
+    collector: Option<&chaffra_telemetry::TelemetryCollector>,
+) -> GrpcModuleHost {
+    let total_start = std::time::Instant::now();
     let mut host = GrpcModuleHost::new();
-    // Register built-in modules. Each module is wrapped in a GrpcModuleHandle
-    // that starts an in-process gRPC service (tower::Service, no TCP).
-    let _ = host.register(Box::new(DeadCodeModule::new()));
-    let _ = host.register(Box::new(ComplexityModule::new()));
-    let _ = host.register(Box::new(SecurityModule::new()));
-    let _ = host.register(Box::new(FrameworksModule::new()));
-    let _ = host.register(Box::new(AuditModule::new()));
-    let _ = host.register(Box::new(HotspotModule::new()));
-    let _ = host.register(Box::new(AutofixModule::new()));
-    let _ = host.register(Box::new(AiQualityModule::new()));
-    let _ = host.register(Box::new(LlmDefenseModule::new()));
-    let _ = host.register(Box::new(CicdSecurityModule::new()));
-    let _ = host.register(Box::new(TelemetryModule::new()));
-    let _ = host.register(Box::new(DuplicationModule::new()));
-    let _ = host.register(Box::new(ArchModule::new()));
+
+    let modules: Vec<(&str, Box<dyn chaffra_core::module::AnalysisModule>)> = vec![
+        ("dead-code", Box::new(DeadCodeModule::new())),
+        ("complexity", Box::new(ComplexityModule::new())),
+        ("security", Box::new(SecurityModule::new())),
+        ("frameworks", Box::new(FrameworksModule::new())),
+        ("audit", Box::new(AuditModule::new())),
+        ("hotspot", Box::new(HotspotModule::new())),
+        ("autofix", Box::new(AutofixModule::new())),
+        ("ai-quality", Box::new(AiQualityModule::new())),
+        ("llm-defense", Box::new(LlmDefenseModule::new())),
+        ("cicd-security", Box::new(CicdSecurityModule::new())),
+        ("telemetry", Box::new(TelemetryModule::new())),
+        ("duplication", Box::new(DuplicationModule::new())),
+        ("architecture", Box::new(ArchModule::new())),
+    ];
+
+    for (id, module) in modules {
+        let start = std::time::Instant::now();
+        let result = host.register(module);
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if let Some(c) = collector {
+            c.record_module_startup(id, duration_ms);
+            if result.is_err() {
+                c.record_module_load_error(id, "registration_failed");
+            }
+        }
+    }
+
+    if let Some(c) = collector {
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        c.record_startup_total(total_ms);
+    }
+
     host
 }
 
@@ -278,6 +305,35 @@ fn load_config(config_path: Option<&str>, analysis_path: &Path) -> Result<Chaffr
     } else {
         Ok(ChaffraConfig::load_from_dir(analysis_path).unwrap_or_default())
     }
+}
+
+fn fingerprints_from_findings(
+    findings: &[chaffra_core::diagnostic::Finding],
+) -> HashSet<chaffra_telemetry::churn::FindingFingerprint> {
+    findings
+        .iter()
+        .map(|f| {
+            chaffra_telemetry::churn::FindingFingerprint::new(
+                &f.rule_id,
+                &f.location.file,
+                f.location.start_line,
+            )
+        })
+        .collect()
+}
+
+fn merge_telemetry_config(
+    cli_config: &chaffra_telemetry::TelemetryConfig,
+    project_config: &ChaffraConfig,
+) -> chaffra_telemetry::TelemetryConfig {
+    let mut config = cli_config.clone();
+    let module_cfg = project_config.module_config("telemetry");
+    if !module_cfg.is_empty() {
+        let project_tel = chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg);
+        config.sampling_rate = project_tel.sampling_rate;
+        config.sampling_strategy = project_tel.sampling_strategy;
+    }
+    config
 }
 
 fn discover_and_read_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo> {
@@ -316,13 +372,15 @@ fn cmd_dead_code(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let result = host.analyze("dead-code", &files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -332,17 +390,19 @@ fn cmd_dupes(
     formatter: &dyn chaffra_output::Formatter,
     mode: &str,
     min_tokens: &str,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let mut module_config = config.module_config("duplication");
     module_config.insert("mode".to_owned(), mode.to_owned());
     module_config.insert("min-tokens".to_owned(), min_tokens.to_owned());
 
     let result = host.analyze_with_config("duplication", &files, &module_config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     if result.findings.is_empty() {
         return Ok("No duplicates found.\n".to_owned());
     }
@@ -354,17 +414,19 @@ fn cmd_boundaries(
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
     preset: Option<&str>,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let mut module_config = config.module_config("architecture");
     if let Some(p) = preset {
         module_config.insert("preset".to_owned(), p.to_owned());
     }
     let result = host.analyze_with_config("architecture", &files, &module_config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     if result.findings.is_empty() {
         return Ok("No architecture violations found.\n".to_owned());
     }
@@ -375,6 +437,7 @@ fn cmd_security(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let mut files = discover_and_read_files(root, config);
 
@@ -383,8 +446,9 @@ fn cmd_security(
     if files.is_empty() {
         return Ok("No files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let result = host.analyze("security", &files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -478,13 +542,15 @@ fn cmd_ai_quality(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let result = host.analyze("ai-quality", &files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -492,9 +558,10 @@ fn cmd_audit(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
 
     // First, run dead-code and complexity to collect findings.
     let mut all_findings = Vec::new();
@@ -513,6 +580,7 @@ fn cmd_audit(
     }];
 
     let result = host.analyze("audit", &audit_files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -520,13 +588,15 @@ fn cmd_hotspot(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let result = host.analyze("hotspot", &files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -534,13 +604,15 @@ fn cmd_llm_defense(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let result = host.analyze("llm-defense", &files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     Ok(formatter.format_findings(&result.findings))
 }
 
@@ -548,13 +620,15 @@ fn cmd_cicd_security(
     root: &Path,
     config: &ChaffraConfig,
     formatter: &dyn chaffra_output::Formatter,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_all_files(root, config);
     if files.is_empty() {
         return Ok("No files found.\n".to_owned());
     }
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let result = host.analyze("cicd-security", &files, config)?;
+    collector.set_finding_fingerprints(fingerprints_from_findings(&result.findings));
     if result.findings.is_empty() {
         return Ok("No CI/CD security issues found.\n".to_owned());
     }
@@ -620,13 +694,14 @@ fn cmd_fix(
     config: &ChaffraConfig,
     dry_run: bool,
     rule: Option<&str>,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
 
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
 
     let dead_code_result = host.analyze("dead-code", &files, config)?;
     let mut all_findings = dead_code_result.findings;
@@ -635,6 +710,8 @@ fn cmd_fix(
         Ok(result) => all_findings.extend(result.findings),
         Err(e) => eprintln!("warning: complexity analysis failed: {e}"),
     }
+
+    collector.set_finding_fingerprints(fingerprints_from_findings(&all_findings));
 
     // Optionally filter by rule.
     if let Some(rule_id) = rule {
@@ -893,6 +970,7 @@ fn cmd_impact(
     baseline_path: Option<&str>,
     label: Option<String>,
     format: OutputFormat,
+    collector: &chaffra_telemetry::TelemetryCollector,
 ) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
@@ -900,7 +978,7 @@ fn cmd_impact(
     }
 
     // Run all registered modules and aggregate findings
-    let host = build_module_host();
+    let host = build_module_host_with_telemetry(Some(collector));
     let mut all_findings: Vec<chaffra_core::diagnostic::Finding> = Vec::new();
     let mut total_files_analyzed: u64 = 0;
 
@@ -910,6 +988,8 @@ fn cmd_impact(
             total_files_analyzed = total_files_analyzed.max(result.metrics.files_analyzed);
         }
     }
+
+    collector.set_finding_fingerprints(fingerprints_from_findings(&all_findings));
 
     let health = chaffra_complexity::analyze_project_health(
         &files,
@@ -1011,7 +1091,11 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
         chaffra_telemetry::TelemetryConfig::default().backends
     };
 
-    chaffra_telemetry::TelemetryConfig { audience, backends }
+    chaffra_telemetry::TelemetryConfig {
+        audience,
+        backends,
+        ..Default::default()
+    }
 }
 
 fn cmd_telemetry_status(tel_config: &chaffra_telemetry::TelemetryConfig) -> String {
@@ -1126,33 +1210,77 @@ fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
 
 fn run_with_telemetry<F>(
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    project_config: &ChaffraConfig,
     command_name: &str,
     f: F,
 ) -> Result<String>
 where
-    F: FnOnce() -> Result<String>,
+    F: FnOnce(&chaffra_telemetry::TelemetryCollector) -> Result<String>,
 {
+    let effective_config = merge_telemetry_config(tel_config, project_config);
+
     if matches!(
-        tel_config.audience,
+        effective_config.audience,
         chaffra_telemetry::TelemetryAudience::Off
     ) {
-        return f();
+        let collector = chaffra_telemetry::TelemetryCollector::new(effective_config);
+        return f(&collector);
     }
 
-    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
+    let collector = chaffra_telemetry::TelemetryCollector::new(effective_config.clone());
     collector.register_core_metrics();
     let start = std::time::Instant::now();
 
-    let result = f();
+    let result = f(&collector);
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let failed = result.is_err();
     collector.record_module_call(command_name, duration_ms, failed);
 
-    let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
-    let snapshot = collector.snapshot();
-    for backend in &backends {
-        let _ = backend.flush(&snapshot);
+    if !failed {
+        let current_fingerprints = collector.finding_fingerprints();
+        let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
+        let previous_state = chaffra_telemetry::churn::load_state(state_path);
+
+        let current_hash = chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
+
+        if let Some(ref prev) = previous_state {
+            let churn = chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
+            collector.record_finding_churn(&churn);
+        }
+
+        let decision = chaffra_telemetry::sampling::should_sample(
+            effective_config.sampling_strategy,
+            effective_config.sampling_rate,
+            current_hash,
+            previous_state.as_ref().map(|s| s.findings_hash),
+        );
+
+        if decision == chaffra_telemetry::SamplingDecision::Emit {
+            let (backends, _) =
+                chaffra_telemetry::backends::create_backends(&effective_config.backends);
+            let snapshot = collector.snapshot();
+            for backend in &backends {
+                let _ = backend.flush(&snapshot);
+            }
+        }
+
+        let new_state = chaffra_telemetry::churn::ChurnState {
+            fingerprints: current_fingerprints,
+            findings_hash: current_hash,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+    } else {
+        let (backends, _) =
+            chaffra_telemetry::backends::create_backends(&effective_config.backends);
+        let snapshot = collector.snapshot();
+        for backend in &backends {
+            let _ = backend.flush(&snapshot);
+        }
     }
 
     result
@@ -1171,11 +1299,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "health", || cmd_health(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "health", |_collector| {
+                    cmd_health(&root, &config, formatter.as_ref())
+                })?
             );
         }
 
@@ -1184,11 +1310,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "dead-code", || cmd_dead_code(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+                    cmd_dead_code(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1197,11 +1321,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "security", || cmd_security(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "security", |collector| {
+                    cmd_security(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1210,11 +1332,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "audit", || cmd_audit(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "audit", |collector| {
+                    cmd_audit(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1223,11 +1343,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "hotspot", || cmd_hotspot(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "hotspot", |collector| {
+                    cmd_hotspot(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1236,11 +1354,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "ai-quality", || cmd_ai_quality(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "ai-quality", |collector| {
+                    cmd_ai_quality(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1249,11 +1365,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "llm-defense", || cmd_llm_defense(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "llm-defense", |collector| {
+                    cmd_llm_defense(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1262,11 +1376,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "cicd-security", || cmd_cicd_security(
-                    &root,
-                    &config,
-                    formatter.as_ref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "cicd-security", |collector| {
+                    cmd_cicd_security(&root, &config, formatter.as_ref(), collector)
+                })?
             );
         }
 
@@ -1279,13 +1391,16 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "duplication", || cmd_dupes(
-                    &root,
-                    &config,
-                    formatter.as_ref(),
-                    &mode,
-                    &min_tokens
-                ))?
+                run_with_telemetry(&tel_config, &config, "duplication", |collector| {
+                    cmd_dupes(
+                        &root,
+                        &config,
+                        formatter.as_ref(),
+                        &mode,
+                        &min_tokens,
+                        collector,
+                    )
+                })?
             );
         }
 
@@ -1294,12 +1409,15 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "architecture", || cmd_boundaries(
-                    &root,
-                    &config,
-                    formatter.as_ref(),
-                    preset.as_deref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "architecture", |collector| {
+                    cmd_boundaries(
+                        &root,
+                        &config,
+                        formatter.as_ref(),
+                        preset.as_deref(),
+                        collector,
+                    )
+                })?
             );
         }
 
@@ -1331,12 +1449,9 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "fix", || cmd_fix(
-                    &root,
-                    &config,
-                    dry_run,
-                    rule.as_deref()
-                ))?
+                run_with_telemetry(&tel_config, &config, "fix", |collector| {
+                    cmd_fix(&root, &config, dry_run, rule.as_deref(), collector)
+                })?
             );
         }
 
@@ -1405,14 +1520,17 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, "impact", || cmd_impact(
-                    &root,
-                    &config,
-                    save_snapshot.as_deref(),
-                    baseline.as_deref(),
-                    label.clone(),
-                    format,
-                ))?
+                run_with_telemetry(&tel_config, &config, "impact", |collector| {
+                    cmd_impact(
+                        &root,
+                        &config,
+                        save_snapshot.as_deref(),
+                        baseline.as_deref(),
+                        label.clone(),
+                        format,
+                        collector,
+                    )
+                })?
             );
         }
 
@@ -1570,7 +1688,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dead_code(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
         assert!(
             output.contains("unused"),
@@ -1583,7 +1702,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/python/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dead_code(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -1592,7 +1712,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_dead_code(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dead_code(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -1601,7 +1722,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Json);
-        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dead_code(&root, &config, formatter.as_ref(), &collector).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output)
             .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{output}"));
         assert!(parsed.is_array() || parsed.is_object());
@@ -1612,7 +1734,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Markdown);
-        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dead_code(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -1621,7 +1744,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Badge);
-        let output = cmd_dead_code(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dead_code(&root, &config, formatter.as_ref(), &collector).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(parsed["schemaVersion"].is_number());
     }
@@ -1633,7 +1757,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_dupes(dir.path(), &config, formatter.as_ref(), "strict", "50").unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_dupes(
+            dir.path(),
+            &config,
+            formatter.as_ref(),
+            "strict",
+            "50",
+            &collector,
+        )
+        .unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -1642,8 +1775,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output =
-            cmd_boundaries(dir.path(), &config, formatter.as_ref(), Some("layered")).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_boundaries(
+            dir.path(),
+            &config,
+            formatter.as_ref(),
+            Some("layered"),
+            &collector,
+        )
+        .unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -1652,7 +1792,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_audit(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_audit(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -1661,7 +1802,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_audit(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_audit(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -1670,7 +1812,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_hotspot(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_hotspot(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(output.contains("No issues found"));
     }
 
@@ -1679,7 +1822,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_hotspot(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_hotspot(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -1691,7 +1835,8 @@ mod tests {
     fn test_cmd_fix_dry_run() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
-        let output = cmd_fix(&root, &config, true, None).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_fix(&root, &config, true, None, &collector).unwrap();
         assert!(output.contains("Dry run") || output.contains("No auto-fixable"));
     }
 
@@ -1699,7 +1844,8 @@ mod tests {
     fn test_cmd_fix_empty_dir() {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
-        let output = cmd_fix(dir.path(), &config, true, None).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_fix(dir.path(), &config, true, None, &collector).unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -1707,7 +1853,8 @@ mod tests {
     fn test_cmd_fix_with_rule_filter() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
-        let output = cmd_fix(&root, &config, true, Some("unused-function")).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_fix(&root, &config, true, Some("unused-function"), &collector).unwrap();
         // Should either find fixable findings or report none.
         assert!(
             output.contains("Dry run") || output.contains("No auto-fixable"),
@@ -1719,7 +1866,8 @@ mod tests {
     fn test_cmd_fix_with_nonexistent_rule() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
         let config = ChaffraConfig::default();
-        let output = cmd_fix(&root, &config, true, Some("nonexistent-rule")).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_fix(&root, &config, true, Some("nonexistent-rule"), &collector).unwrap();
         assert_eq!(output, "No auto-fixable findings.\n");
     }
 
@@ -1885,7 +2033,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_security(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert_eq!(output, "No files found.\n");
     }
 
@@ -1896,7 +2045,8 @@ mod tests {
         if root.exists() {
             let config = ChaffraConfig::default();
             let formatter = create_formatter(OutputFormat::Terminal);
-            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+            let output = cmd_security(&root, &config, formatter.as_ref(), &collector).unwrap();
             assert!(!output.is_empty());
         }
     }
@@ -1908,7 +2058,8 @@ mod tests {
         if root.exists() {
             let config = ChaffraConfig::default();
             let formatter = create_formatter(OutputFormat::Json);
-            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+            let output = cmd_security(&root, &config, formatter.as_ref(), &collector).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&output)
                 .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{output}"));
             assert!(parsed.is_array() || parsed.is_object());
@@ -1922,7 +2073,8 @@ mod tests {
         if root.exists() {
             let config = ChaffraConfig::default();
             let formatter = create_formatter(OutputFormat::Terminal);
-            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+            let output = cmd_security(&root, &config, formatter.as_ref(), &collector).unwrap();
             assert!(
                 !output.contains("sql-injection")
                     && !output.contains("command-injection")
@@ -1941,7 +2093,8 @@ mod tests {
         if root.exists() {
             let config = ChaffraConfig::default();
             let formatter = create_formatter(OutputFormat::Terminal);
-            let output = cmd_security(&root, &config, formatter.as_ref()).unwrap();
+            let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+            let output = cmd_security(&root, &config, formatter.as_ref(), &collector).unwrap();
             assert!(
                 !output.is_empty(),
                 "should discover files in nested directories"
@@ -1959,7 +2112,8 @@ mod tests {
         .unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_security(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert!(
             output.contains("hardcoded-secret") || output.contains("high-entropy"),
             "should detect secrets in .env files, got: {output}"
@@ -1996,7 +2150,8 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/python/ai-quality");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_ai_quality(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_ai_quality(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -2005,7 +2160,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_ai_quality(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_ai_quality(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -2017,7 +2173,8 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/python/llm-defense");
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_llm_defense(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_llm_defense(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -2026,7 +2183,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_llm_defense(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_llm_defense(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 
@@ -2054,6 +2212,7 @@ mod tests {
         let config = ChaffraConfig::default();
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("snapshot.json");
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
 
         let output = cmd_impact(
             &root,
@@ -2062,6 +2221,7 @@ mod tests {
             None,
             Some("test-label".to_owned()),
             OutputFormat::Terminal,
+            &collector,
         )
         .unwrap();
         assert!(output.contains("Snapshot saved"));
@@ -2078,6 +2238,7 @@ mod tests {
         let config = ChaffraConfig::default();
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("baseline.json");
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
 
         cmd_impact(
             &root,
@@ -2086,6 +2247,7 @@ mod tests {
             None,
             Some("baseline".to_owned()),
             OutputFormat::Terminal,
+            &collector,
         )
         .unwrap();
 
@@ -2096,6 +2258,7 @@ mod tests {
             Some(snapshot_path.to_str().unwrap()),
             Some("current".to_owned()),
             OutputFormat::Terminal,
+            &collector,
         )
         .unwrap();
 
@@ -2109,6 +2272,7 @@ mod tests {
         let config = ChaffraConfig::default();
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("baseline.json");
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
 
         cmd_impact(
             &root,
@@ -2117,6 +2281,7 @@ mod tests {
             None,
             None,
             OutputFormat::Terminal,
+            &collector,
         )
         .unwrap();
 
@@ -2127,6 +2292,7 @@ mod tests {
             Some(snapshot_path.to_str().unwrap()),
             None,
             OutputFormat::Json,
+            &collector,
         )
         .unwrap();
 
@@ -2139,6 +2305,7 @@ mod tests {
     fn test_cmd_impact_no_files() {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
         let output = cmd_impact(
             dir.path(),
             &config,
@@ -2146,6 +2313,7 @@ mod tests {
             None,
             None,
             OutputFormat::Terminal,
+            &collector,
         )
         .unwrap();
         assert_eq!(output, "No source files found.\n");
@@ -2296,6 +2464,7 @@ mod tests {
         let config = ChaffraConfig::default();
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("snapshot.json");
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
 
         cmd_impact(
             &root,
@@ -2304,6 +2473,7 @@ mod tests {
             None,
             Some("all-modules".to_owned()),
             OutputFormat::Terminal,
+            &collector,
         )
         .unwrap();
 
@@ -2364,7 +2534,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_cicd_security(dir.path(), &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output =
+            cmd_cicd_security(dir.path(), &config, formatter.as_ref(), &collector).unwrap();
         assert_eq!(output, "No files found.\n");
     }
 
@@ -2376,7 +2548,232 @@ mod tests {
         }
         let config = ChaffraConfig::default();
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = cmd_cicd_security(&root, &config, formatter.as_ref()).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_cicd_security(&root, &config, formatter.as_ref(), &collector).unwrap();
         assert!(!output.is_empty());
+    }
+
+    // --- Phase 13: telemetry wiring tests ---
+
+    #[test]
+    fn test_churn_wiring_records_real_fingerprints() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let _ = cmd_dead_code(&root, &config, formatter.as_ref(), &collector).unwrap();
+
+        let fingerprints = collector.finding_fingerprints();
+        assert!(
+            !fingerprints.is_empty(),
+            "dead-code analysis should produce real fingerprints"
+        );
+        for fp in &fingerprints {
+            assert!(!fp.rule_id.is_empty());
+            assert!(!fp.file.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_sampling_config_merges_project_config() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        assert_eq!(cli_config.sampling_rate, 1.0);
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\nsampling-rate = \"0.5\"\nsampling-strategy = \"on-change\"\n",
+        )
+        .unwrap();
+        let project_config = load_config(None, dir.path()).unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert!(
+            (merged.sampling_rate - 0.5).abs() < f64::EPSILON,
+            "project config sampling-rate should override default"
+        );
+        assert_eq!(
+            merged.sampling_strategy,
+            chaffra_telemetry::SamplingStrategy::OnChange,
+            "project config sampling-strategy should override default"
+        );
+    }
+
+    #[test]
+    fn test_startup_timing_records_metrics() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let _host = build_module_host_with_telemetry(Some(&collector));
+
+        let snapshot = collector.snapshot();
+        let startup_points: Vec<_> = snapshot
+            .data_points
+            .iter()
+            .filter(|p| p.name == "chaffra.module.startup_duration_ms")
+            .collect();
+        assert!(
+            !startup_points.is_empty(),
+            "should record per-module startup timing"
+        );
+
+        let total_point = snapshot
+            .data_points
+            .iter()
+            .find(|p| p.name == "chaffra.startup.total_duration_ms");
+        assert!(
+            total_point.is_some(),
+            "should record total startup duration"
+        );
+    }
+
+    #[test]
+    fn test_run_with_telemetry_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(
+                    dir.path()
+                        .join("telemetry.json")
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+
+        // Temporarily override the state file path by running in the temp dir.
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+            cmd_dead_code(&root, &config, formatter.as_ref(), collector)
+        })
+        .unwrap();
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(!output.is_empty());
+
+        // Verify state file was written with real fingerprints.
+        let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
+        assert!(state_file.exists(), "churn state file should be written");
+        let state = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        assert!(
+            !state.fingerprints.is_empty(),
+            "churn state should contain real fingerprints, not an empty set"
+        );
+    }
+
+    #[test]
+    fn test_failed_run_preserves_prior_churn_state() {
+        let dir = TempDir::new().unwrap();
+        let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
+
+        let prior_state = chaffra_telemetry::churn::ChurnState {
+            fingerprints: [chaffra_telemetry::churn::FindingFingerprint::new(
+                "dc:unused",
+                "a.go",
+                10,
+            )]
+            .into_iter()
+            .collect(),
+            findings_hash: 12345,
+            timestamp_ms: 1000,
+        };
+        chaffra_telemetry::churn::save_state(&prior_state, &state_file).unwrap();
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            backends: vec![],
+            ..Default::default()
+        };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated analysis failure")
+        });
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_err());
+
+        let loaded = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        assert_eq!(
+            loaded.fingerprints, prior_state.fingerprints,
+            "prior churn state should be preserved after a failed run"
+        );
+        assert_eq!(loaded.findings_hash, 12345);
+    }
+
+    #[test]
+    fn test_failed_run_flushes_error_telemetry() {
+        let dir = TempDir::new().unwrap();
+        let telemetry_path = dir.path().join("telemetry.json");
+        let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
+
+        let prior_state = chaffra_telemetry::churn::ChurnState {
+            fingerprints: [chaffra_telemetry::churn::FindingFingerprint::new(
+                "dc:unused",
+                "a.go",
+                10,
+            )]
+            .into_iter()
+            .collect(),
+            findings_hash: 99999,
+            timestamp_ms: 2000,
+        };
+        chaffra_telemetry::churn::save_state(&prior_state, &state_file).unwrap();
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(telemetry_path.to_str().unwrap().to_owned()),
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated analysis failure")
+        });
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_err());
+
+        assert!(
+            telemetry_path.exists(),
+            "telemetry JSON should be flushed even on failed runs"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["operator_summary"]["module_error_counts"]["failing-cmd"], 1,
+            "error metric should be recorded in flushed telemetry"
+        );
+
+        let loaded = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        assert_eq!(
+            loaded.fingerprints, prior_state.fingerprints,
+            "prior churn state should be unchanged after a failed run"
+        );
+        assert_eq!(loaded.findings_hash, 99999);
+        assert_eq!(loaded.timestamp_ms, 2000);
     }
 }

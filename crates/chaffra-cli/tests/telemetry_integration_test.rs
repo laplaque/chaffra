@@ -71,6 +71,7 @@ fn test_json_file_backend_output() {
             path: Some(path.to_str().unwrap().to_owned()),
             options: HashMap::new(),
         }],
+        ..Default::default()
     };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
@@ -196,6 +197,7 @@ fn test_prometheus_exposition_format() {
             path: None,
             options: HashMap::new(),
         }],
+        ..Default::default()
     };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
@@ -222,6 +224,7 @@ fn test_otlp_payload_format() {
             path: None,
             options: HashMap::new(),
         }],
+        ..Default::default()
     };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
@@ -249,6 +252,7 @@ fn test_statsd_line_format() {
             path: None,
             options: HashMap::new(),
         }],
+        ..Default::default()
     };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());

@@ -2,6 +2,7 @@
 //!
 //! Maps to the `[modules.telemetry]` section in `.chaffra.toml`.
 
+use crate::sampling::SamplingStrategy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -105,6 +106,18 @@ pub struct TelemetryConfig {
     /// Configured backends.
     #[serde(default = "default_backends")]
     pub backends: Vec<BackendConfig>,
+
+    /// Fraction of runs that emit operator telemetry (0.0–1.0).
+    #[serde(default = "default_sampling_rate")]
+    pub sampling_rate: f64,
+
+    /// How to decide whether to emit operator telemetry.
+    #[serde(default)]
+    pub sampling_strategy: SamplingStrategy,
+}
+
+fn default_sampling_rate() -> f64 {
+    1.0
 }
 
 impl Default for TelemetryConfig {
@@ -112,6 +125,8 @@ impl Default for TelemetryConfig {
         Self {
             audience: TelemetryAudience::On,
             backends: default_backends(),
+            sampling_rate: 1.0,
+            sampling_strategy: SamplingStrategy::default(),
         }
     }
 }
@@ -151,7 +166,25 @@ impl TelemetryConfig {
             default_backends()
         };
 
-        Self { audience, backends }
+        let sampling_rate = config
+            .get("sampling-rate")
+            .or_else(|| config.get("sampling_rate"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+
+        let sampling_strategy = config
+            .get("sampling-strategy")
+            .or_else(|| config.get("sampling_strategy"))
+            .and_then(|v| SamplingStrategy::from_str_loose(v))
+            .unwrap_or_default();
+
+        Self {
+            audience,
+            backends,
+            sampling_rate,
+            sampling_strategy,
+        }
     }
 }
 
@@ -229,6 +262,8 @@ mod tests {
         assert_eq!(cfg.audience, TelemetryAudience::On);
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].kind, BackendKind::JsonFile);
+        assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.sampling_strategy, SamplingStrategy::Rate);
     }
 
     #[test]
@@ -254,5 +289,29 @@ mod tests {
         let cfg = TelemetryConfig::from_module_config(&mc);
         assert_eq!(cfg.audience, TelemetryAudience::On);
         assert_eq!(cfg.backends[0].kind, BackendKind::JsonFile);
+        assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.sampling_strategy, SamplingStrategy::Rate);
+    }
+
+    #[test]
+    fn test_from_module_config_sampling() {
+        let mut mc = HashMap::new();
+        mc.insert("sampling-rate".to_owned(), "0.5".to_owned());
+        mc.insert("sampling-strategy".to_owned(), "on-change".to_owned());
+        let cfg = TelemetryConfig::from_module_config(&mc);
+        assert!((cfg.sampling_rate - 0.5).abs() < f64::EPSILON);
+        assert_eq!(cfg.sampling_strategy, SamplingStrategy::OnChange);
+    }
+
+    #[test]
+    fn test_sampling_rate_clamped() {
+        let mut mc = HashMap::new();
+        mc.insert("sampling-rate".to_owned(), "5.0".to_owned());
+        let cfg = TelemetryConfig::from_module_config(&mc);
+        assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
+
+        mc.insert("sampling-rate".to_owned(), "-1.0".to_owned());
+        let cfg = TelemetryConfig::from_module_config(&mc);
+        assert!((cfg.sampling_rate - 0.0).abs() < f64::EPSILON);
     }
 }
