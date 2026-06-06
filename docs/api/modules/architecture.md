@@ -26,7 +26,7 @@ Classic layered architecture: presentation -> application -> domain <- infrastru
 | domain | `domain/**`, `model/**`, `entity/**`, `core/**` |
 | infrastructure | `infrastructure/**`, `infra/**`, `db/**`, `repository/**`, `adapter/**` |
 
-Rules: domain cannot import from infrastructure, presentation, or application. Application cannot import from presentation.
+Rules: domain cannot import from infrastructure, presentation, or application. Application cannot import from presentation. Infrastructure cannot import from presentation. Presentation cannot import from infrastructure (must go through application).
 
 ### `hexagonal`
 

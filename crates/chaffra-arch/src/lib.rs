@@ -18,6 +18,7 @@ use chaffra_parse::graph::ImportGraph;
 use chaffra_parse::parser;
 use chaffra_parse::symbols;
 use presets::ArchPreset;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Architecture analysis module.
@@ -52,7 +53,7 @@ const RULES: &[(&str, &str, &str, &str)] = &[
 ];
 
 /// A zone definition: name + glob patterns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
     /// Zone name (e.g. "domain", "infrastructure", "presentation").
     pub name: String,
@@ -61,7 +62,7 @@ pub struct Zone {
 }
 
 /// A dependency rule between zones.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyRule {
     /// Source zone.
     pub from: String,
@@ -72,7 +73,7 @@ pub struct DependencyRule {
 }
 
 /// Architecture configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchConfig {
     /// Zone definitions.
     pub zones: Vec<Zone>,
@@ -629,5 +630,70 @@ mod tests {
         assert!(matches_glob("domain/user.go", "domain/**"));
         assert!(matches_glob("infrastructure/db.go", "infrastructure/**"));
         assert!(!matches_glob("other/file.go", "domain/**"));
+    }
+
+    #[test]
+    fn test_layered_denies_presentation_to_infrastructure() {
+        let config = ArchConfig::from_preset("layered").unwrap();
+        assert!(
+            !is_dependency_allowed("presentation", "infrastructure", &config.rules),
+            "layered preset must deny presentation -> infrastructure"
+        );
+    }
+
+    #[test]
+    fn test_layered_fixture_catches_boundary_violation() {
+        let module = ArchModule::new();
+        let files = vec![
+            make_file(
+                "presentation/handler.go",
+                "package presentation\n\nimport \"infrastructure\"\n\ntype Handler struct{}\n",
+            ),
+            make_file(
+                "infrastructure/repo.go",
+                "package infrastructure\n\nimport \"domain\"\n\ntype UserRepo struct{}\n",
+            ),
+            make_file(
+                "domain/user.go",
+                "package domain\n\ntype User struct {\n\tID int\n\tName string\n}\n",
+            ),
+        ];
+        let mut config = HashMap::new();
+        config.insert("preset".to_owned(), "layered".to_owned());
+        let result = module.analyze(&files, &config).unwrap();
+        let violations: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "boundary-violation")
+            .collect();
+        assert!(
+            !violations.is_empty(),
+            "layered preset must flag presentation importing from infrastructure"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|f| f.location.file == "presentation/handler.go")
+        );
+    }
+
+    #[test]
+    fn test_layered_allows_valid_dependencies() {
+        let config = ArchConfig::from_preset("layered").unwrap();
+        assert!(is_dependency_allowed(
+            "presentation",
+            "application",
+            &config.rules
+        ));
+        assert!(is_dependency_allowed(
+            "application",
+            "domain",
+            &config.rules
+        ));
+        assert!(is_dependency_allowed(
+            "infrastructure",
+            "domain",
+            &config.rules
+        ));
     }
 }

@@ -118,6 +118,12 @@ fn layered_config() -> ArchConfig {
                 to: "presentation".to_owned(),
                 allow: false,
             },
+            // Presentation must not import from infrastructure directly.
+            DependencyRule {
+                from: "presentation".to_owned(),
+                to: "infrastructure".to_owned(),
+                allow: false,
+            },
         ],
     }
 }

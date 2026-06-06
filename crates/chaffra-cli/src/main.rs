@@ -313,9 +313,7 @@ fn cmd_dupes(
     module_config.insert("mode".to_owned(), mode.to_owned());
     module_config.insert("min-tokens".to_owned(), min_tokens.to_owned());
 
-    // Use the host's get() + analyze() but we need to inject config.
-    // The host.analyze() merges module_config from ChaffraConfig, so set it there.
-    let result = host.analyze("duplication", &files, config)?;
+    let result = host.analyze_with_config("duplication", &files, &module_config)?;
     if result.findings.is_empty() {
         return Ok("No duplicates found.\n".to_owned());
     }
@@ -337,7 +335,7 @@ fn cmd_boundaries(
     if let Some(p) = preset {
         module_config.insert("preset".to_owned(), p.to_owned());
     }
-    let result = host.analyze("architecture", &files, config)?;
+    let result = host.analyze_with_config("architecture", &files, &module_config)?;
     if result.findings.is_empty() {
         return Ok("No architecture violations found.\n".to_owned());
     }
