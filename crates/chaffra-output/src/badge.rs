@@ -201,6 +201,7 @@ mod tests {
                 files_analyzed: 1,
                 duration_ms: 10,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         };
         let health = ProjectHealth {
@@ -224,6 +225,7 @@ mod tests {
                 files_analyzed: 1,
                 duration_ms: 10,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         };
         let output = formatter.format_result(&result, None);

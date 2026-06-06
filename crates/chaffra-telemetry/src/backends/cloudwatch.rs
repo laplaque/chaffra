@@ -1,13 +1,13 @@
-//! AWS CloudWatch backend (behind `cloudwatch` feature flag).
+//! AWS CloudWatch payload backend (preview, behind `cloudwatch` feature flag).
 //!
-//! Uses AWS PutMetricData to push metrics. Requires the `cloudwatch` feature
-//! to avoid pulling in heavy AWS SDK dependencies by default.
+//! Generates PutMetricData-compatible JSON payloads. Does not perform network
+//! calls in this version — use `inspect` to preview payloads.
 
 use super::TelemetryBackend;
 use crate::collector::TelemetrySnapshot;
 use crate::error::{Result, TelemetryError};
 
-/// AWS CloudWatch metrics backend.
+/// AWS CloudWatch payload generator (preview — no network calls yet).
 #[derive(Debug)]
 pub struct CloudWatchBackend {
     namespace: String,
@@ -59,11 +59,10 @@ impl TelemetryBackend for CloudWatchBackend {
 
     fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
         let payload = self.build_payload(snapshot);
-        // In production this would call AWS SDK PutMetricData.
         let json = serde_json::to_string(&payload)
             .map_err(|e| TelemetryError::BackendError(format!("CloudWatch payload error: {e}")))?;
         eprintln!(
-            "[cloudwatch] would send {} bytes to namespace '{}'",
+            "[cloudwatch] preview: generated {} byte PutMetricData payload for namespace '{}' (network export not yet implemented)",
             json.len(),
             self.namespace
         );
@@ -73,7 +72,7 @@ impl TelemetryBackend for CloudWatchBackend {
     fn test_connection(&self) -> Result<String> {
         let region_str = self.region.as_deref().unwrap_or("default");
         Ok(format!(
-            "CloudWatch namespace '{}' (region: {region_str})",
+            "CloudWatch namespace '{}' (region: {region_str}) (preview mode — payload generation only, network export not yet implemented)",
             self.namespace
         ))
     }

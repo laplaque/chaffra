@@ -386,6 +386,7 @@ mod tests {
                 files_analyzed: 10,
                 duration_ms: 100,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         }
     }

@@ -398,6 +398,7 @@ impl AnalysisModule for AuditModule {
                     c.insert("total_baseline".to_owned(), report.total_baseline as u64);
                     c
                 },
+                ..Default::default()
             },
         })
     }

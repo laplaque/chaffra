@@ -164,6 +164,7 @@ mod tests {
                 files_analyzed: 1,
                 duration_ms: 10,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         };
         let health = ProjectHealth {

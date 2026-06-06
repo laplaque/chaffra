@@ -1,0 +1,17 @@
+{
+  "timestamp_ms": 1780707907809,
+  "definitions": {},
+  "data_points": [],
+  "spans": [],
+  "user_summary": {
+    "analysis_duration_ms": 0,
+    "files_total": 0,
+    "findings_by_severity": {},
+    "findings_by_module": {},
+    "module_summaries": {}
+  },
+  "operator_summary": {
+    "module_call_durations": {},
+    "module_error_counts": {}
+  }
+}

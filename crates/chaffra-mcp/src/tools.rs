@@ -21,7 +21,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "chaffra/telemetry".to_owned(),
-            description: "Query telemetry state: last run metrics, configured backends, connection status.".to_owned(),
+            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -167,6 +167,9 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
 }
 
 /// Execute the chaffra/telemetry tool.
+///
+/// Returns default configuration and backend info. Does not share state with
+/// a running analysis — use CLI `chaffra telemetry inspect` for live previews.
 pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
     let action = params
         .get("action")

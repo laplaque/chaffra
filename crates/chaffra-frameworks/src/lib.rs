@@ -155,6 +155,7 @@ impl AnalysisModule for FrameworksModule {
                     );
                     c
                 },
+                ..Default::default()
             },
         })
     }

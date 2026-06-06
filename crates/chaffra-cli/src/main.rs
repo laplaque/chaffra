@@ -1061,59 +1061,150 @@ fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
     }
 }
 
+fn run_with_telemetry<F>(
+    tel_config: &chaffra_telemetry::TelemetryConfig,
+    command_name: &str,
+    f: F,
+) -> Result<String>
+where
+    F: FnOnce() -> Result<String>,
+{
+    if matches!(
+        tel_config.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        return f();
+    }
+
+    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
+    collector.register_core_metrics();
+    let start = std::time::Instant::now();
+
+    let result = f();
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let failed = result.is_err();
+    collector.record_module_call(command_name, duration_ms, failed);
+
+    let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+    let snapshot = collector.snapshot();
+    for backend in &backends {
+        let _ = backend.flush(&snapshot);
+    }
+
+    result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_str_loose(&cli.format).unwrap_or(OutputFormat::Terminal);
     let formatter = create_formatter(format);
+    let tel_config = build_telemetry_config(&cli);
 
     match cli.command {
         Command::Health { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_health(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "health", || cmd_health(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::DeadCode { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_dead_code(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "dead-code", || cmd_dead_code(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Security { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_security(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "security", || cmd_security(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Audit { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_audit(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "audit", || cmd_audit(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Hotspot { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_hotspot(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "hotspot", || cmd_hotspot(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::AiQuality { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_ai_quality(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "ai-quality", || cmd_ai_quality(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::LlmDefense { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_llm_defense(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "llm-defense", || cmd_llm_defense(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::CicdSecurity { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            print!("{}", cmd_cicd_security(&root, &config, formatter.as_ref())?);
+            print!(
+                "{}",
+                run_with_telemetry(&tel_config, "cicd-security", || cmd_cicd_security(
+                    &root,
+                    &config,
+                    formatter.as_ref()
+                ))?
+            );
         }
 
         Command::Dupes { .. } => {
@@ -1241,28 +1332,25 @@ async fn main() -> Result<()> {
             print!("{}", cmd_workspaces(&root, format));
         }
 
-        Command::Telemetry { ref action } => {
-            let tel_config = build_telemetry_config(&cli);
-            match action {
-                TelemetryAction::Status => {
-                    print!("{}", cmd_telemetry_status(&tel_config));
-                }
-                TelemetryAction::Test => match cmd_telemetry_test(&tel_config) {
-                    Ok(output) => print!("{output}"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                },
-                TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
-                    Ok(output) => print!("{output}"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                },
+        Command::Telemetry { ref action } => match action {
+            TelemetryAction::Status => {
+                print!("{}", cmd_telemetry_status(&tel_config));
             }
-        }
+            TelemetryAction::Test => match cmd_telemetry_test(&tel_config) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            },
+            TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            },
+        },
     }
 
     Ok(())

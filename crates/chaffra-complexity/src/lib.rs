@@ -556,6 +556,7 @@ impl AnalysisModule for ComplexityModule {
                     c.insert("functions_analyzed".to_owned(), total_functions);
                     c
                 },
+                ..Default::default()
             },
         })
     }

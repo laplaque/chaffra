@@ -250,6 +250,7 @@ impl AnalysisModule for HotspotModule {
                     c.insert("hotspots_found".to_owned(), hotspots.len() as u64);
                     c
                 },
+                ..Default::default()
             },
         })
     }

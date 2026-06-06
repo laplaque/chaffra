@@ -149,6 +149,7 @@ impl AnalysisModule for TelemetryModule {
                 files_analyzed: 0,
                 duration_ms: 0,
                 counters: HashMap::new(),
+                ..Default::default()
             },
         })
     }

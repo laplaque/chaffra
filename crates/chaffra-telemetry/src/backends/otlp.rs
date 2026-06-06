@@ -1,14 +1,14 @@
-//! OTLP (OpenTelemetry Protocol) gRPC backend.
+//! OTLP (OpenTelemetry Protocol) payload backend (preview).
 //!
-//! Exports metrics via OTLP gRPC to any compatible collector (Grafana Agent,
-//! Jaeger, Datadog Agent, etc.). Uses a simple JSON-over-HTTP fallback if the
-//! tonic gRPC transport is not available.
+//! Generates OTLP-compliant JSON payloads for metrics. Does not perform
+//! network export in this version — use `inspect` to preview payloads for
+//! integration with external collectors.
 
 use super::TelemetryBackend;
 use crate::collector::TelemetrySnapshot;
 use crate::error::{Result, TelemetryError};
 
-/// OTLP gRPC exporter.
+/// OTLP payload generator (preview — no network export yet).
 #[derive(Debug)]
 pub struct OtlpBackend {
     endpoint: String,
@@ -79,12 +79,10 @@ impl TelemetryBackend for OtlpBackend {
 
     fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
         let payload = self.build_payload(snapshot);
-        // In production this would send via gRPC (tonic) or HTTP POST.
-        // For now we validate the payload can be serialized and log.
         let json = serde_json::to_string(&payload)
             .map_err(|e| TelemetryError::BackendError(format!("OTLP payload error: {e}")))?;
         eprintln!(
-            "[otlp] would export {} bytes to {}",
+            "[otlp] preview: generated {} byte OTLP payload for {} (network export not yet implemented)",
             json.len(),
             self.endpoint
         );
@@ -92,8 +90,10 @@ impl TelemetryBackend for OtlpBackend {
     }
 
     fn test_connection(&self) -> Result<String> {
-        // Real implementation would attempt a gRPC health check.
-        Ok(format!("OTLP endpoint configured: {}", self.endpoint))
+        Ok(format!(
+            "OTLP endpoint configured: {} (preview mode — payload generation only, network export not yet implemented)",
+            self.endpoint
+        ))
     }
 
     fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
