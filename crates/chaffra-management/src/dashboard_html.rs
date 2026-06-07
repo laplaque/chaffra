@@ -116,49 +116,154 @@ function renderTable(headers,rows){
   for(const r of rows)h+='<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>';
   return h+'</tbody></table>';
 }
+function hdr(t){return '<h4 style="margin:16px 0 8px;color:#8b949e">'+t+'</h4>';}
+function bar(pct,color){return '<div style="display:inline-block;width:80px;height:10px;background:#21262d;border-radius:3px;vertical-align:middle;margin-right:6px"><div style="width:'+Math.min(100,Math.max(0,pct))+'%;height:100%;background:'+(color||'#58a6ff')+';border-radius:3px"></div></div>';}
+function sevColor(s){return s==='error'?'#f85149':s==='warning'?'#d29922':'#8b949e';}
+function insight(text){return '<div style="margin:12px 0;padding:10px 12px;background:#0d1117;border-left:3px solid #58a6ff;border-radius:0 4px 4px 0;font-size:13px;color:#c9d1d9">'+text+'</div>';}
 async function showDetail(endpoint,title){
   el('detail-title').textContent=title;
   let html='';
   try{
-    const metrics=await fetchJSON('/metrics');
     if(endpoint==='/health'){
-      const health=await fetchJSON('/health');
-      html+='<h4 style="margin:12px 0 8px;color:#8b949e">Aggregate</h4>';
-      html+=renderTable(['Metric','Value'],[['Score',health.score!=null?health.score:'—'],['Grade',health.grade]]);
-      const hps=metrics.data_points.filter(p=>p.name.includes('.health_score'));
+      const[health,metrics,modules,findings]=await Promise.all([fetchJSON('/health'),fetchJSON('/metrics'),fetchJSON('/modules'),fetchJSON('/findings/summary')]);
+      const avg=health.score;
+      html+=hdr('Aggregate Health');
+      html+=renderTable(['Metric','Value'],[['Score',avg!=null?avg.toFixed(1):'—'],['Grade',health.grade]]);
+      const hps=metrics.data_points.filter(p=>p.name.includes('.health_score')).map(p=>{
+        const mid=p.name.replace('chaffra.module.','').replace('.health_score','');
+        const mod=modules.modules.find(m=>m.id===mid);
+        const fc=(findings.by_module||{})[mid]||0;
+        return {module:mid,score:p.value,findings:fc,duration:mod?mod.duration_ms:0,status:mod?mod.status:'—',delta:avg!=null?p.value-avg:0};
+      }).sort((a,b)=>a.score-b.score);
       if(hps.length){
-        html+='<h4 style="margin:16px 0 8px;color:#8b949e">Per-module Health Scores</h4>';
-        html+=renderTable(['Module','Score'],hps.map(p=>[p.labels.module||'—',p.value.toFixed(1)]));
+        html+=hdr('Per-module Health (sorted worst-first)');
+        html+=renderTable(['Module','Score','','Findings','Duration','Status'],hps.map(h=>{
+          const c=h.score>=80?'#3fb950':h.score>=60?'#d29922':'#f85149';
+          return [h.module,h.score.toFixed(1),bar(h.score,c),h.findings,h.duration+'ms','<span class="status-dot '+(h.status==='error'?'error':'ok')+'"></span>'+h.status];
+        }));
+        if(avg!=null){
+          const worst=hps[0];
+          html+=insight('Lowest contributor: <strong>'+worst.module+'</strong> at '+worst.score.toFixed(1)+' ('+(worst.delta>=0?'+':'')+worst.delta.toFixed(1)+' from average). '+(worst.findings>0?worst.findings+' finding(s) from this module.':'No findings from this module.'));
+        }
       }
-    }else if(endpoint==='/modules'){
-      const mods=await fetchJSON('/modules');
-      html+='<h4 style="margin:12px 0 8px;color:#8b949e">Module Details</h4>';
-      html+=renderTable(['Module','Status','Findings','Duration','Capabilities'],
-        (mods.modules||[]).map(m=>[m.id,m.status,m.finding_count,m.duration_ms+'ms',m.capabilities.join(', ')]));
-      const mdps=metrics.data_points.filter(p=>p.labels&&p.labels.module);
-      if(mdps.length){
-        html+='<h4 style="margin:16px 0 8px;color:#8b949e">Module Data Points</h4>';
-        html+=renderTable(['Metric','Module','Value'],mdps.map(p=>[p.name,p.labels.module,p.value]));
+      const errs=metrics.data_points.filter(p=>p.name==='chaffra.module.error_total');
+      if(errs.length){
+        html+=hdr('Module Errors');
+        html+=renderTable(['Module','Error Count'],errs.map(e=>[e.labels.module||'—',e.value]));
       }
     }else if(endpoint==='/findings/summary'){
-      const fs=await fetchJSON('/findings/summary');
-      html+='<h4 style="margin:12px 0 8px;color:#8b949e">By Module</h4>';
-      html+=renderTable(['Module','Count'],Object.entries(fs.by_module).map(([k,v])=>[k,v]));
-      html+='<h4 style="margin:16px 0 8px;color:#8b949e">By Severity</h4>';
-      html+=renderTable(['Severity','Count'],Object.entries(fs.by_severity).map(([k,v])=>[k,v]));
+      const[findings,metrics,modules]=await Promise.all([fetchJSON('/findings/summary'),fetchJSON('/metrics'),fetchJSON('/modules')]);
+      html+=hdr('Severity Breakdown');
+      const sevs=Object.entries(findings.by_severity).sort((a,b)=>b[1]-a[1]);
+      const maxSev=sevs.length?sevs[0][1]:1;
+      html+=renderTable(['Severity','Count',''],sevs.map(([s,c])=>[s,c,bar(c/maxSev*100,sevColor(s))]));
+      const bySev=metrics.data_points.filter(p=>p.name==='chaffra.analysis.findings_by_severity');
+      if(bySev.length){
+        html+=hdr('Module x Severity');
+        const mods=new Map();
+        for(const p of bySev){
+          const mid=p.labels.module||'—';
+          if(!mods.has(mid))mods.set(mid,{});
+          mods.get(mid)[p.labels.severity||'—']=p.value;
+        }
+        const allSevs=[...new Set(bySev.map(p=>p.labels.severity||'—'))].sort();
+        const rows=[];
+        for(const[mid,ss]of mods){
+          const mod=modules.modules.find(m=>m.id===mid);
+          const total=Object.values(ss).reduce((a,b)=>a+b,0);
+          rows.push({mid,ss,total,dur:mod?mod.duration_ms:0});
+        }
+        rows.sort((a,b)=>b.total-a.total);
+        html+=renderTable(['Module',...allSevs,'Total','Duration'],rows.map(r=>[r.mid,...allSevs.map(s=>(r.ss[s]||0).toString()),r.total,r.dur+'ms']));
+        if(rows.length){
+          const top=rows[0];
+          const topSev=Object.entries(top.ss).sort((a,b)=>b[1]-a[1])[0];
+          html+=insight('Highest concentration: <strong>'+top.mid+'</strong> with '+top.total+' finding(s). '+(topSev?'Most common severity: '+topSev[0]+' ('+topSev[1]+').':''));
+        }
+      }else{
+        html+=hdr('By Module');
+        const mods=Object.entries(findings.by_module).sort((a,b)=>b[1]-a[1]);
+        html+=renderTable(['Module','Findings'],mods.map(([k,v])=>[k,v]));
+      }
+    }else if(endpoint==='/modules'){
+      const[modules,metrics,findings]=await Promise.all([fetchJSON('/modules'),fetchJSON('/metrics'),fetchJSON('/findings/summary')]);
+      html+=hdr('Module Performance');
+      const totalDur=modules.modules.reduce((s,m)=>s+m.duration_ms,0)||1;
+      const sorted=[...modules.modules].sort((a,b)=>b.duration_ms-a.duration_ms);
+      html+=renderTable(['Module','Status','Duration','% of Total','Findings','Rate'],sorted.map(m=>{
+        const pct=(m.duration_ms/totalDur*100);
+        const rate=m.duration_ms>0?(m.finding_count/(m.duration_ms/1000)).toFixed(1)+'/s':'—';
+        return [m.id,'<span class="status-dot '+(m.status==='error'?'error':'ok')+'"></span>'+m.status,m.duration_ms+'ms',bar(pct)+(pct).toFixed(1)+'%',m.finding_count,rate];
+      }));
+      const modMetrics=new Map();
+      for(const p of metrics.data_points){
+        if(p.name.startsWith('chaffra.module.')&&!['chaffra.module.call_duration_ms','chaffra.module.error_total','chaffra.module.startup_duration_ms','chaffra.module.load_error_total'].includes(p.name)){
+          const parts=p.name.replace('chaffra.module.','').split('.');
+          if(parts.length>=2){
+            const mid=parts.slice(0,-1).join('.');
+            const key=parts[parts.length-1];
+            if(!modMetrics.has(mid))modMetrics.set(mid,{});
+            modMetrics.get(mid)[key]=p.value;
+          }
+        }
+      }
+      if(modMetrics.size){
+        html+=hdr('Module-specific Metrics');
+        for(const[mid,kv]of modMetrics){
+          html+='<div style="margin:8px 0 4px;font-size:13px;color:#58a6ff;font-weight:600">'+mid+'</div>';
+          html+=renderTable(['Metric','Value'],Object.entries(kv).map(([k,v])=>[k,typeof v==='number'?v.toFixed(2):v]));
+        }
+      }
+      const errMods=modules.modules.filter(m=>m.status==='error');
+      if(errMods.length){
+        html+=insight(errMods.length+' module(s) in error state: '+errMods.map(m=>'<strong>'+m.id+'</strong>').join(', ')+'.');
+      }
     }else if(endpoint==='/findings/churn'){
-      const ch=await fetchJSON('/findings/churn');
-      html+=renderTable(['Metric','Value'],[['New',ch.new_count],['Resolved',ch.resolved_count],['Unchanged',ch.unchanged_count],['Churn Rate',(ch.churn_rate*100).toFixed(1)+'%']]);
+      const[churn,findings]=await Promise.all([fetchJSON('/findings/churn'),fetchJSON('/findings/summary')]);
+      html+=hdr('Churn Summary');
+      html+=renderTable(['Metric','Value'],[['New findings',churn.new_count],['Resolved findings',churn.resolved_count],['Unchanged',churn.unchanged_count],['Churn rate',(churn.churn_rate*100).toFixed(1)+'%']]);
+      const net=churn.new_count-churn.resolved_count;
+      const total=findings.total||0;
+      let status,color;
+      if(net<0){status='Improving';color='#3fb950';}
+      else if(net===0){status='Stable';color='#8b949e';}
+      else{status='Degrading';color='#f85149';}
+      html+=hdr('Trend Analysis');
+      html+='<div style="margin:8px 0;font-size:24px;font-weight:700;color:'+color+'">'+status+'</div>';
+      html+=renderTable(['Metric','Value'],[
+        ['Net change (new - resolved)',(net>=0?'+':'')+net],
+        ['Total current findings',total],
+        ['Churn as % of total',total>0?((churn.new_count+churn.resolved_count)/total*100).toFixed(1)+'%':'—']
+      ]);
+      if(net>0)html+=insight(net+' more finding(s) introduced than resolved. '+churn.new_count+' new finding(s) against '+churn.unchanged_count+' unchanged — churn rate '+(churn.churn_rate*100).toFixed(1)+'%.');
+      else if(net<0)html+=insight(Math.abs(net)+' more finding(s) resolved than introduced. Codebase quality is improving.');
+      else html+=insight('Equal new and resolved findings. Codebase churn is stable.');
     }else if(endpoint==='/metrics'){
-      html+='<h4 style="margin:12px 0 8px;color:#8b949e">Backends</h4>';
-      html+=renderTable(['Name','Kind','Connected','Message'],
-        (metrics.backends||[]).map(b=>[b.name,b.kind,b.connected?'Yes':'No',b.message]));
-      html+='<h4 style="margin:16px 0 8px;color:#8b949e">All Data Points ('+metrics.data_points.length+')</h4>';
-      html+=renderTable(['Name','Value','Labels'],
-        metrics.data_points.map(p=>[p.name,p.value,Object.entries(p.labels).map(([k,v])=>k+'='+v).join(', ')||'—']));
+      const metrics=await fetchJSON('/metrics');
+      html+=hdr('Backend Status');
+      html+=renderTable(['Name','Kind','Status','Message'],(metrics.backends||[]).map(b=>[b.name,b.kind,'<span class="status-dot '+(b.connected?'ok':'error')+'"></span>'+(b.connected?'Connected':'Disconnected'),b.message]));
+      html+=hdr('Metric Coverage');
+      const grouped=new Map();
+      for(const p of metrics.data_points){
+        if(!grouped.has(p.name))grouped.set(p.name,{count:0,labels:new Set()});
+        const g=grouped.get(p.name);
+        g.count++;
+        for(const k of Object.keys(p.labels))g.labels.add(k);
+      }
+      html+=renderTable(['Metric Name','Data Points','Label Dimensions'],[...grouped.entries()].sort((a,b)=>b[1].count-a[1].count).map(([n,g])=>[n,g.count,[...g.labels].join(', ')||'none']));
+      html+=insight(metrics.data_points.length+' data point(s) across '+grouped.size+' distinct metric(s). '+(metrics.backends||[]).filter(b=>b.connected).length+' of '+(metrics.backends||[]).length+' backend(s) connected.');
     }else if(endpoint==='/config'){
-      const cfg=await fetchJSON('/config');
-      html+=renderTable(['Setting','Value'],[['Audience',cfg.audience],['Sampling Rate',cfg.sampling_rate],['Strategy',cfg.sampling_strategy],['Backends',cfg.backends.join(', ')||'—']]);
+      const[cfg,metrics]=await Promise.all([fetchJSON('/config'),fetchJSON('/metrics')]);
+      html+=hdr('Telemetry Configuration');
+      html+=renderTable(['Setting','Value'],[['Audience',cfg.audience],['Sampling Rate',cfg.sampling_rate],['Sampling Strategy',cfg.sampling_strategy],['Backends',cfg.backends.join(', ')||'—']]);
+      html+=hdr('Collection Summary');
+      const metricNames=new Set(metrics.data_points.map(p=>p.name));
+      html+=renderTable(['Metric','Value'],[
+        ['Active metrics',metricNames.size],
+        ['Total data points',metrics.data_points.length],
+        ['Connected backends',(metrics.backends||[]).filter(b=>b.connected).length+' / '+(metrics.backends||[]).length]
+      ]);
+      if(cfg.sampling_rate<1.0)html+=insight('Sampling rate is '+(cfg.sampling_rate*100).toFixed(0)+'% — operator metrics are emitted on ~1 in '+Math.round(1/cfg.sampling_rate)+' runs.');
     }else{
       const data=await fetchJSON(endpoint);
       html='<pre>'+JSON.stringify(data,null,2).replace(/</g,'&lt;')+'</pre>';
