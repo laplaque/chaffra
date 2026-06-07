@@ -23,8 +23,16 @@ pub struct Suppression {
 /// - `chaffra:ignore *` -- wildcard, suppress all rules
 pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
     let mut suppressions = Vec::new();
+    let mut in_multiline_string = false;
 
     for (idx, line) in source.lines().enumerate() {
+        let was_inside = in_multiline_string;
+        in_multiline_string = update_multiline_state(line, language, in_multiline_string);
+
+        if was_inside {
+            continue;
+        }
+
         if let Some((rest, text)) = find_suppression_in_line(line, language) {
             let rules = parse_suppression_rules(rest);
             suppressions.push(Suppression {
@@ -36,6 +44,114 @@ pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
     }
 
     suppressions
+}
+
+/// Update multiline string state after processing a line.
+///
+/// For slash-comment languages (Go, etc.): tracks backtick raw strings.
+/// For hash-comment languages (Python): tracks triple-quoted strings (`"""` and `'''`).
+///
+/// Returns `true` if we are inside a multiline string after this line.
+fn update_multiline_state(line: &str, language: Language, currently_inside: bool) -> bool {
+    if uses_slash_comments(language) {
+        update_multiline_state_backtick(line, currently_inside)
+    } else if uses_hash_comments(language) {
+        update_multiline_state_triple_quote(line, currently_inside)
+    } else {
+        currently_inside
+    }
+}
+
+/// Count backticks not inside double-quoted strings on this line.
+/// Each such backtick toggles the raw string state.
+fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> bool {
+    let bytes = line.as_bytes();
+    let mut in_double_quote = false;
+    let mut backtick_count: u32 = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if !currently_inside && !in_double_quote && bytes[i] == b'\\' {
+            // Skip escaped character (only relevant outside raw strings)
+            i += 2;
+            continue;
+        }
+        if !currently_inside || backtick_count % 2 != 0 {
+            // We're outside a raw string (or re-entered normal code on this line)
+            if bytes[i] == b'"' && !currently_inside {
+                in_double_quote = !in_double_quote;
+            } else if bytes[i] == b'`' && !in_double_quote {
+                backtick_count += 1;
+            }
+        } else {
+            // We're inside a raw string — only backtick matters
+            if bytes[i] == b'`' {
+                backtick_count += 1;
+            }
+        }
+        i += 1;
+    }
+
+    // Odd number of backtick toggles flips the state
+    if backtick_count % 2 != 0 {
+        !currently_inside
+    } else {
+        currently_inside
+    }
+}
+
+/// Track triple-quote state (`"""` and `'''`) for Python.
+/// Returns whether we're inside a multiline string after this line.
+fn update_multiline_state_triple_quote(line: &str, currently_inside: bool) -> bool {
+    let bytes = line.as_bytes();
+    let mut state = currently_inside;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if !state {
+            // Outside a multiline string — skip single-line strings and look for triple quotes
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if i + 2 < bytes.len()
+                && ((bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"')
+                    || (bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''))
+            {
+                state = true;
+                i += 3;
+                continue;
+            }
+            // Skip single-quoted or double-quoted string to avoid false triple-quote detection
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip closing quote
+                }
+                continue;
+            }
+        } else {
+            // Inside a multiline string — look for the closing triple quote
+            if i + 2 < bytes.len()
+                && ((bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"')
+                    || (bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''))
+            {
+                state = false;
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    state
 }
 
 /// Check whether the character at `pos` is inside a string literal.
@@ -345,6 +461,61 @@ mod tests {
         for (src, lang, desc) in cases {
             let suppressions = scan_suppressions(src, *lang);
             assert_eq!(suppressions.len(), 1, "should find suppression: {}", desc);
+        }
+    }
+
+    #[test]
+    fn test_suppression_inside_multiline_string_not_matched() {
+        struct Case {
+            src: &'static str,
+            lang: Language,
+            desc: &'static str,
+            expected_count: usize,
+        }
+
+        let cases = &[
+            Case {
+                src: "msg := `\n// chaffra:ignore *\n`\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go raw string spanning 3 lines — suppression inside should not match",
+                expected_count: 0,
+            },
+            Case {
+                src: "msg = \"\"\"\n# chaffra:ignore rule\n\"\"\"\ndef unused(): pass\n",
+                lang: Language::Python,
+                desc: "Python triple-double-quoted string — suppression inside should not match",
+                expected_count: 0,
+            },
+            Case {
+                src: "msg = '''\n# chaffra:ignore rule\n'''\ndef unused(): pass\n",
+                lang: Language::Python,
+                desc: "Python triple-single-quoted string — suppression inside should not match",
+                expected_count: 0,
+            },
+            Case {
+                src: "msg := `// chaffra:ignore *`\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go raw string open+close same line — already handled by is_inside_string_literal",
+                expected_count: 0,
+            },
+            Case {
+                src: "msg := `\nsome content\n`\n// chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: real suppression after multiline string closes should match",
+                expected_count: 1,
+            },
+        ];
+
+        for case in cases {
+            let suppressions = scan_suppressions(case.src, case.lang);
+            assert_eq!(
+                suppressions.len(),
+                case.expected_count,
+                "case '{}': expected {} suppressions, got {}",
+                case.desc,
+                case.expected_count,
+                suppressions.len()
+            );
         }
     }
 }
