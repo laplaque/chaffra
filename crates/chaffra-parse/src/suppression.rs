@@ -27,9 +27,22 @@ pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
 
     for (idx, line) in source.lines().enumerate() {
         let was_inside = in_multiline_string;
-        in_multiline_string = update_multiline_state(line, language, in_multiline_string);
+        let (new_state, close_pos) = update_multiline_state(line, language, in_multiline_string);
+        in_multiline_string = new_state;
 
         if was_inside {
+            if let Some(pos) = close_pos {
+                // Multiline string closed on this line — scan remainder
+                let remainder = &line[pos..];
+                if let Some((rest, text)) = find_suppression_in_line(remainder, language) {
+                    let rules = parse_suppression_rules(rest);
+                    suppressions.push(Suppression {
+                        line: idx as u32 + 1,
+                        rules,
+                        text,
+                    });
+                }
+            }
             continue;
         }
 
@@ -51,23 +64,31 @@ pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
 /// For slash-comment languages (Go, etc.): tracks backtick raw strings.
 /// For hash-comment languages (Python): tracks triple-quoted strings (`"""` and `'''`).
 ///
-/// Returns `true` if we are inside a multiline string after this line.
-fn update_multiline_state(line: &str, language: Language, currently_inside: bool) -> bool {
+/// Returns `(new_state, close_pos)` where `new_state` is whether we are inside a multiline
+/// string after this line, and `close_pos` is the byte index right after the first closing
+/// delimiter if the line started inside a multiline string and the string closed on this line.
+fn update_multiline_state(
+    line: &str,
+    language: Language,
+    currently_inside: bool,
+) -> (bool, Option<usize>) {
     if uses_slash_comments(language) {
         update_multiline_state_backtick(line, currently_inside)
-    } else if uses_hash_comments(language) {
-        update_multiline_state_triple_quote(line, currently_inside)
     } else {
-        currently_inside
+        update_multiline_state_triple_quote(line, currently_inside)
     }
 }
 
 /// Count backticks not inside double-quoted strings on this line.
 /// Each such backtick toggles the raw string state.
-fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> bool {
+///
+/// Returns `(new_state, close_pos)` where `close_pos` is the byte index right after
+/// the first closing backtick if `currently_inside` was true and the string closed.
+fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> (bool, Option<usize>) {
     let bytes = line.as_bytes();
     let mut in_double_quote = false;
     let mut backtick_count: u32 = 0;
+    let mut first_close_pos: Option<usize> = None;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -87,24 +108,43 @@ fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> bool {
             // We're inside a raw string — only backtick matters
             if bytes[i] == b'`' {
                 backtick_count += 1;
+                if currently_inside && first_close_pos.is_none() {
+                    // This is the first backtick that closes the multiline string
+                    first_close_pos = Some(i + 1);
+                }
             }
         }
         i += 1;
     }
 
     // Odd number of backtick toggles flips the state
-    if backtick_count % 2 != 0 {
+    let new_state = if backtick_count % 2 != 0 {
         !currently_inside
     } else {
         currently_inside
-    }
+    };
+
+    // Only report close_pos if we actually started inside
+    let close_pos = if currently_inside && backtick_count > 0 {
+        first_close_pos
+    } else {
+        None
+    };
+
+    (new_state, close_pos)
 }
 
 /// Track triple-quote state (`"""` and `'''`) for Python.
-/// Returns whether we're inside a multiline string after this line.
-fn update_multiline_state_triple_quote(line: &str, currently_inside: bool) -> bool {
+///
+/// Returns `(new_state, close_pos)` where `close_pos` is the byte index right after
+/// the first closing triple-quote if `currently_inside` was true and the string closed.
+fn update_multiline_state_triple_quote(
+    line: &str,
+    currently_inside: bool,
+) -> (bool, Option<usize>) {
     let bytes = line.as_bytes();
     let mut state = currently_inside;
+    let mut first_close_pos: Option<usize> = None;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -144,6 +184,9 @@ fn update_multiline_state_triple_quote(line: &str, currently_inside: bool) -> bo
                     || (bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''))
             {
                 state = false;
+                if currently_inside && first_close_pos.is_none() {
+                    first_close_pos = Some(i + 3);
+                }
                 i += 3;
                 continue;
             }
@@ -151,7 +194,14 @@ fn update_multiline_state_triple_quote(line: &str, currently_inside: bool) -> bo
         i += 1;
     }
 
-    state
+    // Only report close_pos if we actually started inside
+    let close_pos = if currently_inside {
+        first_close_pos
+    } else {
+        None
+    };
+
+    (state, close_pos)
 }
 
 /// Check whether the character at `pos` is inside a string literal.
@@ -509,6 +559,18 @@ mod tests {
                 lang: Language::Python,
                 desc: "Python: escaped chars in strings before triple-quote — no false suppression",
                 expected_count: 0,
+            },
+            Case {
+                src: "msg := `\nsome content\n` // chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: closing backtick with trailing suppression on same line",
+                expected_count: 1,
+            },
+            Case {
+                src: "msg = \"\"\"\nsome content\n\"\"\" # chaffra:ignore rule\ndef unused(): pass\n",
+                lang: Language::Python,
+                desc: "Python: closing triple-quote with trailing suppression on same line",
+                expected_count: 1,
             },
         ];
 
