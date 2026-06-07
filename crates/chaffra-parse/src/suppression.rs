@@ -92,8 +92,11 @@ fn update_multiline_state(
     }
 }
 
-/// Count backticks not inside double-quoted strings on this line.
-/// Each such backtick toggles the raw string state.
+/// Track backtick raw string state across a single line.
+///
+/// Uses a `in_raw` boolean that reflects the actual current state at each byte,
+/// toggling on each unquoted backtick. Double-quote tracking works correctly
+/// in suffixes after a raw string closes.
 ///
 /// Returns `(new_state, close_pos)` where `close_pos` is the byte index right after
 /// the first closing backtick if we started inside a raw string and it closed.
@@ -103,50 +106,43 @@ fn update_multiline_state_backtick(
 ) -> (MultilineState, Option<usize>) {
     let currently_inside = state == MultilineState::InBacktick;
     let bytes = line.as_bytes();
+    let mut in_raw = currently_inside;
     let mut in_double_quote = false;
-    let mut backtick_count: u32 = 0;
     let mut first_close_pos: Option<usize> = None;
     let mut i = 0;
 
     while i < bytes.len() {
-        if !currently_inside && !in_double_quote && bytes[i] == b'\\' {
+        if !in_raw && !in_double_quote && bytes[i] == b'\\' {
             // Skip escaped character (only relevant outside raw strings)
             i += 2;
             continue;
         }
-        if !currently_inside || backtick_count % 2 != 0 {
-            // We're outside a raw string (or re-entered normal code on this line)
-            if bytes[i] == b'"' && !currently_inside {
-                in_double_quote = !in_double_quote;
-            } else if bytes[i] == b'`' && !in_double_quote {
-                backtick_count += 1;
-            }
-        } else {
-            // We're inside a raw string — only backtick matters
+        if in_raw {
+            // Inside a raw string — only backtick exits
             if bytes[i] == b'`' {
-                backtick_count += 1;
+                in_raw = false;
                 if currently_inside && first_close_pos.is_none() {
-                    // This is the first backtick that closes the multiline string
                     first_close_pos = Some(i + 1);
                 }
+            }
+        } else {
+            // Normal code — track double quotes and backticks
+            if bytes[i] == b'"' {
+                in_double_quote = !in_double_quote;
+            } else if bytes[i] == b'`' && !in_double_quote {
+                in_raw = true;
             }
         }
         i += 1;
     }
 
-    // Odd number of backtick toggles flips the state
-    let new_state = if backtick_count % 2 != 0 {
-        if currently_inside {
-            MultilineState::None
-        } else {
-            MultilineState::InBacktick
-        }
+    let new_state = if in_raw {
+        MultilineState::InBacktick
     } else {
-        state
+        MultilineState::None
     };
 
-    // Only report close_pos if we actually started inside
-    let close_pos = if currently_inside && backtick_count > 0 {
+    let close_pos = if currently_inside {
         first_close_pos
     } else {
         None
@@ -693,6 +689,12 @@ mod tests {
                 lang: Language::Python,
                 desc: "Python: \"\"\" inside ''' does not close the string — no false suppression",
                 expected_count: 0,
+            },
+            Case {
+                src: "msg := `\nraw content\n` ; x := fmt.Println(\"`\") \n// chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: backtick inside double-quoted string after raw string close does not corrupt state",
+                expected_count: 1,
             },
         ];
 
