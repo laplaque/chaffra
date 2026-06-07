@@ -244,4 +244,19 @@ mod tests {
             "should not detect suppression inside a single-quoted Python string"
         );
     }
+
+    #[test]
+    fn test_is_line_suppressed_convenience() {
+        let src = "package main\n// chaffra:ignore dead-code\nfunc unused() {}\n";
+        assert!(is_line_suppressed(src, 3, "dead-code", Language::Go));
+        assert!(!is_line_suppressed(src, 3, "complexity", Language::Go));
+        assert!(!is_line_suppressed(src, 1, "dead-code", Language::Go));
+    }
+
+    #[test]
+    fn test_escaped_quote_does_not_break_string_detection() {
+        let src = "x := fmt.Sprintf(\"val=\\\"%s\\\"\" ) // chaffra:ignore dead-code\n";
+        let suppressions = scan_suppressions(src, Language::Go);
+        assert_eq!(suppressions.len(), 1);
+    }
 }
