@@ -504,6 +504,12 @@ mod tests {
                 desc: "Go: real suppression after multiline string closes should match",
                 expected_count: 1,
             },
+            Case {
+                src: "x = \"has\\\"quote\"\ny = \\\n\"\"\"\n# chaffra:ignore rule\n\"\"\"\ndef real(): pass\n",
+                lang: Language::Python,
+                desc: "Python: escaped chars in strings before triple-quote — no false suppression",
+                expected_count: 0,
+            },
         ];
 
         for case in cases {
