@@ -1243,15 +1243,31 @@ mod tests {
 
     #[test]
     fn test_find_llm_response_vars_requires_both_conditions() {
-        // Name alone is not enough
-        let lines = vec!["result = some_function()"];
-        let vars = find_llm_response_vars(&lines, Language::Python);
-        assert!(!vars.contains("result"));
-
-        // LLM call alone without LLM-like name is not enough
-        let lines = vec!["data = client.chat.completions.create(messages=[])"];
-        let vars = find_llm_response_vars(&lines, Language::Python);
-        assert!(!vars.contains("data"));
+        let cases: &[(&[&str], &str, bool, &str)] = &[
+            (
+                &["result = some_function()"],
+                "result",
+                false,
+                "LLM-like name without LLM call",
+            ),
+            (
+                &["data = client.chat.completions.create(messages=[])"],
+                "data",
+                false,
+                "LLM call without LLM-like name",
+            ),
+            (
+                &["response = client.chat.completions.create(messages=[])"],
+                "response",
+                true,
+                "both LLM name and LLM call",
+            ),
+        ];
+        for (lines, var, expected, desc) in cases {
+            let lines_owned: Vec<&str> = lines.to_vec();
+            let vars = find_llm_response_vars(&lines_owned, Language::Python);
+            assert_eq!(vars.contains(*var), *expected, "{}", desc);
+        }
     }
 
     #[test]

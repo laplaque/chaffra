@@ -21,11 +21,11 @@ pub struct Suppression {
 /// - `// chaffra:ignore unused-function,unused-type` -- suppress specific rules
 /// - `code // chaffra:ignore rule` -- inline suppression on the same line
 /// - `chaffra:ignore *` -- wildcard, suppress all rules
-pub fn scan_suppressions(source: &str, _language: Language) -> Vec<Suppression> {
+pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
     let mut suppressions = Vec::new();
 
     for (idx, line) in source.lines().enumerate() {
-        if let Some((rest, text)) = find_suppression_in_line(line) {
+        if let Some((rest, text)) = find_suppression_in_line(line, language) {
             let rules = parse_suppression_rules(rest);
             suppressions.push(Suppression {
                 line: idx as u32 + 1,
@@ -65,24 +65,48 @@ fn is_inside_string_literal(line: &str, pos: usize) -> bool {
     double_quotes % 2 != 0 || single_quotes % 2 != 0
 }
 
-fn find_suppression_in_line(line: &str) -> Option<(&str, String)> {
+/// Returns `true` if the language uses `//` as a comment marker.
+fn uses_slash_comments(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Go
+            | Language::Rust
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Java
+            | Language::CSharp
+            | Language::Dart
+            | Language::Php
+    )
+}
+
+/// Returns `true` if the language uses `#` as a comment marker.
+fn uses_hash_comments(language: Language) -> bool {
+    matches!(language, Language::Python | Language::Php)
+}
+
+fn find_suppression_in_line(line: &str, language: Language) -> Option<(&str, String)> {
     const MARKER: &str = "chaffra:ignore";
 
-    if let Some(comment_start) = line.find("//") {
-        if !is_inside_string_literal(line, comment_start) {
-            let comment = &line[comment_start..];
-            if let Some(pos) = comment.find(MARKER) {
-                let rest = &comment[pos + MARKER.len()..];
-                return Some((rest, comment.trim().to_owned()));
+    if uses_slash_comments(language) {
+        if let Some(comment_start) = line.find("//") {
+            if !is_inside_string_literal(line, comment_start) {
+                let comment = &line[comment_start..];
+                if let Some(pos) = comment.find(MARKER) {
+                    let rest = &comment[pos + MARKER.len()..];
+                    return Some((rest, comment.trim().to_owned()));
+                }
             }
         }
     }
-    if let Some(comment_start) = line.find('#') {
-        if !is_inside_string_literal(line, comment_start) {
-            let comment = &line[comment_start..];
-            if let Some(pos) = comment.find(MARKER) {
-                let rest = &comment[pos + MARKER.len()..];
-                return Some((rest, comment.trim().to_owned()));
+    if uses_hash_comments(language) {
+        if let Some(comment_start) = line.find('#') {
+            if !is_inside_string_literal(line, comment_start) {
+                let comment = &line[comment_start..];
+                if let Some(pos) = comment.find(MARKER) {
+                    let rest = &comment[pos + MARKER.len()..];
+                    return Some((rest, comment.trim().to_owned()));
+                }
             }
         }
     }
@@ -209,39 +233,55 @@ mod tests {
 
     #[test]
     fn test_suppression_in_string_literal_not_matched() {
-        // Go: // inside a string literal should not be treated as a comment
-        let src = "fmt.Println(\"// chaffra:ignore *\")\n";
+        let cases: &[(&str, Language, &str)] = &[
+            (
+                "fmt.Println(\"// chaffra:ignore *\")\n",
+                Language::Go,
+                "Go string with //",
+            ),
+            (
+                "let s = \"// chaffra:ignore *\";\n",
+                Language::Go,
+                "Go let string",
+            ),
+            (
+                "x = \"# chaffra:ignore rule\"\n",
+                Language::Python,
+                "Python double-quoted string",
+            ),
+            (
+                "x = '# chaffra:ignore rule'\n",
+                Language::Python,
+                "Python single-quoted string",
+            ),
+        ];
+        for (src, lang, desc) in cases {
+            let suppressions = scan_suppressions(src, *lang);
+            assert!(
+                suppressions.is_empty(),
+                "should not detect suppression: {}",
+                desc
+            );
+        }
+    }
+
+    #[test]
+    fn test_hash_marker_not_suppression_in_go() {
+        let src = "x := 1 # chaffra:ignore dead-code\n";
         let suppressions = scan_suppressions(src, Language::Go);
         assert!(
             suppressions.is_empty(),
-            "should not detect suppression inside a string literal"
-        );
-
-        // Rust/Go style with let
-        let src2 = "let s = \"// chaffra:ignore *\";\n";
-        let suppressions2 = scan_suppressions(src2, Language::Go);
-        assert!(
-            suppressions2.is_empty(),
-            "should not detect suppression inside a string literal (let)"
+            "hash marker should not be recognized as a comment in Go"
         );
     }
 
     #[test]
-    fn test_suppression_in_python_string_not_matched() {
-        // Python: # inside a string literal should not be treated as a comment
-        let src = "x = \"# chaffra:ignore rule\"\n";
+    fn test_slash_marker_not_suppression_in_python() {
+        let src = "x = 1 // chaffra:ignore dead-code\n";
         let suppressions = scan_suppressions(src, Language::Python);
         assert!(
             suppressions.is_empty(),
-            "should not detect suppression inside a Python string literal"
-        );
-
-        // Single-quoted Python string
-        let src2 = "x = '# chaffra:ignore rule'\n";
-        let suppressions2 = scan_suppressions(src2, Language::Python);
-        assert!(
-            suppressions2.is_empty(),
-            "should not detect suppression inside a single-quoted Python string"
+            "slash marker should not be recognized as a comment in Python"
         );
     }
 
