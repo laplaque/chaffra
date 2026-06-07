@@ -32,6 +32,8 @@ pub struct BackendStatusEntry {
 pub struct MetricsHistoryResponse {
     pub window: String,
     pub snapshots: Vec<serde_json::Value>,
+    pub status: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,6 +135,8 @@ pub async fn get_metrics_history(
     Json(MetricsHistoryResponse {
         window: query.window,
         snapshots: Vec::new(),
+        status: "not_implemented".to_owned(),
+        message: "Time-series history requires the streaming/watch mode integration. This endpoint will return snapshots once co-located mode is available.".to_owned(),
     })
 }
 

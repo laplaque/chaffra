@@ -260,5 +260,8 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["window"], "7d");
+        assert_eq!(parsed["status"], "not_implemented");
+        assert!(parsed["message"].as_str().unwrap().contains("co-located"));
+        assert!(parsed["snapshots"].as_array().unwrap().is_empty());
     }
 }

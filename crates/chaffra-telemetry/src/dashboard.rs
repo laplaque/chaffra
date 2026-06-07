@@ -25,6 +25,32 @@ pub fn generate_dashboard() -> Value {
                 "current": {},
                 "hide": 0,
             },
+            {
+                "name": "module",
+                "type": "query",
+                "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+                "query": format!("label_values({PROM_FINDINGS_TOTAL}, module)"),
+                "refresh": 2,
+                "includeAll": true,
+                "multi": true,
+                "allValue": ".*",
+                "current": { "selected": true, "text": "All", "value": "$__all" },
+                "hide": 0,
+                "sort": 1,
+            },
+            {
+                "name": "severity",
+                "type": "query",
+                "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+                "query": format!("label_values({PROM_FINDINGS_BY_SEVERITY}, severity)"),
+                "refresh": 2,
+                "includeAll": true,
+                "multi": true,
+                "allValue": ".*",
+                "current": { "selected": true, "text": "All", "value": "$__all" },
+                "hide": 0,
+                "sort": 1,
+            },
         ]
     });
 
@@ -36,9 +62,10 @@ pub fn generate_dashboard() -> Value {
         row_panel(4, "Per-module Detail", 21),
         module_call_duration_panel(5, &ds, 22),
         module_finding_breakdown_panel(6, &ds, 30),
-        row_panel(7, "Operational", 38),
-        error_rate_panel(8, &ds, 39),
-        startup_time_panel(9, &ds, 47),
+        per_module_repeated_row(7, &ds, 38),
+        row_panel(8, "Operational", 51),
+        error_rate_panel(9, &ds, 52),
+        startup_time_panel(10, &ds, 60),
     ];
 
     json!({
@@ -55,7 +82,16 @@ pub fn generate_dashboard() -> Value {
         "fiscalYearStartMonth": 0,
         "graphTooltip": 1,
         "id": Value::Null,
-        "links": [],
+        "links": [
+            {
+                "title": "Module Detail",
+                "type": "link",
+                "icon": "dashboard",
+                "tooltip": "Drill into a specific module",
+                "url": "/d/${__dashboard.uid}?var-module=${__data.fields.module}&from=${__from}&to=${__to}",
+                "targetBlank": false,
+            }
+        ],
         "panels": panels,
         "schemaVersion": 39,
         "tags": ["chaffra", "codebase-intelligence"],
@@ -101,6 +137,11 @@ fn health_score_trend_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
                     ]
                 },
                 "unit": "percent",
+                "links": [{
+                    "title": "Drill into ${__field.labels.module}",
+                    "url": "/d/${__dashboard.uid}?var-module=${__field.labels.module}&from=${__from}&to=${__to}",
+                    "targetBlank": false,
+                }],
             },
             "overrides": [],
         },
@@ -119,9 +160,19 @@ fn finding_count_by_module_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "title": "Finding Count by Module",
         "datasource": ds,
         "gridPos": { "h": 8, "w": 12, "x": 12, "y": grid_y },
-        "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+        "fieldConfig": {
+            "defaults": {
+                "unit": "short",
+                "links": [{
+                    "title": "Filter to ${__field.labels.module}",
+                    "url": "/d/${__dashboard.uid}?var-module=${__field.labels.module}&from=${__from}&to=${__to}",
+                    "targetBlank": false,
+                }],
+            },
+            "overrides": [],
+        },
         "targets": [{
-            "expr": format!("{PROM_FINDINGS_TOTAL}"),
+            "expr": format!("{PROM_FINDINGS_TOTAL}{{module=~\"$module\"}}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -162,9 +213,19 @@ fn module_call_duration_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "title": "Module Call Duration",
         "datasource": ds,
         "gridPos": { "h": 8, "w": 12, "x": 0, "y": grid_y },
-        "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+        "fieldConfig": {
+            "defaults": {
+                "unit": "ms",
+                "links": [{
+                    "title": "Drill into ${__field.labels.module}",
+                    "url": "/d/${__dashboard.uid}?var-module=${__field.labels.module}&from=${__from}&to=${__to}",
+                    "targetBlank": false,
+                }],
+            },
+            "overrides": [],
+        },
         "targets": [{
-            "expr": format!("{PROM_MODULE_CALL_DURATION}"),
+            "expr": format!("{PROM_MODULE_CALL_DURATION}{{module=~\"$module\"}}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -179,7 +240,14 @@ fn module_finding_breakdown_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
         "datasource": ds,
         "gridPos": { "h": 8, "w": 12, "x": 12, "y": grid_y },
         "fieldConfig": {
-            "defaults": { "unit": "short" },
+            "defaults": {
+                "unit": "short",
+                "links": [{
+                    "title": "Filter to ${__field.name} severity",
+                    "url": "/d/${__dashboard.uid}?var-severity=${__field.name}&from=${__from}&to=${__to}",
+                    "targetBlank": false,
+                }],
+            },
             "overrides": [
                 { "matcher": { "id": "byName", "options": "error" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
                 { "matcher": { "id": "byName", "options": "warning" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
@@ -187,7 +255,7 @@ fn module_finding_breakdown_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
             ],
         },
         "targets": [{
-            "expr": format!("sum by (severity) ({PROM_FINDINGS_BY_SEVERITY})"),
+            "expr": format!("sum by (severity) ({PROM_FINDINGS_BY_SEVERITY}{{module=~\"$module\",severity=~\"$severity\"}})"),
             "legendFormat": "{{severity}}",
             "refId": "A",
         }],
@@ -211,11 +279,16 @@ fn error_rate_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
                         { "color": "red", "value": 1 },
                     ]
                 },
+                "links": [{
+                    "title": "Drill into ${__field.labels.module} errors",
+                    "url": "/d/${__dashboard.uid}?var-module=${__field.labels.module}&from=${__from}&to=${__to}",
+                    "targetBlank": false,
+                }],
             },
             "overrides": [],
         },
         "targets": [{
-            "expr": format!("{PROM_MODULE_ERROR_TOTAL}"),
+            "expr": format!("{PROM_MODULE_ERROR_TOTAL}{{module=~\"$module\"}}"),
             "legendFormat": "{{module}}",
             "refId": "A",
         }],
@@ -237,9 +310,99 @@ fn startup_time_panel(id: u32, ds: &Value, grid_y: u32) -> Value {
                 "refId": "A",
             },
             {
-                "expr": format!("{PROM_MODULE_STARTUP}"),
+                "expr": format!("{PROM_MODULE_STARTUP}{{module=~\"$module\"}}"),
                 "legendFormat": "{{module}}",
                 "refId": "B",
+            },
+        ],
+    })
+}
+
+fn per_module_repeated_row(id: u32, ds: &Value, grid_y: u32) -> Value {
+    json!({
+        "id": id,
+        "type": "row",
+        "title": "Module: $module",
+        "collapsed": true,
+        "repeat": "module",
+        "repeatDirection": "h",
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": grid_y },
+        "panels": [
+            {
+                "id": id + 100,
+                "type": "stat",
+                "title": "Health Score",
+                "datasource": ds,
+                "gridPos": { "h": 4, "w": 6, "x": 0, "y": grid_y + 1 },
+                "fieldConfig": {
+                    "defaults": { "unit": "percent", "min": 0, "max": 100,
+                        "thresholds": { "mode": "absolute", "steps": [
+                            { "color": "red", "value": null },
+                            { "color": "yellow", "value": 60 },
+                            { "color": "green", "value": 80 },
+                        ]}
+                    }, "overrides": [],
+                },
+                "targets": [{ "expr": "{__name__=~\"chaffra_module_${module:raw}_health_score\"}", "refId": "A" }],
+            },
+            {
+                "id": id + 101,
+                "type": "stat",
+                "title": "Findings",
+                "datasource": ds,
+                "gridPos": { "h": 4, "w": 6, "x": 6, "y": grid_y + 1 },
+                "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+                "targets": [{ "expr": format!("{PROM_FINDINGS_TOTAL}{{module=\"$module\"}}"), "refId": "A" }],
+            },
+            {
+                "id": id + 102,
+                "type": "stat",
+                "title": "Call Duration",
+                "datasource": ds,
+                "gridPos": { "h": 4, "w": 6, "x": 12, "y": grid_y + 1 },
+                "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+                "targets": [{ "expr": format!("{PROM_MODULE_CALL_DURATION}{{module=\"$module\"}}"), "refId": "A" }],
+            },
+            {
+                "id": id + 103,
+                "type": "stat",
+                "title": "Errors",
+                "datasource": ds,
+                "gridPos": { "h": 4, "w": 6, "x": 18, "y": grid_y + 1 },
+                "fieldConfig": {
+                    "defaults": { "unit": "short",
+                        "thresholds": { "mode": "absolute", "steps": [
+                            { "color": "green", "value": null },
+                            { "color": "red", "value": 1 },
+                        ]}
+                    }, "overrides": [],
+                },
+                "targets": [{ "expr": format!("{PROM_MODULE_ERROR_TOTAL}{{module=\"$module\"}}"), "refId": "A" }],
+            },
+            {
+                "id": id + 104,
+                "type": "piechart",
+                "title": "Findings by Severity",
+                "datasource": ds,
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": grid_y + 5 },
+                "fieldConfig": {
+                    "defaults": { "unit": "short" },
+                    "overrides": [
+                        { "matcher": { "id": "byName", "options": "error" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+                        { "matcher": { "id": "byName", "options": "warning" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+                        { "matcher": { "id": "byName", "options": "info" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+                    ],
+                },
+                "targets": [{ "expr": format!("sum by (severity) ({PROM_FINDINGS_BY_SEVERITY}{{module=\"$module\"}})"), "legendFormat": "{{severity}}", "refId": "A" }],
+            },
+            {
+                "id": id + 105,
+                "type": "timeseries",
+                "title": "Call Duration Over Time",
+                "datasource": ds,
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": grid_y + 5 },
+                "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+                "targets": [{ "expr": format!("{PROM_MODULE_CALL_DURATION}{{module=\"$module\"}}"), "legendFormat": "duration", "refId": "A" }],
             },
         ],
     })
@@ -256,13 +419,14 @@ mod tests {
         assert_eq!(dashboard["schemaVersion"], 39);
 
         let panels = dashboard["panels"].as_array().unwrap();
-        assert_eq!(panels.len(), 10);
+        assert_eq!(panels.len(), 11);
 
         let rows: Vec<_> = panels.iter().filter(|p| p["type"] == "row").collect();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0]["title"], "Overview");
         assert_eq!(rows[1]["title"], "Per-module Detail");
-        assert_eq!(rows[2]["title"], "Operational");
+        assert_eq!(rows[2]["title"], "Module: $module");
+        assert_eq!(rows[3]["title"], "Operational");
 
         let template_vars = dashboard["templating"]["list"].as_array().unwrap();
         let var_names: Vec<&str> = template_vars
@@ -270,7 +434,9 @@ mod tests {
             .filter_map(|v| v["name"].as_str())
             .collect();
         assert!(var_names.contains(&"DS_PROMETHEUS"));
-        assert_eq!(var_names.len(), 1);
+        assert!(var_names.contains(&"module"));
+        assert!(var_names.contains(&"severity"));
+        assert_eq!(var_names.len(), 3);
     }
 
     #[test]
@@ -293,6 +459,92 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&dashboard).unwrap();
         let reparsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(dashboard, reparsed);
+    }
+
+    #[test]
+    fn test_dashboard_has_interactive_drilldowns() {
+        let dashboard = generate_dashboard();
+        let json_str = serde_json::to_string(&dashboard).unwrap();
+
+        assert!(
+            json_str.contains("\"repeat\":\"module\""),
+            "dashboard should have a repeated row for per-module drilldown"
+        );
+
+        assert!(
+            json_str.contains("\"links\""),
+            "dashboard should have data links for drilldown navigation"
+        );
+
+        assert!(
+            json_str.contains("${__field.labels.module}"),
+            "data links should reference module label for drill-through"
+        );
+
+        let links = dashboard["links"].as_array().unwrap();
+        assert!(
+            !links.is_empty(),
+            "dashboard should have top-level navigation links"
+        );
+
+        let template_vars = dashboard["templating"]["list"].as_array().unwrap();
+        let module_var = template_vars
+            .iter()
+            .find(|v| v["name"] == "module")
+            .unwrap();
+        assert_eq!(module_var["type"], "query");
+        assert_eq!(module_var["includeAll"], true);
+        assert_eq!(module_var["multi"], true);
+
+        let severity_var = template_vars
+            .iter()
+            .find(|v| v["name"] == "severity")
+            .unwrap();
+        assert_eq!(severity_var["type"], "query");
+        assert_eq!(severity_var["includeAll"], true);
+        assert_eq!(severity_var["multi"], true);
+    }
+
+    #[test]
+    fn test_dashboard_repeated_row_has_module_panels() {
+        let dashboard = generate_dashboard();
+        let panels = dashboard["panels"].as_array().unwrap();
+        let repeated_row = panels
+            .iter()
+            .find(|p| p["repeat"] == "module")
+            .expect("should have a repeated module row");
+
+        let inner_panels = repeated_row["panels"].as_array().unwrap();
+        assert!(
+            inner_panels.len() >= 4,
+            "repeated row should have stat panels for health, findings, duration, errors"
+        );
+
+        let inner_titles: Vec<&str> = inner_panels
+            .iter()
+            .filter_map(|p| p["title"].as_str())
+            .collect();
+        assert!(inner_titles.contains(&"Health Score"));
+        assert!(inner_titles.contains(&"Findings"));
+        assert!(inner_titles.contains(&"Call Duration"));
+        assert!(inner_titles.contains(&"Errors"));
+        assert!(inner_titles.contains(&"Findings by Severity"));
+        assert!(inner_titles.contains(&"Call Duration Over Time"));
+    }
+
+    #[test]
+    fn test_dashboard_panels_use_variable_selectors() {
+        let dashboard = generate_dashboard();
+        let json_str = serde_json::to_string(&dashboard).unwrap();
+
+        assert!(
+            json_str.contains("module=~\\\"$module\\\""),
+            "panels should filter by $module variable"
+        );
+        assert!(
+            json_str.contains("severity=~\\\"$severity\\\""),
+            "severity panel should filter by $severity variable"
+        );
     }
 
     #[test]
@@ -361,22 +613,34 @@ mod tests {
 
         let mut query_metrics = Vec::new();
         let mut has_health_regex_query = false;
-        for panel in panels {
+
+        fn extract_targets(panel: &Value, query_metrics: &mut Vec<String>, has_health: &mut bool) {
             if let Some(targets) = panel["targets"].as_array() {
                 for target in targets {
                     if let Some(expr) = target["expr"].as_str() {
                         if expr.contains("__name__=~") && expr.contains("health_score") {
-                            has_health_regex_query = true;
+                            *has_health = true;
                             continue;
                         }
                         let metric = expr.split('{').next().unwrap_or(expr);
                         let metric = metric
                             .trim_start_matches("sum by (severity) (")
                             .trim_end_matches(')');
-                        query_metrics.push(metric.to_owned());
+                        if !metric.is_empty() {
+                            query_metrics.push(metric.to_owned());
+                        }
                     }
                 }
             }
+            if let Some(inner_panels) = panel["panels"].as_array() {
+                for inner in inner_panels {
+                    extract_targets(inner, query_metrics, has_health);
+                }
+            }
+        }
+
+        for panel in panels {
+            extract_targets(panel, &mut query_metrics, &mut has_health_regex_query);
         }
 
         assert!(

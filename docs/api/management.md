@@ -20,7 +20,7 @@ Embedded web UI (HTML/JS served from the binary, no external dependencies):
 
 - Current module status: registered, healthy, error
 - Last run summary: health score, finding counts by category, duration
-- Finding trends over recent runs
+- Finding churn: new, resolved, unchanged since last run
 - Active telemetry backends and connection status
 - Active config: loaded modules, enabled rules, thresholds
 - Auto-refreshes every 10 seconds
@@ -46,12 +46,14 @@ Current metric values.
 
 ### `GET /api/v1/metrics/history?window=7d`
 
-Time-series over the specified window.
+**Status: not implemented.** Returns an explicit `not_implemented` status. Time-series history requires the streaming/watch mode integration (co-located mode). This endpoint will return populated snapshots once that integration is available.
 
 ```json
 {
   "window": "7d",
-  "snapshots": []
+  "snapshots": [],
+  "status": "not_implemented",
+  "message": "Time-series history requires the streaming/watch mode integration. This endpoint will return snapshots once co-located mode is available."
 }
 ```
 
