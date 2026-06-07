@@ -2,6 +2,19 @@
 
 use chaffra_core::diagnostic::Language;
 
+/// Tracks which type of multiline string delimiter is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultilineState {
+    /// Not inside any multiline string.
+    None,
+    /// Inside a Go raw string (backtick-delimited).
+    InBacktick,
+    /// Inside a Python `"""` string.
+    InTripleDouble,
+    /// Inside a Python `'''` string.
+    InTripleSingle,
+}
+
 /// A suppression comment found in source code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Suppression {
@@ -23,12 +36,12 @@ pub struct Suppression {
 /// - `chaffra:ignore *` -- wildcard, suppress all rules
 pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
     let mut suppressions = Vec::new();
-    let mut in_multiline_string = false;
+    let mut multiline_state = MultilineState::None;
 
     for (idx, line) in source.lines().enumerate() {
-        let was_inside = in_multiline_string;
-        let (new_state, close_pos) = update_multiline_state(line, language, in_multiline_string);
-        in_multiline_string = new_state;
+        let was_inside = multiline_state != MultilineState::None;
+        let (new_state, close_pos) = update_multiline_state(line, language, multiline_state);
+        multiline_state = new_state;
 
         if was_inside {
             if let Some(pos) = close_pos {
@@ -64,18 +77,18 @@ pub fn scan_suppressions(source: &str, language: Language) -> Vec<Suppression> {
 /// For slash-comment languages (Go, etc.): tracks backtick raw strings.
 /// For hash-comment languages (Python): tracks triple-quoted strings (`"""` and `'''`).
 ///
-/// Returns `(new_state, close_pos)` where `new_state` is whether we are inside a multiline
+/// Returns `(new_state, close_pos)` where `new_state` indicates whether we are inside a multiline
 /// string after this line, and `close_pos` is the byte index right after the first closing
 /// delimiter if the line started inside a multiline string and the string closed on this line.
 fn update_multiline_state(
     line: &str,
     language: Language,
-    currently_inside: bool,
-) -> (bool, Option<usize>) {
+    state: MultilineState,
+) -> (MultilineState, Option<usize>) {
     if uses_slash_comments(language) {
-        update_multiline_state_backtick(line, currently_inside)
+        update_multiline_state_backtick(line, state)
     } else {
-        update_multiline_state_triple_quote(line, currently_inside)
+        update_multiline_state_triple_quote(line, state)
     }
 }
 
@@ -83,8 +96,12 @@ fn update_multiline_state(
 /// Each such backtick toggles the raw string state.
 ///
 /// Returns `(new_state, close_pos)` where `close_pos` is the byte index right after
-/// the first closing backtick if `currently_inside` was true and the string closed.
-fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> (bool, Option<usize>) {
+/// the first closing backtick if we started inside a raw string and it closed.
+fn update_multiline_state_backtick(
+    line: &str,
+    state: MultilineState,
+) -> (MultilineState, Option<usize>) {
+    let currently_inside = state == MultilineState::InBacktick;
     let bytes = line.as_bytes();
     let mut in_double_quote = false;
     let mut backtick_count: u32 = 0;
@@ -119,9 +136,13 @@ fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> (bool,
 
     // Odd number of backtick toggles flips the state
     let new_state = if backtick_count % 2 != 0 {
-        !currently_inside
+        if currently_inside {
+            MultilineState::None
+        } else {
+            MultilineState::InBacktick
+        }
     } else {
-        currently_inside
+        state
     };
 
     // Only report close_pos if we actually started inside
@@ -136,102 +157,171 @@ fn update_multiline_state_backtick(line: &str, currently_inside: bool) -> (bool,
 
 /// Track triple-quote state (`"""` and `'''`) for Python.
 ///
+/// Tracks which specific delimiter opened the string so that `'''` inside `"""`
+/// (and vice versa) does not incorrectly close it.
+///
 /// Returns `(new_state, close_pos)` where `close_pos` is the byte index right after
-/// the first closing triple-quote if `currently_inside` was true and the string closed.
+/// the first closing triple-quote if we started inside a string and it closed.
 fn update_multiline_state_triple_quote(
     line: &str,
-    currently_inside: bool,
-) -> (bool, Option<usize>) {
+    state: MultilineState,
+) -> (MultilineState, Option<usize>) {
     let bytes = line.as_bytes();
-    let mut state = currently_inside;
+    let mut current = state;
     let mut first_close_pos: Option<usize> = None;
     let mut i = 0;
 
     while i < bytes.len() {
-        if !state {
-            // Outside a multiline string — skip single-line strings and look for triple quotes
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if i + 2 < bytes.len()
-                && ((bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"')
-                    || (bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''))
-            {
-                state = true;
-                i += 3;
-                continue;
-            }
-            // Skip single-quoted or double-quoted string to avoid false triple-quote detection
-            if bytes[i] == b'"' || bytes[i] == b'\'' {
-                let quote = bytes[i];
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    if bytes[i] == b'\\' {
+        match current {
+            MultilineState::None | MultilineState::InBacktick => {
+                // Outside a multiline string — skip single-line strings and look for triple quotes
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if i + 2 < bytes.len()
+                    && bytes[i] == b'"'
+                    && bytes[i + 1] == b'"'
+                    && bytes[i + 2] == b'"'
+                {
+                    current = MultilineState::InTripleDouble;
+                    i += 3;
+                    continue;
+                }
+                if i + 2 < bytes.len()
+                    && bytes[i] == b'\''
+                    && bytes[i + 1] == b'\''
+                    && bytes[i + 2] == b'\''
+                {
+                    current = MultilineState::InTripleSingle;
+                    i += 3;
+                    continue;
+                }
+                // Skip single-quoted or double-quoted string to avoid false triple-quote detection
+                if bytes[i] == b'"' || bytes[i] == b'\'' {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
                         i += 1;
                     }
-                    i += 1;
+                    if i < bytes.len() {
+                        i += 1; // skip closing quote
+                    }
+                    continue;
                 }
-                if i < bytes.len() {
-                    i += 1; // skip closing quote
-                }
-                continue;
             }
-        } else {
-            // Inside a multiline string — look for the closing triple quote
-            if i + 2 < bytes.len()
-                && ((bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"')
-                    || (bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''))
-            {
-                state = false;
-                if currently_inside && first_close_pos.is_none() {
-                    first_close_pos = Some(i + 3);
+            MultilineState::InTripleDouble => {
+                // Inside `"""` — only `"""` closes it
+                if i + 2 < bytes.len()
+                    && bytes[i] == b'"'
+                    && bytes[i + 1] == b'"'
+                    && bytes[i + 2] == b'"'
+                {
+                    current = MultilineState::None;
+                    if state != MultilineState::None && first_close_pos.is_none() {
+                        first_close_pos = Some(i + 3);
+                    }
+                    i += 3;
+                    continue;
                 }
-                i += 3;
-                continue;
+            }
+            MultilineState::InTripleSingle => {
+                // Inside `'''` — only `'''` closes it
+                if i + 2 < bytes.len()
+                    && bytes[i] == b'\''
+                    && bytes[i + 1] == b'\''
+                    && bytes[i + 2] == b'\''
+                {
+                    current = MultilineState::None;
+                    if state != MultilineState::None && first_close_pos.is_none() {
+                        first_close_pos = Some(i + 3);
+                    }
+                    i += 3;
+                    continue;
+                }
             }
         }
         i += 1;
     }
 
     // Only report close_pos if we actually started inside
-    let close_pos = if currently_inside {
+    let close_pos = if state != MultilineState::None {
         first_close_pos
     } else {
         None
     };
 
-    (state, close_pos)
+    (current, close_pos)
 }
 
 /// Check whether the character at `pos` is inside a string literal.
 ///
-/// Counts unescaped double-quote (and single-quote for Python's `#`) characters
-/// before `pos`. If the count is odd, the position is inside a string literal.
+/// Uses a state machine to properly handle nested delimiters (e.g., a backtick
+/// inside a double-quoted string does not start a raw string).
 fn is_inside_string_literal(line: &str, pos: usize) -> bool {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        InDouble,
+        InSingle,
+        InBacktick,
+    }
+
     let prefix = &line[..pos];
-    let mut double_quotes = 0u32;
-    let mut single_quotes = 0u32;
-    let mut backticks = 0u32;
     let bytes = prefix.as_bytes();
+    let mut state = State::Normal;
     let mut i = 0;
+
     while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            // Skip escaped character.
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'"' {
-            double_quotes += 1;
-        } else if bytes[i] == b'\'' {
-            single_quotes += 1;
-        } else if bytes[i] == b'`' {
-            backticks += 1;
+        match state {
+            State::Normal => {
+                if bytes[i] == b'\\' {
+                    // Skip escaped character in normal context.
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    state = State::InDouble;
+                } else if bytes[i] == b'\'' {
+                    state = State::InSingle;
+                } else if bytes[i] == b'`' {
+                    state = State::InBacktick;
+                }
+            }
+            State::InDouble => {
+                if bytes[i] == b'\\' {
+                    // Skip escaped character inside double-quoted string.
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    state = State::Normal;
+                }
+            }
+            State::InSingle => {
+                if bytes[i] == b'\\' {
+                    // Skip escaped character inside single-quoted string.
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\'' {
+                    state = State::Normal;
+                }
+            }
+            State::InBacktick => {
+                // Go raw strings have no escape sequences — only backtick closes.
+                if bytes[i] == b'`' {
+                    state = State::Normal;
+                }
+            }
         }
         i += 1;
     }
-    // Inside a string if any quote count is odd.
-    double_quotes % 2 != 0 || single_quotes % 2 != 0 || backticks % 2 != 0
+
+    state != State::Normal
 }
 
 /// Returns `true` if the language uses `//` as a comment marker.
@@ -507,6 +597,26 @@ mod tests {
                 Language::Python,
                 "Python: suppression after hash in string",
             ),
+            (
+                "fmt.Println(\"`\") // chaffra:ignore dead-code\n",
+                Language::Go,
+                "Go: backtick inside double-quoted string does not affect state",
+            ),
+            (
+                "x := `raw` // chaffra:ignore dead-code\n",
+                Language::Go,
+                "Go: suppression after closed backtick raw string",
+            ),
+            (
+                "x = 'esc\\'d' # chaffra:ignore dead-code\n",
+                Language::Python,
+                "Python: suppression after single-quoted string with escape",
+            ),
+            (
+                "\\x // chaffra:ignore dead-code\n",
+                Language::Go,
+                "Go: backslash in normal context before suppression",
+            ),
         ];
         for (src, lang, desc) in cases {
             let suppressions = scan_suppressions(src, *lang);
@@ -571,6 +681,18 @@ mod tests {
                 lang: Language::Python,
                 desc: "Python: closing triple-quote with trailing suppression on same line",
                 expected_count: 1,
+            },
+            Case {
+                src: "msg = \"\"\"\n''' # chaffra:ignore dead-code\n\"\"\"\ndef unused(): pass\n",
+                lang: Language::Python,
+                desc: "Python: ''' inside \"\"\" does not close the string — no false suppression",
+                expected_count: 0,
+            },
+            Case {
+                src: "msg = '''\n\"\"\" # chaffra:ignore dead-code\n'''\ndef unused(): pass\n",
+                lang: Language::Python,
+                desc: "Python: \"\"\" inside ''' does not close the string — no false suppression",
+                expected_count: 0,
             },
         ];
 
