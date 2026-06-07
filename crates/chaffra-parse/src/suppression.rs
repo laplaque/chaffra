@@ -92,25 +92,33 @@ fn find_suppression_in_line(line: &str, language: Language) -> Option<(&str, Str
     const MARKER: &str = "chaffra:ignore";
 
     if uses_slash_comments(language) {
-        if let Some(comment_start) = line.find("//") {
+        let mut search_start = 0;
+        while let Some(offset) = line[search_start..].find("//") {
+            let comment_start = search_start + offset;
             if !is_inside_string_literal(line, comment_start) {
                 let comment = &line[comment_start..];
                 if let Some(pos) = comment.find(MARKER) {
                     let rest = &comment[pos + MARKER.len()..];
                     return Some((rest, comment.trim().to_owned()));
                 }
+                break; // Found a real comment but no marker — no suppression on this line
             }
+            search_start = comment_start + 2; // Skip past this "//" and keep looking
         }
     }
     if uses_hash_comments(language) {
-        if let Some(comment_start) = line.find('#') {
+        let mut search_start = 0;
+        while let Some(offset) = line[search_start..].find('#') {
+            let comment_start = search_start + offset;
             if !is_inside_string_literal(line, comment_start) {
                 let comment = &line[comment_start..];
                 if let Some(pos) = comment.find(MARKER) {
                     let rest = &comment[pos + MARKER.len()..];
                     return Some((rest, comment.trim().to_owned()));
                 }
+                break; // Found a real comment but no marker — no suppression on this line
             }
+            search_start = comment_start + 1; // Skip past this "#" and keep looking
         }
     }
     None
@@ -318,5 +326,25 @@ mod tests {
         let src = "x := fmt.Sprintf(\"val=\\\"%s\\\"\" ) // chaffra:ignore dead-code\n";
         let suppressions = scan_suppressions(src, Language::Go);
         assert_eq!(suppressions.len(), 1);
+    }
+
+    #[test]
+    fn test_suppression_found_after_in_string_delimiter() {
+        let cases: &[(&str, Language, &str)] = &[
+            (
+                "url := \"https://example.com\" // chaffra:ignore dead-code\n",
+                Language::Go,
+                "Go: suppression after URL in string",
+            ),
+            (
+                "x = \"has # inside\" # chaffra:ignore rule\n",
+                Language::Python,
+                "Python: suppression after hash in string",
+            ),
+        ];
+        for (src, lang, desc) in cases {
+            let suppressions = scan_suppressions(src, *lang);
+            assert_eq!(suppressions.len(), 1, "should find suppression: {}", desc);
+        }
     }
 }
