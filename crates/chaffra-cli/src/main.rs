@@ -463,7 +463,9 @@ fn cmd_security(
 ) -> Result<String> {
     let mut files = discover_and_read_files(root, config);
 
-    discover_security_files(root, root, &mut files);
+    let ignore_patterns =
+        chaffra_parse::discovery::load_all_ignore_patterns(root, &config.project.ignore);
+    discover_security_files(root, root, &ignore_patterns, &mut files);
 
     if files.is_empty() {
         return Ok("No files found.\n".to_owned());
@@ -515,7 +517,12 @@ const SKIP_DIRS: &[&str] = &[
     "venv",
 ];
 
-fn discover_security_files(root: &Path, dir: &Path, files: &mut Vec<FileInfo>) {
+fn discover_security_files(
+    root: &Path,
+    dir: &Path,
+    ignore_patterns: &[String],
+    files: &mut Vec<FileInfo>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -530,13 +537,25 @@ fn discover_security_files(root: &Path, dir: &Path, files: &mut Vec<FileInfo>) {
             if SKIP_DIRS.contains(&name.as_ref()) {
                 continue;
             }
-            discover_security_files(root, &path, files);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            if chaffra_parse::discovery::is_ignored(&rel, ignore_patterns) {
+                continue;
+            }
+            discover_security_files(root, &path, ignore_patterns, files);
         } else if path.is_file() {
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
+
+            if chaffra_parse::discovery::is_ignored(&rel, ignore_patterns) {
+                continue;
+            }
 
             if files.iter().any(|f| f.path == rel) {
                 continue;
@@ -2839,5 +2858,33 @@ mod tests {
         );
         assert_eq!(loaded.findings_hash, 99999);
         assert_eq!(loaded.timestamp_ms, 2000);
+    }
+
+    #[test]
+    fn test_discover_security_files_honors_ignore_patterns() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Create a visible .env file at the root.
+        fs::write(root.join(".env"), "VISIBLE_SECRET=abc123").unwrap();
+
+        // Create an ignored directory with a secret file.
+        let ignored_dir = root.join("secrets_backup");
+        fs::create_dir_all(&ignored_dir).unwrap();
+        fs::write(ignored_dir.join(".env"), "LEAKED_KEY=super_secret_42").unwrap();
+
+        // Create a .chafframeignore that ignores secrets_backup.
+        fs::write(root.join(".chafframeignore"), "secrets_backup/**\n").unwrap();
+
+        let ignore_patterns = chaffra_parse::discovery::load_all_ignore_patterns(root, &[]);
+        let mut files: Vec<FileInfo> = Vec::new();
+        discover_security_files(root, root, &ignore_patterns, &mut files);
+
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&".env"), "root .env should be discovered");
+        assert!(
+            !paths.iter().any(|p| p.contains("secrets_backup")),
+            "files in ignored directory should not be discovered"
+        );
     }
 }

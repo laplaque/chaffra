@@ -29,21 +29,40 @@ const DEFAULT_IGNORE_DIRS: &[&str] = &[
     "venv",
 ];
 
+/// Load all ignore patterns from `.gitignore`, `.chafframeignore`, and config.
+pub fn load_all_ignore_patterns(root: &Path, config_ignores: &[String]) -> Vec<String> {
+    let gitignore_patterns = load_ignore_file(root, ".gitignore");
+    let chaffra_ignore_patterns = load_ignore_file(root, ".chafframeignore");
+
+    config_ignores
+        .iter()
+        .cloned()
+        .chain(gitignore_patterns)
+        .chain(chaffra_ignore_patterns)
+        .collect()
+}
+
+/// Returns true if the given relative path matches any of the ignore patterns.
+pub fn is_ignored(relative_path: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        if let Ok(matcher) = glob::Pattern::new(pattern) {
+            if matcher.matches(relative_path) {
+                return true;
+            }
+        }
+        if relative_path.starts_with(pattern.trim_end_matches("/**")) && pattern.ends_with("/**") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Discover source files in a directory tree.
 ///
 /// Respects `.gitignore` and `.chafframeignore` patterns, plus default ignores.
 pub fn discover_files(root: &Path, ignore_patterns: &[String]) -> Vec<DiscoveredFile> {
     let mut files = Vec::new();
-    let gitignore_patterns = load_ignore_file(root, ".gitignore");
-    let chaffra_ignore_patterns = load_ignore_file(root, ".chafframeignore");
-
-    let all_ignore: Vec<String> = ignore_patterns
-        .iter()
-        .cloned()
-        .chain(gitignore_patterns)
-        .chain(chaffra_ignore_patterns)
-        .collect();
-
+    let all_ignore = load_all_ignore_patterns(root, ignore_patterns);
     walk_dir(root, root, &all_ignore, &mut files);
     files
 }
@@ -105,22 +124,6 @@ fn load_ignore_file(root: &Path, filename: &str) -> Vec<String> {
             .collect(),
         Err(_) => Vec::new(),
     }
-}
-
-fn is_ignored(relative_path: &str, patterns: &[String]) -> bool {
-    for pattern in patterns {
-        // Simple glob matching.
-        if let Ok(matcher) = glob::Pattern::new(pattern) {
-            if matcher.matches(relative_path) {
-                return true;
-            }
-        }
-        // Also try matching as a directory prefix.
-        if relative_path.starts_with(pattern.trim_end_matches("/**")) && pattern.ends_with("/**") {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
