@@ -50,8 +50,12 @@ pub fn is_ignored(relative_path: &str, patterns: &[String]) -> bool {
                 return true;
             }
         }
-        if relative_path.starts_with(pattern.trim_end_matches("/**")) && pattern.ends_with("/**") {
-            return true;
+        // Also try matching as a directory prefix.
+        if pattern.ends_with("/**") {
+            let prefix = pattern.trim_end_matches("/**");
+            if relative_path == prefix || relative_path.starts_with(&format!("{}/", prefix)) {
+                return true;
+            }
         }
     }
     false
@@ -184,9 +188,32 @@ mod tests {
 
     #[test]
     fn test_is_ignored() {
-        assert!(is_ignored("vendor/foo.go", &["vendor/**".to_owned()]));
-        assert!(!is_ignored("src/main.go", &["vendor/**".to_owned()]));
-        assert!(is_ignored("test_foo.py", &["test_*.py".to_owned()]));
+        let cases: &[(&str, &[&str], bool)] = &[
+            // Glob-only patterns
+            ("debug.log", &["*.log"], true),
+            // /** suffix patterns
+            ("dir/file", &["dir/**"], true),
+            // Prefix collision: dir/** must NOT match dir_extra/file
+            ("dir_extra/file", &["dir/**"], false),
+            // Dotfiles
+            (".gitignore", &[".gitignore"], true),
+            // Empty pattern list
+            ("any/path.go", &[], false),
+            // Multiple patterns (first match wins)
+            ("vendor/foo.go", &["src/**", "vendor/**"], true),
+        ];
+
+        for (path, patterns, expected) in cases {
+            let owned: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+            assert_eq!(
+                is_ignored(path, &owned),
+                *expected,
+                "is_ignored({:?}, {:?}) should be {}",
+                path,
+                patterns,
+                expected
+            );
+        }
     }
 
     #[test]
