@@ -38,21 +38,52 @@ pub fn scan_suppressions(source: &str, _language: Language) -> Vec<Suppression> 
     suppressions
 }
 
+/// Check whether the character at `pos` is inside a string literal.
+///
+/// Counts unescaped double-quote (and single-quote for Python's `#`) characters
+/// before `pos`. If the count is odd, the position is inside a string literal.
+fn is_inside_string_literal(line: &str, pos: usize) -> bool {
+    let prefix = &line[..pos];
+    let mut double_quotes = 0u32;
+    let mut single_quotes = 0u32;
+    let bytes = prefix.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Skip escaped character.
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            double_quotes += 1;
+        } else if bytes[i] == b'\'' {
+            single_quotes += 1;
+        }
+        i += 1;
+    }
+    // Inside a string if either quote count is odd.
+    double_quotes % 2 != 0 || single_quotes % 2 != 0
+}
+
 fn find_suppression_in_line(line: &str) -> Option<(&str, String)> {
     const MARKER: &str = "chaffra:ignore";
 
     if let Some(comment_start) = line.find("//") {
-        let comment = &line[comment_start..];
-        if let Some(pos) = comment.find(MARKER) {
-            let rest = &comment[pos + MARKER.len()..];
-            return Some((rest, comment.trim().to_owned()));
+        if !is_inside_string_literal(line, comment_start) {
+            let comment = &line[comment_start..];
+            if let Some(pos) = comment.find(MARKER) {
+                let rest = &comment[pos + MARKER.len()..];
+                return Some((rest, comment.trim().to_owned()));
+            }
         }
     }
     if let Some(comment_start) = line.find('#') {
-        let comment = &line[comment_start..];
-        if let Some(pos) = comment.find(MARKER) {
-            let rest = &comment[pos + MARKER.len()..];
-            return Some((rest, comment.trim().to_owned()));
+        if !is_inside_string_literal(line, comment_start) {
+            let comment = &line[comment_start..];
+            if let Some(pos) = comment.find(MARKER) {
+                let rest = &comment[pos + MARKER.len()..];
+                return Some((rest, comment.trim().to_owned()));
+            }
         }
     }
     None
@@ -174,5 +205,43 @@ mod tests {
         let suppressions = scan_suppressions(src, Language::Go);
         assert_eq!(suppressions.len(), 1);
         assert!(suppressions[0].rules.is_empty());
+    }
+
+    #[test]
+    fn test_suppression_in_string_literal_not_matched() {
+        // Go: // inside a string literal should not be treated as a comment
+        let src = "fmt.Println(\"// chaffra:ignore *\")\n";
+        let suppressions = scan_suppressions(src, Language::Go);
+        assert!(
+            suppressions.is_empty(),
+            "should not detect suppression inside a string literal"
+        );
+
+        // Rust/Go style with let
+        let src2 = "let s = \"// chaffra:ignore *\";\n";
+        let suppressions2 = scan_suppressions(src2, Language::Go);
+        assert!(
+            suppressions2.is_empty(),
+            "should not detect suppression inside a string literal (let)"
+        );
+    }
+
+    #[test]
+    fn test_suppression_in_python_string_not_matched() {
+        // Python: # inside a string literal should not be treated as a comment
+        let src = "x = \"# chaffra:ignore rule\"\n";
+        let suppressions = scan_suppressions(src, Language::Python);
+        assert!(
+            suppressions.is_empty(),
+            "should not detect suppression inside a Python string literal"
+        );
+
+        // Single-quoted Python string
+        let src2 = "x = '# chaffra:ignore rule'\n";
+        let suppressions2 = scan_suppressions(src2, Language::Python);
+        assert!(
+            suppressions2.is_empty(),
+            "should not detect suppression inside a single-quoted Python string"
+        );
     }
 }

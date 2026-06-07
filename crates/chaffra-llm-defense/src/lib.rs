@@ -218,8 +218,8 @@ impl AnalysisModule for LlmDefenseModule {
 
         for file in files {
             let lang = match detect_language(&file.path) {
-                Some(l) => l,
-                None => continue,
+                Some(l @ Language::Go) | Some(l @ Language::Python) => l,
+                _ => continue,
             };
 
             let tree = parser::parse(&file.content, lang)?;
