@@ -19,38 +19,55 @@ pub struct Suppression {
 /// (`# chaffra:ignore`) comments, with optional rule IDs:
 /// - `// chaffra:ignore` -- suppress all rules on the next line
 /// - `// chaffra:ignore unused-function,unused-type` -- suppress specific rules
+/// - `code // chaffra:ignore rule` -- inline suppression on the same line
+/// - `chaffra:ignore *` -- wildcard, suppress all rules
 pub fn scan_suppressions(source: &str, _language: Language) -> Vec<Suppression> {
     let mut suppressions = Vec::new();
 
     for (idx, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-
-        // Check for Go-style: // chaffra:ignore
-        // Check for Python-style: # chaffra:ignore
-        let rest = trimmed
-            .strip_prefix("// chaffra:ignore")
-            .or_else(|| trimmed.strip_prefix("# chaffra:ignore"));
-
-        if let Some(rest) = rest {
-            let rules: Vec<String> = if rest.is_empty() {
-                Vec::new()
-            } else {
-                rest.trim()
-                    .split(',')
-                    .map(|r| r.trim().to_owned())
-                    .filter(|r| !r.is_empty())
-                    .collect()
-            };
-
+        if let Some((rest, text)) = find_suppression_in_line(line) {
+            let rules = parse_suppression_rules(rest);
             suppressions.push(Suppression {
                 line: idx as u32 + 1,
                 rules,
-                text: trimmed.to_owned(),
+                text,
             });
         }
     }
 
     suppressions
+}
+
+fn find_suppression_in_line(line: &str) -> Option<(&str, String)> {
+    const MARKER: &str = "chaffra:ignore";
+
+    if let Some(comment_start) = line.find("//") {
+        let comment = &line[comment_start..];
+        if let Some(pos) = comment.find(MARKER) {
+            let rest = &comment[pos + MARKER.len()..];
+            return Some((rest, comment.trim().to_owned()));
+        }
+    }
+    if let Some(comment_start) = line.find('#') {
+        let comment = &line[comment_start..];
+        if let Some(pos) = comment.find(MARKER) {
+            let rest = &comment[pos + MARKER.len()..];
+            return Some((rest, comment.trim().to_owned()));
+        }
+    }
+    None
+}
+
+fn parse_suppression_rules(rest: &str) -> Vec<String> {
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "*" {
+        Vec::new()
+    } else {
+        rest.split(',')
+            .map(|r| r.trim().to_owned())
+            .filter(|r| !r.is_empty() && r != "*")
+            .collect()
+    }
 }
 
 /// Check if a given line is suppressed for a specific rule.
@@ -64,6 +81,15 @@ pub fn is_suppressed(suppressions: &[Suppression], line: u32, rule_id: &str) -> 
         }
     }
     false
+}
+
+/// Check if a specific line in source code is suppressed for a given rule.
+///
+/// This is a convenience function that combines `scan_suppressions` and `is_suppressed`
+/// for one-shot checks without pre-scanning.
+pub fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language) -> bool {
+    let suppressions = scan_suppressions(source, lang);
+    is_suppressed(&suppressions, line_num, rule_id)
 }
 
 #[cfg(test)]
@@ -122,5 +148,31 @@ mod tests {
         let src = "// This is a regular comment\n// chaffra-tool is great\n";
         let suppressions = scan_suppressions(src, Language::Go);
         assert!(suppressions.is_empty());
+    }
+
+    #[test]
+    fn test_inline_suppression_go() {
+        let src = "result := fabricated(x) // chaffra:ignore phantom-api-call\n";
+        let suppressions = scan_suppressions(src, Language::Go);
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].line, 1);
+        assert_eq!(suppressions[0].rules, vec!["phantom-api-call"]);
+    }
+
+    #[test]
+    fn test_inline_suppression_python() {
+        let src = "result = bad_fn(data)  # chaffra:ignore phantom-api-call\n";
+        let suppressions = scan_suppressions(src, Language::Python);
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].line, 1);
+        assert_eq!(suppressions[0].rules, vec!["phantom-api-call"]);
+    }
+
+    #[test]
+    fn test_wildcard_star_suppression() {
+        let src = "code() // chaffra:ignore *\n";
+        let suppressions = scan_suppressions(src, Language::Go);
+        assert_eq!(suppressions.len(), 1);
+        assert!(suppressions[0].rules.is_empty());
     }
 }
