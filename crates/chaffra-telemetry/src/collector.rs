@@ -172,6 +172,20 @@ impl TelemetryCollector {
             },
             timestamp_ms: ts,
         });
+
+        if had_error {
+            let error_count = inner.module_errors.get(module_id).copied().unwrap_or(1);
+            inner.data_points.push(MetricDataPoint {
+                name: "chaffra.module.error_total".to_owned(),
+                value: error_count as f64,
+                labels: {
+                    let mut m = HashMap::new();
+                    m.insert("module".to_owned(), module_id.to_owned());
+                    m
+                },
+                timestamp_ms: ts,
+            });
+        }
     }
 
     /// Record findings from a module (called by the core after each module runs).
@@ -203,6 +217,20 @@ impl TelemetryCollector {
             },
             timestamp_ms: ts,
         });
+
+        for (severity, count) in severity_counts {
+            inner.data_points.push(MetricDataPoint {
+                name: "chaffra.analysis.findings_by_severity".to_owned(),
+                value: *count as f64,
+                labels: {
+                    let mut m = HashMap::new();
+                    m.insert("module".to_owned(), module_id.to_owned());
+                    m.insert("severity".to_owned(), severity.clone());
+                    m
+                },
+                timestamp_ms: ts,
+            });
+        }
     }
 
     /// Set total files analyzed.
@@ -417,7 +445,13 @@ impl TelemetryCollector {
             MetricDefinition {
                 name: "chaffra.analysis.findings_total".to_owned(),
                 kind: MetricKind::Counter,
-                description: "Total findings by severity and module".to_owned(),
+                description: "Total findings per module".to_owned(),
+                unit: "count".to_owned(),
+            },
+            MetricDefinition {
+                name: "chaffra.analysis.findings_by_severity".to_owned(),
+                kind: MetricKind::Counter,
+                description: "Findings per module and severity".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {

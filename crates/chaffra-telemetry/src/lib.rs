@@ -8,10 +8,13 @@
 //! - **User-facing**: analysis duration, finding counts, health scores (included in output).
 //! - **Operator**: call latencies, error rates, memory pressure (sunk to backends).
 
+pub mod audit_log;
 pub mod backends;
+pub mod cache_metrics;
 pub mod churn;
 pub mod collector;
 pub mod config;
+pub mod dashboard;
 pub mod error;
 pub mod grpc_service;
 pub mod metrics;

@@ -123,12 +123,56 @@ sampling-rate = 1.0          # 0.0–1.0
 sampling-strategy = "rate"   # rate | on-change
 ```
 
+## Parse Cache Metrics (helper API)
+
+Library helper for tracking incremental parse cache effectiveness. Provides atomic counters and a `flush_to_collector()` method for integration into cache-aware code paths.
+
+| Metric | Kind | Description |
+|--------|------|-------------|
+| `chaffra.parse.cache_hits` | counter | Files served from parse cache |
+| `chaffra.parse.cache_misses` | counter | Files re-parsed (cache miss) |
+| `chaffra.parse.cache_hit_rate` | gauge | Hit rate: hits / (hits + misses) |
+| `chaffra.parse.cache_size_bytes` | gauge | Current cache memory usage |
+| `chaffra.parse.cache_evictions` | counter | Cache entries evicted |
+
+Integration into the watch mode and LSP parse cache producers is planned for a future phase. Until then, these metrics are available as a library API for downstream consumers to call directly.
+
+## Grafana Dashboard Generator
+
+Generate an import-ready Grafana dashboard JSON (Prometheus datasource) for the full chaffra metric set.
+
+```
+chaffra telemetry dashboard                         # Write chaffra-grafana-dashboard.json
+chaffra telemetry dashboard --stdout                # Print to stdout
+```
+
+Panels: health score trend, finding count by module, finding churn, module call duration, findings by severity, error rates, startup time.
+
+Row grouping: Overview (health + findings), Per-module detail, Operational (timing + errors).
+
+## Telemetry Audit Log (helper API)
+
+Library helper for GDPR-style accountability logging. Provides event types, append/read functions, and display/export formatters for telemetry configuration change records.
+
+Location: `.chaffra-telemetry-audit.log` (JSON lines format).
+
+Event types: telemetry enabled/disabled, backend added/removed/modified, tenant-id changed, path-mode changed, sampling rate changed.
+
+Integration into the actual configuration mutation paths (CLI config changes, MCP config updates) is planned for a future phase. Until then, the writer functions (`log_telemetry_enabled`, `log_backend_added`, etc.) are available as a library API. The CLI reader is available now:
+
+```
+chaffra telemetry audit-log            # Display the audit log
+chaffra telemetry audit-log --export   # Export as JSON array for GDPR data subject access requests
+```
+
 ## CLI
 
 ```
-chaffra telemetry status   # Show backends and connection status
-chaffra telemetry test     # Emit test metric, report success/failure
-chaffra telemetry inspect  # Dry-run: show metric payload
+chaffra telemetry status      # Show backends and connection status
+chaffra telemetry test        # Emit test metric, report success/failure
+chaffra telemetry inspect     # Dry-run: show metric payload
+chaffra telemetry dashboard   # Generate Grafana dashboard JSON
+chaffra telemetry audit-log   # Display telemetry audit log
 
 # Global flags on all commands:
 --telemetry on|off|user-only|operator-only
