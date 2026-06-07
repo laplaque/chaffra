@@ -46,6 +46,7 @@ fn is_inside_string_literal(line: &str, pos: usize) -> bool {
     let prefix = &line[..pos];
     let mut double_quotes = 0u32;
     let mut single_quotes = 0u32;
+    let mut backticks = 0u32;
     let bytes = prefix.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -58,11 +59,13 @@ fn is_inside_string_literal(line: &str, pos: usize) -> bool {
             double_quotes += 1;
         } else if bytes[i] == b'\'' {
             single_quotes += 1;
+        } else if bytes[i] == b'`' {
+            backticks += 1;
         }
         i += 1;
     }
-    // Inside a string if either quote count is odd.
-    double_quotes % 2 != 0 || single_quotes % 2 != 0
+    // Inside a string if any quote count is odd.
+    double_quotes % 2 != 0 || single_quotes % 2 != 0 || backticks % 2 != 0
 }
 
 /// Returns `true` if the language uses `//` as a comment marker.
@@ -254,6 +257,11 @@ mod tests {
                 Language::Python,
                 "Python single-quoted string",
             ),
+            (
+                "fmt.Println(`// chaffra:ignore *`)\n",
+                Language::Go,
+                "Go raw string with backticks",
+            ),
         ];
         for (src, lang, desc) in cases {
             let suppressions = scan_suppressions(src, *lang);
@@ -288,9 +296,21 @@ mod tests {
     #[test]
     fn test_is_line_suppressed_convenience() {
         let src = "package main\n// chaffra:ignore dead-code\nfunc unused() {}\n";
-        assert!(is_line_suppressed(src, 3, "dead-code", Language::Go));
-        assert!(!is_line_suppressed(src, 3, "complexity", Language::Go));
-        assert!(!is_line_suppressed(src, 1, "dead-code", Language::Go));
+        let cases: &[(u32, &str, bool)] = &[
+            (3, "dead-code", true),
+            (3, "complexity", false),
+            (1, "dead-code", false),
+        ];
+        for (line, rule, expected) in cases {
+            assert_eq!(
+                is_line_suppressed(src, *line, rule, Language::Go),
+                *expected,
+                "is_line_suppressed(line={}, rule={}) should be {}",
+                line,
+                rule,
+                expected
+            );
+        }
     }
 
     #[test]
