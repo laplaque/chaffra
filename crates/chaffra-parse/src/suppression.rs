@@ -127,6 +127,11 @@ fn update_multiline_state_backtick(
             }
         } else {
             // Normal code — track double quotes and backticks
+            if in_double_quote && bytes[i] == b'\\' {
+                // Skip escaped character inside double-quoted string
+                i += 2;
+                continue;
+            }
             if !in_double_quote && bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                 // Real comment starts here — stop processing
                 break;
@@ -714,6 +719,12 @@ mod tests {
                 src: "# has triple quote: \"\"\"\n# chaffra:ignore dead-code\ndef unused(): pass\n",
                 lang: Language::Python,
                 desc: "Python: triple-quote in comment should not open multiline string state",
+                expected_count: 1,
+            },
+            Case {
+                src: "fmt.Sprintf(\"val=\\\"%s`end\\\"\") \n// chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: escaped quote before backtick in double-quoted string should not open raw string state",
                 expected_count: 1,
             },
         ];
