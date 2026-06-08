@@ -127,6 +127,10 @@ fn update_multiline_state_backtick(
             }
         } else {
             // Normal code — track double quotes and backticks
+            if !in_double_quote && bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                // Real comment starts here — stop processing
+                break;
+            }
             if bytes[i] == b'"' {
                 in_double_quote = !in_double_quote;
             } else if bytes[i] == b'`' && !in_double_quote {
@@ -207,6 +211,10 @@ fn update_multiline_state_triple_quote(
                         i += 1; // skip closing quote
                     }
                     continue;
+                }
+                // Hash comment starts here — stop processing (not inside a string)
+                if bytes[i] == b'#' {
+                    break;
                 }
             }
             MultilineState::InTripleDouble => {
@@ -694,6 +702,18 @@ mod tests {
                 src: "msg := `\nraw content\n` ; x := fmt.Println(\"`\") \n// chaffra:ignore dead-code\nfunc unused() {}\n",
                 lang: Language::Go,
                 desc: "Go: backtick inside double-quoted string after raw string close does not corrupt state",
+                expected_count: 1,
+            },
+            Case {
+                src: "// has a backtick: `\n// chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: backtick in comment should not open raw string state",
+                expected_count: 1,
+            },
+            Case {
+                src: "# has triple quote: \"\"\"\n# chaffra:ignore dead-code\ndef unused(): pass\n",
+                lang: Language::Python,
+                desc: "Python: triple-quote in comment should not open multiline string state",
                 expected_count: 1,
             },
         ];
