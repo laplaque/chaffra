@@ -136,6 +136,20 @@ fn update_multiline_state_backtick(
                 // Real comment starts here — stop processing
                 break;
             }
+            if bytes[i] == b'\'' && !in_double_quote {
+                // Skip rune literal contents (e.g., '`' in Go)
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    if bytes[i] == b'\\' {
+                        i += 1; // skip escaped char
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip closing quote
+                }
+                continue;
+            }
             if bytes[i] == b'"' {
                 in_double_quote = !in_double_quote;
             } else if bytes[i] == b'`' && !in_double_quote {
@@ -725,6 +739,18 @@ mod tests {
                 src: "fmt.Sprintf(\"val=\\\"%s`end\\\"\") \n// chaffra:ignore dead-code\nfunc unused() {}\n",
                 lang: Language::Go,
                 desc: "Go: escaped quote before backtick in double-quoted string should not open raw string state",
+                expected_count: 1,
+            },
+            Case {
+                src: "x := '`'\n// chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: rune literal with backtick does not open raw string state",
+                expected_count: 1,
+            },
+            Case {
+                src: "x := '\\`'\n// chaffra:ignore dead-code\nfunc unused() {}\n",
+                lang: Language::Go,
+                desc: "Go: rune literal with escaped backtick does not open raw string state",
                 expected_count: 1,
             },
         ];
