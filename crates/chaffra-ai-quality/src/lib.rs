@@ -10,7 +10,9 @@ use chaffra_core::diagnostic::{
 };
 use chaffra_core::error::{ChaffraError, Result};
 use chaffra_core::module::AnalysisModule;
+use chaffra_parse::detect_language;
 use chaffra_parse::parser;
+use chaffra_parse::suppression::is_line_suppressed;
 use chaffra_parse::symbols::{self, ImportInfo, Reference, Symbol, SymbolKind};
 use std::collections::{HashMap, HashSet};
 
@@ -235,8 +237,8 @@ impl AnalysisModule for AiQualityModule {
 
         for file in files {
             let lang = match detect_language(&file.path) {
-                Some(l) => l,
-                None => continue,
+                Some(l @ Language::Go) | Some(l @ Language::Python) => l,
+                _ => continue,
             };
 
             let tree = parser::parse(&file.content, lang)?;
@@ -425,16 +427,6 @@ struct FileData {
     symbols: Vec<Symbol>,
     references: Vec<Reference>,
     source: String,
-}
-
-fn detect_language(path: &str) -> Option<Language> {
-    if path.ends_with(".go") {
-        Some(Language::Go)
-    } else if path.ends_with(".py") {
-        Some(Language::Python)
-    } else {
-        None
-    }
 }
 
 fn import_local_name(imp: &ImportInfo, lang: Language) -> String {
@@ -930,47 +922,6 @@ fn detect_inconsistent_error_handling(fd: &FileData, findings: &mut Vec<Finding>
 }
 
 // --- Helpers ---
-
-/// Check if a finding at `line_num` (1-based) is suppressed by a `chaffra:ignore <rule-id>`
-/// comment on the same line or the preceding line.
-fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language) -> bool {
-    let lines: Vec<&str> = source.lines().collect();
-    let idx = (line_num as usize).saturating_sub(1); // convert to 0-based
-
-    let suppression_pattern = format!("chaffra:ignore {rule_id}");
-    let wildcard_pattern = "chaffra:ignore *";
-
-    let check_line = |line: &str| -> bool {
-        let comment_body = match lang {
-            Language::Python => {
-                if let Some(pos) = line.find('#') {
-                    &line[pos..]
-                } else {
-                    return false;
-                }
-            }
-            Language::Go => {
-                if let Some(pos) = line.find("//") {
-                    &line[pos..]
-                } else {
-                    return false;
-                }
-            }
-            _ => return false,
-        };
-        comment_body.contains(&suppression_pattern) || comment_body.contains(wildcard_pattern)
-    };
-
-    // Check the finding line itself.
-    if idx < lines.len() && check_line(lines[idx]) {
-        return true;
-    }
-    // Check the preceding line.
-    if idx > 0 && check_line(lines[idx - 1]) {
-        return true;
-    }
-    false
-}
 
 fn is_security_related(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -1805,7 +1756,7 @@ mod tests {
     fn test_detect_language() {
         assert_eq!(detect_language("foo.go"), Some(Language::Go));
         assert_eq!(detect_language("bar.py"), Some(Language::Python));
-        assert_eq!(detect_language("baz.rs"), None);
+        assert_eq!(detect_language("baz.txt"), None);
     }
 
     #[test]

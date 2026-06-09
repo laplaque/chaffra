@@ -10,7 +10,9 @@ use chaffra_core::diagnostic::{
 };
 use chaffra_core::error::{ChaffraError, Result};
 use chaffra_core::module::AnalysisModule;
+use chaffra_parse::detect_language;
 use chaffra_parse::parser;
+use chaffra_parse::suppression::is_line_suppressed;
 use chaffra_parse::symbols::{self, ImportInfo};
 use std::collections::{HashMap, HashSet};
 
@@ -216,8 +218,8 @@ impl AnalysisModule for LlmDefenseModule {
 
         for file in files {
             let lang = match detect_language(&file.path) {
-                Some(l) => l,
-                None => continue,
+                Some(l @ Language::Go) | Some(l @ Language::Python) => l,
+                _ => continue,
             };
 
             let tree = parser::parse(&file.content, lang)?;
@@ -371,16 +373,6 @@ struct FileData {
     path: String,
     language: Language,
     source: String,
-}
-
-fn detect_language(path: &str) -> Option<Language> {
-    if path.ends_with(".go") {
-        Some(Language::Go)
-    } else if path.ends_with(".py") {
-        Some(Language::Python)
-    } else {
-        None
-    }
 }
 
 fn has_llm_imports(imports: &[ImportInfo], lang: Language) -> bool {
@@ -668,47 +660,6 @@ fn detect_unguarded_agent_loop(fd: &FileData, findings: &mut Vec<Finding>) {
 
 // --- Helpers ---
 
-/// Check if a finding at `line_num` (1-based) is suppressed by a `chaffra:ignore <rule-id>`
-/// comment on the same line or the preceding line.
-fn is_line_suppressed(source: &str, line_num: u32, rule_id: &str, lang: Language) -> bool {
-    let lines: Vec<&str> = source.lines().collect();
-    let idx = (line_num as usize).saturating_sub(1); // convert to 0-based
-
-    let suppression_pattern = format!("chaffra:ignore {rule_id}");
-    let wildcard_pattern = "chaffra:ignore *";
-
-    let check_line = |line: &str| -> bool {
-        let comment_body = match lang {
-            Language::Python => {
-                if let Some(pos) = line.find('#') {
-                    &line[pos..]
-                } else {
-                    return false;
-                }
-            }
-            Language::Go => {
-                if let Some(pos) = line.find("//") {
-                    &line[pos..]
-                } else {
-                    return false;
-                }
-            }
-            _ => return false,
-        };
-        comment_body.contains(&suppression_pattern) || comment_body.contains(wildcard_pattern)
-    };
-
-    // Check the finding line itself.
-    if idx < lines.len() && check_line(lines[idx]) {
-        return true;
-    }
-    // Check the preceding line.
-    if idx > 0 && check_line(lines[idx - 1]) {
-        return true;
-    }
-    false
-}
-
 fn has_user_input_indicator(line: &str) -> bool {
     let lower = line.to_lowercase();
     lower.contains("user")
@@ -722,7 +673,7 @@ fn has_user_input_indicator(line: &str) -> bool {
 
 fn find_llm_response_vars(lines: &[&str], _lang: Language) -> HashSet<String> {
     let mut vars = HashSet::new();
-    let response_patterns = [
+    let response_name_patterns = [
         "completion",
         "response",
         "result",
@@ -733,22 +684,41 @@ fn find_llm_response_vars(lines: &[&str], _lang: Language) -> HashSet<String> {
         "ai_response",
     ];
 
+    let is_llm_rhs = |rhs: &str| -> bool {
+        rhs.contains("client.messages.create")
+            || rhs.contains("openai.chat.completions.create")
+            || rhs.contains("chat.completions.create")
+            || rhs.contains("completions.create")
+            || rhs.contains("messages.create")
+            || rhs.contains("chain.invoke")
+            || rhs.contains("llm.generate")
+            || rhs.contains("model.predict")
+            || rhs.contains("chatcompletion.create")
+            || rhs.contains("generate_content")
+    };
+
     for line in lines {
         let trimmed = line.trim();
-        // Look for assignment patterns: var = llm_call(...)
         if let Some(eq_pos) = trimmed.find('=') {
+            if eq_pos + 1 >= trimmed.len() {
+                continue;
+            }
+            let next_char = trimmed.as_bytes().get(eq_pos + 1);
+            if next_char == Some(&b'=') {
+                continue;
+            }
+
             let lhs = trimmed[..eq_pos].trim();
             let rhs = trimmed[eq_pos + 1..].trim().to_lowercase();
 
-            // Check if RHS looks like an LLM call.
-            if rhs.contains("create(")
-                || rhs.contains("generate(")
-                || rhs.contains("complete(")
-                || rhs.contains("chat(")
-                || rhs.contains("invoke(")
-                || rhs.contains("predict(")
-            {
-                // Extract the variable name.
+            let has_llm_name = {
+                let lhs_lower = lhs.to_lowercase();
+                response_name_patterns.iter().any(|p| lhs_lower.contains(p))
+            };
+
+            let has_llm_call = is_llm_rhs(&rhs);
+
+            if has_llm_name && has_llm_call {
                 let var_name = lhs
                     .split_whitespace()
                     .last()
@@ -757,15 +727,6 @@ fn find_llm_response_vars(lines: &[&str], _lang: Language) -> HashSet<String> {
                     .trim_start_matches("var ")
                     .trim_start_matches(':')
                     .trim();
-                if !var_name.is_empty() {
-                    vars.insert(var_name.to_owned());
-                }
-            }
-
-            // Check if LHS looks like a response variable.
-            let lhs_lower = lhs.to_lowercase();
-            if response_patterns.iter().any(|p| lhs_lower.contains(p)) {
-                let var_name = lhs.split_whitespace().last().unwrap_or(lhs).trim();
                 if !var_name.is_empty() {
                     vars.insert(var_name.to_owned());
                 }
@@ -1281,10 +1242,39 @@ mod tests {
     }
 
     #[test]
+    fn test_find_llm_response_vars_requires_both_conditions() {
+        let cases: &[(&[&str], &str, bool, &str)] = &[
+            (
+                &["result = some_function()"],
+                "result",
+                false,
+                "LLM-like name without LLM call",
+            ),
+            (
+                &["data = client.chat.completions.create(messages=[])"],
+                "data",
+                false,
+                "LLM call without LLM-like name",
+            ),
+            (
+                &["response = client.chat.completions.create(messages=[])"],
+                "response",
+                true,
+                "both LLM name and LLM call",
+            ),
+        ];
+        for (lines, var, expected, desc) in cases {
+            let lines_owned: Vec<&str> = lines.to_vec();
+            let vars = find_llm_response_vars(&lines_owned, Language::Python);
+            assert_eq!(vars.contains(*var), *expected, "{}", desc);
+        }
+    }
+
+    #[test]
     fn test_detect_language() {
         assert_eq!(detect_language("foo.go"), Some(Language::Go));
         assert_eq!(detect_language("bar.py"), Some(Language::Python));
-        assert_eq!(detect_language("baz.rs"), None);
+        assert_eq!(detect_language("baz.txt"), None);
     }
 
     #[test]
