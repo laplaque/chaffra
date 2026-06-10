@@ -196,7 +196,7 @@ fn merge_overlapping_families(families: &mut Vec<CloneFamily>) {
             for j in (i + 1)..entries.len() {
                 let (_, _, end_i) = entries[i];
                 let (_, start_j, _) = entries[j];
-                if start_j > end_i + 1 {
+                if start_j > end_i {
                     break;
                 }
                 union(&mut parent, entries[i].0, entries[j].0);
@@ -1116,6 +1116,56 @@ mod tests {
         assert!(
             !all_same,
             "findings should cover different line ranges, got {locs:?}"
+        );
+    }
+
+    #[test]
+    fn test_adjacent_families_different_destinations_stay_separate() {
+        let module = DuplicationModule::new();
+        let block_x: String = (0..40)
+            .map(|i| format!("    alphaX{i} := computeX({i})\n"))
+            .collect();
+        let block_y: String = (0..40)
+            .map(|i| format!("    betaY{i} := computeY({i})\n"))
+            .collect();
+
+        let file_a =
+            format!("package main\n\nfunc FX() {{\n{block_x}}}\n\nfunc FY() {{\n{block_y}}}\n");
+        let file_b = format!("package main\n\nfunc BX() {{\n{block_x}}}\n");
+        let file_c = format!("package main\n\nfunc CY() {{\n{block_y}}}\n");
+
+        let files = vec![
+            make_file("a.go", &file_a),
+            make_file("b.go", &file_b),
+            make_file("c.go", &file_c),
+        ];
+
+        let mut config = HashMap::new();
+        config.insert("min-tokens".to_owned(), "20".to_owned());
+
+        let result = module.analyze(&files, &config).unwrap();
+
+        let has_b = result.findings.iter().any(|f| {
+            f.metadata
+                .get("clone_locations")
+                .is_some_and(|v| v.contains("b.go"))
+        });
+        let has_c = result.findings.iter().any(|f| {
+            f.metadata
+                .get("clone_locations")
+                .is_some_and(|v| v.contains("c.go"))
+        });
+        assert!(has_b, "should have a family involving b.go");
+        assert!(has_c, "should have a family involving c.go");
+
+        let merged = result.findings.iter().any(|f| {
+            f.metadata
+                .get("clone_locations")
+                .is_some_and(|v| v.contains("b.go") && v.contains("c.go"))
+        });
+        assert!(
+            !merged,
+            "block X (a.go+b.go) and block Y (a.go+c.go) must NOT merge into one family"
         );
     }
 
