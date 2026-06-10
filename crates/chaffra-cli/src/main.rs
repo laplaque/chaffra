@@ -428,7 +428,7 @@ fn cmd_dupes(
     if result.findings.is_empty() {
         return Ok("No duplicates found.\n".to_owned());
     }
-    Ok(formatter.format_findings(&result.findings))
+    Ok(formatter.format_result(&result, None))
 }
 
 fn cmd_boundaries(

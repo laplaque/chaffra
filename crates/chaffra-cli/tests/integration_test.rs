@@ -1151,12 +1151,33 @@ fn test_duplication_json_output_consumer() {
     let result = module.analyze(&files, &config).unwrap();
 
     let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Json);
-    let json_str = formatter.format_findings(&result.findings);
+    let json_str = formatter.format_result(&result, None);
     let parsed: serde_json::Value = serde_json::from_str(&json_str)
         .unwrap_or_else(|e| panic!("JSON formatter must produce valid JSON: {e}"));
     let findings = parsed.get("findings").expect("must have findings key");
     assert!(findings.is_array());
     assert!(!findings.as_array().unwrap().is_empty());
+
+    let metrics = parsed
+        .get("metrics")
+        .expect("must include metrics in output");
+    let counters = metrics.get("counters").expect("metrics must have counters");
+    assert!(
+        counters.get("raw_clone_pairs").is_some(),
+        "must include raw_clone_pairs counter"
+    );
+    assert!(
+        counters.get("clone_families").is_some(),
+        "must include clone_families counter"
+    );
+    assert!(
+        counters.get("reported_findings").is_some(),
+        "must include reported_findings counter"
+    );
+    assert!(
+        counters.get("collapsed_matches").is_some(),
+        "must include collapsed_matches counter"
+    );
 }
 
 #[test]
@@ -1170,7 +1191,7 @@ fn test_duplication_terminal_output_consumer() {
     let result = module.analyze(&files, &config).unwrap();
 
     let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Terminal);
-    let text = formatter.format_findings(&result.findings);
+    let text = formatter.format_result(&result, None);
     assert!(
         text.contains("[W]"),
         "terminal output must contain warning severity indicator"
@@ -1192,7 +1213,7 @@ fn test_duplication_sarif_output_consumer() {
     let result = module.analyze(&files, &config).unwrap();
 
     let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Sarif);
-    let sarif_str = formatter.format_findings(&result.findings);
+    let sarif_str = formatter.format_result(&result, None);
     let parsed: serde_json::Value = serde_json::from_str(&sarif_str)
         .unwrap_or_else(|e| panic!("SARIF formatter must produce valid JSON: {e}"));
 
