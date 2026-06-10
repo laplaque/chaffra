@@ -1188,4 +1188,60 @@ mod tests {
         assert!(result.metrics.counters.contains_key("reported_findings"));
         assert!(result.metrics.counters.contains_key("collapsed_matches"));
     }
+
+    #[test]
+    fn test_deterministic_output_across_runs_and_permuted_input() {
+        let module = DuplicationModule::new();
+        let block: String = (0..40)
+            .map(|i| format!("    val{i} := process({i})\n"))
+            .collect();
+        let file_a = format!("package main\n\nfunc A() {{\n{block}}}\n");
+        let file_b = format!("package main\n\nfunc B() {{\n{block}}}\n");
+        let file_c = format!("package other\n\nfunc C() {{\n{block}}}\n");
+
+        let files_ordered = vec![
+            make_file("a.go", &file_a),
+            make_file("b.go", &file_b),
+            make_file("c.go", &file_c),
+        ];
+        let files_permuted = vec![
+            make_file("c.go", &file_c),
+            make_file("a.go", &file_a),
+            make_file("b.go", &file_b),
+        ];
+
+        let mut config = HashMap::new();
+        config.insert("min-tokens".to_owned(), "20".to_owned());
+
+        let r1 = module.analyze(&files_ordered, &config).unwrap();
+        let r2 = module.analyze(&files_ordered, &config).unwrap();
+        let r3 = module.analyze(&files_permuted, &config).unwrap();
+
+        fn snapshot(r: &AnalysisResult) -> Vec<(String, String, u32, u32, String)> {
+            r.findings
+                .iter()
+                .map(|f| {
+                    (
+                        f.rule_id.clone(),
+                        f.metadata.get("family_id").cloned().unwrap_or_default(),
+                        f.location.start_line,
+                        f.location.end_line,
+                        f.metadata
+                            .get("clone_locations")
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect()
+        }
+
+        let s1 = snapshot(&r1);
+        let s2 = snapshot(&r2);
+        let s3 = snapshot(&r3);
+
+        assert_eq!(s1, s2, "repeated runs must produce identical output");
+        assert_eq!(s1, s3, "permuted file input must produce identical output");
+        assert_eq!(r1.metrics.counters, r2.metrics.counters);
+        assert_eq!(r1.metrics.counters, r3.metrics.counters);
+    }
 }
