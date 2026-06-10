@@ -4,7 +4,7 @@
 **Crate:** `chaffra-duplication`
 **Languages:** Go, Python, JavaScript, TypeScript, Java
 
-Detects duplicate code blocks using a token-based sliding window algorithm with configurable normalization modes. Produces clone pair findings with family IDs for grouping related clones.
+Detects duplicate code blocks using a token-based sliding window algorithm with configurable normalization modes. Results are aggregated into clone families with coalesced ranges to keep output bounded and meaningful.
 
 ## Rules
 
@@ -28,6 +28,7 @@ Detects duplicate code blocks using a token-based sliding window algorithm with 
 [modules.duplication]
 mode = "strict"      # Detection mode: strict, mild, weak, semantic
 min-tokens = 50      # Minimum token count for a clone to be reported
+max-families = 200   # Maximum clone families reported (default 200)
 ```
 
 ## CLI Usage
@@ -45,17 +46,36 @@ chaffra dupes --format sarif .
 
 ## Clone Families
 
-Each clone pair receives a family ID (`dup:<8hex>`) computed as the SHA-256 hash of the normalized token sequence. Clones with the same family ID share the same normalized structure and should be reviewed together for extraction into a shared utility.
+Raw sliding-window matches are aggregated into clone families. Overlapping or adjacent ranges within the same file are coalesced, and families that share overlapping locations across file pairs are merged using union-find. This produces one finding per logical clone family rather than one per sliding-window match.
+
+Each family receives a deterministic ID (`dup:<8hex>`) computed from its coalesced occurrence locations. Families with multiple locations in different files should be reviewed together for extraction into a shared utility.
+
+When the same code block appears in three or more files, all file pairs are merged into a single family with all locations listed.
+
+## Result Limits
+
+The `max-families` config option (default 200) caps the number of reported families. When truncated, the `truncated_families` metric records how many families were dropped.
 
 ## Finding Metadata
 
-Each finding includes:
-- `family_id` -- clone family fingerprint
+Each finding (one per clone family) includes:
+- `family_id` -- deterministic clone family fingerprint
 - `similarity` -- similarity score (1.0 for strict, lower for normalized modes)
-- `token_count` -- number of matched tokens
+- `token_count_min` / `token_count_max` -- token count range across matches in the family
 - `mode` -- detection mode used
-- `other_file` -- path of the other clone location
-- `other_start_line` / `other_end_line` -- line range of the other clone
+- `clone_locations` -- compact JSON array of all locations: `[{"file":"...","start":N,"end":N},...]`
+- `raw_pair_count` -- number of raw sliding-window pairs before coalescing
+- `reported_location_count` -- number of coalesced locations in this family
+
+## Metrics
+
+| Counter | Description |
+|---------|-------------|
+| `raw_clone_pairs` | Total sliding-window matches before aggregation |
+| `clone_families` | Total families after aggregation (before cap) |
+| `reported_findings` | Findings emitted (after cap) |
+| `collapsed_matches` | Raw pairs absorbed by coalescing |
+| `truncated_families` | Families dropped by the cap (only present when truncated) |
 
 ## Auto-fix
 
