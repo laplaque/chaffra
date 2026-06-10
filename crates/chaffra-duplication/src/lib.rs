@@ -245,7 +245,7 @@ fn aggregate_families(raw_matches: Vec<RawCloneMatch>) -> Vec<CloneFamily> {
     }
 
     let mut families = Vec::new();
-    for (fid, matches) in &family_map {
+    for matches in family_map.values() {
         let raw_pair_count = matches.len();
         let token_count_min = matches.iter().map(|m| m.token_count).min().unwrap_or(0);
         let token_count_max = matches.iter().map(|m| m.token_count).max().unwrap_or(0);
@@ -276,7 +276,7 @@ fn aggregate_families(raw_matches: Vec<RawCloneMatch>) -> Vec<CloneFamily> {
         occurrences.sort();
 
         families.push(CloneFamily {
-            family_id: fid.clone(),
+            family_id: family_id_from_occurrences(&occurrences),
             occurrences,
             token_count_min,
             token_count_max,
