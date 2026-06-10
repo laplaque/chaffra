@@ -57,6 +57,7 @@ struct RawCloneMatch {
     start_b: u32,
     end_b: u32,
     token_count: usize,
+    family_id: String,
     similarity: f32,
 }
 
@@ -230,64 +231,43 @@ fn merge_overlapping_families(families: &mut Vec<CloneFamily>) {
     }
 }
 
-/// Group raw clone matches by file pair, coalesce overlapping ranges, then
-/// merge families that share overlapping locations across file pairs.
+/// Group raw clone matches by family fingerprint, coalesce overlapping ranges,
+/// then merge families whose occurrences overlap in the same file.
 fn aggregate_families(raw_matches: Vec<RawCloneMatch>) -> Vec<CloneFamily> {
     if raw_matches.is_empty() {
         return vec![];
     }
 
-    // Pass 1: group by ordered file pair, coalesce ranges per side.
-    let mut pair_groups: HashMap<(String, String), Vec<&RawCloneMatch>> = HashMap::new();
+    // Pass 1: group by clone-family fingerprint to preserve identity.
+    let mut family_map: HashMap<String, Vec<&RawCloneMatch>> = HashMap::new();
     for m in &raw_matches {
-        let key = if m.file_a <= m.file_b {
-            (m.file_a.clone(), m.file_b.clone())
-        } else {
-            (m.file_b.clone(), m.file_a.clone())
-        };
-        pair_groups.entry(key).or_default().push(m);
+        family_map.entry(m.family_id.clone()).or_default().push(m);
     }
 
     let mut families = Vec::new();
-    for ((fa, fb), matches) in &pair_groups {
+    for (fid, matches) in &family_map {
         let raw_pair_count = matches.len();
         let token_count_min = matches.iter().map(|m| m.token_count).min().unwrap_or(0);
         let token_count_max = matches.iter().map(|m| m.token_count).max().unwrap_or(0);
         let similarity = matches.iter().map(|m| m.similarity).fold(0.0f32, f32::max);
 
-        let mut ranges_a: Vec<(u32, u32)> = Vec::new();
-        let mut ranges_b: Vec<(u32, u32)> = Vec::new();
+        let mut file_ranges: HashMap<&str, Vec<(u32, u32)>> = HashMap::new();
         for m in matches {
-            if m.file_a <= m.file_b {
-                ranges_a.push((m.start_a, m.end_a));
-                ranges_b.push((m.start_b, m.end_b));
-            } else {
-                ranges_a.push((m.start_b, m.end_b));
-                ranges_b.push((m.start_a, m.end_a));
-            }
+            file_ranges
+                .entry(&m.file_a)
+                .or_default()
+                .push((m.start_a, m.end_a));
+            file_ranges
+                .entry(&m.file_b)
+                .or_default()
+                .push((m.start_b, m.end_b));
         }
 
         let mut occurrences = Vec::new();
-        if fa == fb {
-            ranges_a.append(&mut ranges_b);
-            for (start, end) in coalesce_ranges(&mut ranges_a) {
+        for (file, ranges) in &mut file_ranges {
+            for (start, end) in coalesce_ranges(ranges) {
                 occurrences.push(CloneOccurrence {
-                    file: fa.clone(),
-                    start_line: start,
-                    end_line: end,
-                });
-            }
-        } else {
-            for (start, end) in coalesce_ranges(&mut ranges_a) {
-                occurrences.push(CloneOccurrence {
-                    file: fa.clone(),
-                    start_line: start,
-                    end_line: end,
-                });
-            }
-            for (start, end) in coalesce_ranges(&mut ranges_b) {
-                occurrences.push(CloneOccurrence {
-                    file: fb.clone(),
+                    file: (*file).to_owned(),
                     start_line: start,
                     end_line: end,
                 });
@@ -296,7 +276,7 @@ fn aggregate_families(raw_matches: Vec<RawCloneMatch>) -> Vec<CloneFamily> {
         occurrences.sort();
 
         families.push(CloneFamily {
-            family_id: family_id_from_occurrences(&occurrences),
+            family_id: fid.clone(),
             occurrences,
             token_count_min,
             token_count_max,
@@ -306,6 +286,7 @@ fn aggregate_families(raw_matches: Vec<RawCloneMatch>) -> Vec<CloneFamily> {
     }
 
     // Pass 2: merge families whose occurrences overlap in the same file.
+    // This collapses adjacent sliding-window families into single families.
     merge_overlapping_families(&mut families);
 
     families.sort_by(|a, b| a.family_id.cmp(&b.family_id));
@@ -339,7 +320,7 @@ fn detect_clones(
     let mut seen: std::collections::HashSet<(usize, usize, usize, usize)> =
         std::collections::HashSet::new();
 
-    for locations in hash_map.values() {
+    for (fp, locations) in &hash_map {
         if locations.len() < 2 {
             continue;
         }
@@ -402,6 +383,7 @@ fn detect_clones(
                     start_b: start_line_b,
                     end_b: end_line_b,
                     token_count: len,
+                    family_id: fp.clone(),
                     similarity,
                 });
             }
@@ -491,6 +473,10 @@ impl AnalysisModule for DuplicationModule {
         // Aggregate into families with coalesced ranges.
         let mut families = aggregate_families(raw_matches);
         let total_families = families.len();
+        let collapsed_matches: u64 = families
+            .iter()
+            .map(|f| f.raw_pair_count.saturating_sub(1) as u64)
+            .sum();
         let truncated = families.len() > max_families;
         if truncated {
             families.truncate(max_families);
@@ -498,10 +484,7 @@ impl AnalysisModule for DuplicationModule {
 
         // Convert families to findings.
         let mut findings = Vec::new();
-        let mut collapsed_matches: u64 = 0;
         for family in &families {
-            collapsed_matches += family.raw_pair_count.saturating_sub(1) as u64;
-
             let primary = &family.occurrences[0];
             let is_function = family.occurrences.iter().any(|o| o.start_line == 1);
             let rule_id = if is_function {
@@ -510,14 +493,15 @@ impl AnalysisModule for DuplicationModule {
                 "duplicate-block"
             };
 
-            let locations_json: Vec<String> = family
+            let locations_ser: Vec<serde_json::Value> = family
                 .occurrences
                 .iter()
                 .map(|o| {
-                    format!(
-                        "{{\"file\":\"{}\",\"start\":{},\"end\":{}}}",
-                        o.file, o.start_line, o.end_line
-                    )
+                    serde_json::json!({
+                        "file": o.file,
+                        "start": o.start_line,
+                        "end": o.end_line,
+                    })
                 })
                 .collect();
 
@@ -535,7 +519,7 @@ impl AnalysisModule for DuplicationModule {
             metadata.insert("mode".to_owned(), format!("{mode:?}"));
             metadata.insert(
                 "clone_locations".to_owned(),
-                format!("[{}]", locations_json.join(",")),
+                serde_json::to_string(&locations_ser).unwrap_or_default(),
             );
             metadata.insert(
                 "raw_pair_count".to_owned(),
@@ -1022,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_families_groups_by_file_pair() {
+    fn test_aggregate_families_groups_by_fingerprint() {
         let matches = vec![
             RawCloneMatch {
                 file_a: "a.go".to_owned(),
@@ -1032,6 +1016,7 @@ mod tests {
                 start_b: 1,
                 end_b: 10,
                 token_count: 50,
+                family_id: "dup:aaaa0001".to_owned(),
                 similarity: 1.0,
             },
             RawCloneMatch {
@@ -1042,6 +1027,7 @@ mod tests {
                 start_b: 2,
                 end_b: 11,
                 token_count: 50,
+                family_id: "dup:aaaa0002".to_owned(),
                 similarity: 1.0,
             },
             RawCloneMatch {
@@ -1052,10 +1038,12 @@ mod tests {
                 start_b: 5,
                 end_b: 15,
                 token_count: 50,
+                family_id: "dup:bbbb0001".to_owned(),
                 similarity: 0.95,
             },
         ];
         let families = aggregate_families(matches);
+        // The first two matches overlap in (a.go, b.go) and get merged
         assert_eq!(families.len(), 2, "should produce two families");
 
         let fam_ab = families
@@ -1081,6 +1069,54 @@ mod tests {
             .find(|f| f.occurrences.iter().any(|o| o.file == "c.go"))
             .unwrap();
         assert_eq!(fam_cd.raw_pair_count, 1);
+    }
+
+    #[test]
+    fn test_unrelated_blocks_same_file_pair_stay_separate() {
+        let module = DuplicationModule::new();
+        // Two distinct duplicate blocks between the same pair of files,
+        // separated by unique (non-matching) filler to prevent bridging.
+        let block_x: String = (0..40)
+            .map(|i| format!("    alpha{i} := computeX({i})\n"))
+            .collect();
+        let block_y: String = (0..40)
+            .map(|i| format!("    beta{i} := computeY({i})\n"))
+            .collect();
+        let filler_a: String = (0..30)
+            .map(|i| format!("    onlyInA{i} := separatorA({i})\n"))
+            .collect();
+        let filler_b: String = (0..30)
+            .map(|i| format!("    onlyInB{i} := separatorB({i})\n"))
+            .collect();
+
+        let file_a = format!(
+            "package main\n\nfunc A1() {{\n{block_x}}}\n\n{filler_a}\nfunc A2() {{\n{block_y}}}\n"
+        );
+        let file_b = format!(
+            "package main\n\nfunc B1() {{\n{block_x}}}\n\n{filler_b}\nfunc B2() {{\n{block_y}}}\n"
+        );
+        let files = vec![make_file("a.go", &file_a), make_file("b.go", &file_b)];
+
+        let mut config = HashMap::new();
+        config.insert("min-tokens".to_owned(), "20".to_owned());
+
+        let result = module.analyze(&files, &config).unwrap();
+        assert!(
+            result.findings.len() >= 2,
+            "two unrelated blocks between the same files must produce separate families, got {}",
+            result.findings.len()
+        );
+        // Verify the findings reference different line ranges
+        let locs: Vec<_> = result
+            .findings
+            .iter()
+            .map(|f| (f.location.start_line, f.location.end_line))
+            .collect();
+        let all_same = locs.windows(2).all(|w| w[0] == w[1]);
+        assert!(
+            !all_same,
+            "findings should cover different line ranges, got {locs:?}"
+        );
     }
 
     #[test]

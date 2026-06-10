@@ -12,4 +12,5 @@ chaffra-core = { workspace = true }
 chaffra-parse = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
