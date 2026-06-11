@@ -1661,10 +1661,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_build_module_host() {
@@ -2733,23 +2730,22 @@ mod tests {
             ..Default::default()
         };
 
-        let (output, state_file) = {
-            let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let original_dir = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir.path()).unwrap();
+        // Temporarily override the state file path by running in the temp dir.
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
 
-            let formatter = create_formatter(OutputFormat::Terminal);
-            let output = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
-                cmd_dead_code(&root, &config, formatter.as_ref(), collector)
-            })
-            .unwrap();
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let output = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+            cmd_dead_code(&root, &config, formatter.as_ref(), collector)
+        })
+        .unwrap();
 
-            std::env::set_current_dir(&original_dir).unwrap();
-            let sf = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
-            (output, sf)
-        };
+        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(!output.is_empty());
+
+        // Verify state file was written with real fingerprints.
+        let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
         assert!(state_file.exists(), "churn state file should be written");
         let state = chaffra_telemetry::churn::load_state(&state_file).unwrap();
         assert!(
@@ -2783,18 +2779,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = {
-            let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let original_dir = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir.path()).unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
 
-            let r = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
-                anyhow::bail!("simulated analysis failure")
-            });
+        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated analysis failure")
+        });
 
-            std::env::set_current_dir(&original_dir).unwrap();
-            r
-        };
+        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(result.is_err());
 
@@ -2837,18 +2829,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = {
-            let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let original_dir = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir.path()).unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
 
-            let r = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
-                anyhow::bail!("simulated analysis failure")
-            });
+        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated analysis failure")
+        });
 
-            std::env::set_current_dir(&original_dir).unwrap();
-            r
-        };
+        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(result.is_err());
 
