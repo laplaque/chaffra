@@ -74,9 +74,13 @@ jobs:
         run: |
           cargo run -p chaffra-cli -- dupes . --min-tokens 100 --format terminal --telemetry off > /tmp/dupes-terminal.txt
           lines=$(wc -l < /tmp/dupes-terminal.txt)
-          echo "Output lines: ${lines}"
-          if [ "$lines" -ge 10000 ]; then echo "FAIL: terminal output >= 10000 lines"; exit 1; fi
-          head -20 /tmp/dupes-terminal.txt
+          warnings=$(grep -c '\[W\]' /tmp/dupes-terminal.txt || true)
+          families=$(grep -c 'clone family' /tmp/dupes-terminal.txt || true)
+          echo "Output lines: ${lines}, [W] warnings: ${warnings}, clone family mentions: ${families}"
+          if [ "$lines" -ge 500 ]; then echo "FAIL: terminal output >= 500 lines"; exit 1; fi
+          if [ "$warnings" -ge 200 ]; then echo "FAIL: [W] count >= 200 (old baseline was 1566)"; exit 1; fi
+          if [ "$families" -eq 0 ]; then echo "FAIL: no 'clone family' in output — grouped format missing"; exit 1; fi
+          echo "Terminal regression OK: ${warnings} warnings, ${families} clone families, ${lines} lines"
       - name: "Regression: mild mode JSON dupes"
         run: |
           cargo run -p chaffra-cli -- dupes . --mode mild --min-tokens 30 --format json --telemetry off > /tmp/dupes-mild.json
