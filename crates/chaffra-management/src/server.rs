@@ -8,6 +8,7 @@ use crate::dashboard_html::DASHBOARD_HTML;
 
 pub struct SharedState {
     pub collector: chaffra_telemetry::TelemetryCollector,
+    pub live_state: chaffra_telemetry::LiveTelemetryState,
 }
 
 #[derive(Debug, Clone)]
@@ -27,10 +28,17 @@ pub struct ManagementServer {
 }
 
 impl ManagementServer {
-    pub fn new(config: ManagementConfig, collector: chaffra_telemetry::TelemetryCollector) -> Self {
+    pub fn new(
+        config: ManagementConfig,
+        collector: chaffra_telemetry::TelemetryCollector,
+        live_state: chaffra_telemetry::LiveTelemetryState,
+    ) -> Self {
         Self {
             config,
-            state: Arc::new(SharedState { collector }),
+            state: Arc::new(SharedState {
+                collector,
+                live_state,
+            }),
         }
     }
 
@@ -84,7 +92,11 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        Arc::new(SharedState { collector })
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        Arc::new(SharedState {
+            collector,
+            live_state,
+        })
     }
 
     #[tokio::test]
@@ -177,7 +189,11 @@ mod tests {
         };
         collector.record_finding_churn(&churn);
 
-        let state = Arc::new(SharedState { collector });
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+        });
         let app = build_router(state);
         let resp = app
             .oneshot(
@@ -213,7 +229,11 @@ mod tests {
         let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
         collector.record_module_summary_metric("complexity", "health_score", 85.0);
 
-        let state = Arc::new(SharedState { collector });
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+        });
         let app = build_router(state);
         let resp = app
             .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
@@ -244,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metrics_history_endpoint() {
+    async fn test_metrics_history_endpoint_empty() {
         let app = build_router(test_state());
         let resp = app
             .oneshot(
@@ -260,8 +280,45 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["window"], "7d");
-        assert_eq!(parsed["status"], "not_implemented");
-        assert!(parsed["message"].as_str().unwrap().contains("co-located"));
+        assert_eq!(parsed["status"], "empty");
+        assert!(
+            parsed["message"]
+                .as_str()
+                .unwrap()
+                .contains("No telemetry data")
+        );
         assert!(parsed["snapshots"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_history_endpoint_seeded() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let live_state = chaffra_telemetry::seed::seed_live_state();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics/history?window=7d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["window"], "7d");
+        assert_eq!(parsed["status"], "seeded");
+        let snapshots = parsed["snapshots"].as_array().unwrap();
+        assert!(
+            snapshots.len() >= 10,
+            "seeded history should have 10+ snapshots, got {}",
+            snapshots.len()
+        );
     }
 }

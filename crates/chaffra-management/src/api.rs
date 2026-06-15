@@ -129,14 +129,40 @@ pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<
 }
 
 pub async fn get_metrics_history(
-    _state: axum::extract::State<Arc<SharedState>>,
+    state: axum::extract::State<Arc<SharedState>>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
 ) -> Json<MetricsHistoryResponse> {
+    let source = state.live_state.source();
+    let (status, message) = match source {
+        chaffra_telemetry::StateSource::Live => (
+            "live".to_owned(),
+            "Live telemetry data from analysis runs.".to_owned(),
+        ),
+        chaffra_telemetry::StateSource::Seeded => (
+            "seeded".to_owned(),
+            "Seeded demo/test data. Run an analysis to populate live metrics.".to_owned(),
+        ),
+        chaffra_telemetry::StateSource::Empty => {
+            return Json(MetricsHistoryResponse {
+                window: query.window,
+                snapshots: Vec::new(),
+                status: "empty".to_owned(),
+                message: "No telemetry data available. Run an analysis or start with --seed to populate metrics.".to_owned(),
+            });
+        }
+    };
+
+    let snapshots = state.live_state.history_window(&query.window);
+    let snapshot_values: Vec<serde_json::Value> = snapshots
+        .iter()
+        .filter_map(|s| serde_json::to_value(s).ok())
+        .collect();
+
     Json(MetricsHistoryResponse {
         window: query.window,
-        snapshots: Vec::new(),
-        status: "not_implemented".to_owned(),
-        message: "Time-series history requires the streaming/watch mode integration. This endpoint will return snapshots once co-located mode is available.".to_owned(),
+        snapshots: snapshot_values,
+        status,
+        message,
     })
 }
 

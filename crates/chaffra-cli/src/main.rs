@@ -46,8 +46,8 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<String>,
 
-    /// Telemetry mode: on, off, user-only, operator-only.
-    #[arg(long, global = true, default_value = "on")]
+    /// Telemetry mode: on, off, user-only, operator-only (default: user-only).
+    #[arg(long, global = true, default_value = "user-only")]
     telemetry: String,
 
     /// Override telemetry backend (json-file, stderr, prometheus, otlp, statsd).
@@ -1108,7 +1108,7 @@ fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<Strin
 
 fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
     let audience = chaffra_telemetry::TelemetryAudience::from_str_loose(&cli.telemetry)
-        .unwrap_or(chaffra_telemetry::TelemetryAudience::On);
+        .unwrap_or(chaffra_telemetry::TelemetryAudience::UserOnly);
 
     let backends = if let Some(ref backend_str) = cli.telemetry_backend {
         if let Some(kind) = chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
@@ -1648,8 +1648,9 @@ async fn main() -> Result<()> {
         Command::Management { port } => {
             let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
             collector.register_core_metrics();
+            let live_state = chaffra_telemetry::seed::seed_live_state();
             let config = chaffra_management::ManagementConfig { port };
-            let server = chaffra_management::ManagementServer::new(config, collector);
+            let server = chaffra_management::ManagementServer::new(config, collector, live_state);
             server.run().await?;
         }
     }
