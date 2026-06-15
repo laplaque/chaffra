@@ -1230,10 +1230,20 @@ fn cmd_telemetry_inspect(tel_config: &chaffra_telemetry::TelemetryConfig) -> Res
     sev.insert("warning".to_owned(), 2);
     collector.record_module_findings("example-module", 2, &sev);
 
-    let snapshot = collector.snapshot();
+    let raw_snapshot = collector.snapshot();
+    let snapshot = if tel_config.audience.operator_enabled() {
+        raw_snapshot
+    } else {
+        raw_snapshot.user_scoped()
+    };
     let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
 
     let mut out = String::new();
+    if !tel_config.audience.operator_enabled() {
+        out.push_str(
+            "(Showing user-scoped snapshot; use --telemetry on for full operator view)\n\n",
+        );
+    }
     for backend in &backends {
         out.push_str(&format!("--- {} ---\n", backend.name()));
         match backend.inspect(&snapshot) {
@@ -2934,14 +2944,9 @@ mod tests {
             ..Default::default()
         };
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let result = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
             anyhow::bail!("simulated analysis failure")
         });
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(result.is_err());
 
