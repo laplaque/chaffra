@@ -1,0 +1,8 @@
+# Code owners for chaffra.
+#
+# Activates `require_code_owner_review` in the `protect_main` ruleset:
+# every PR to a protected branch requires review from @laplaque before merge.
+# Coordinators and contributors (e.g. iamclaude697) author and address review;
+# only @laplaque approves and merges.
+
+* @laplaque
