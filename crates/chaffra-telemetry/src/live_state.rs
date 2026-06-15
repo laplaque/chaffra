@@ -77,9 +77,19 @@ impl LiveTelemetryState {
             inner.history.pop_front();
         }
         inner.history.push_back(snapshot);
-        if inner.source == StateSource::Empty {
+        if inner.source != StateSource::Live {
             inner.source = StateSource::Live;
         }
+    }
+
+    /// Push a snapshot without changing the source (used for seeded data).
+    pub fn push_seeded(&self, snapshot: TelemetrySnapshot) {
+        let mut inner = self.inner.write().unwrap();
+        inner.current = Some(snapshot.clone());
+        if inner.history.len() >= inner.max_history {
+            inner.history.pop_front();
+        }
+        inner.history.push_back(snapshot);
     }
 
     /// Get the latest snapshot, if any.

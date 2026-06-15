@@ -9,6 +9,7 @@ use crate::dashboard_html::DASHBOARD_HTML;
 pub struct SharedState {
     pub collector: chaffra_telemetry::TelemetryCollector,
     pub live_state: chaffra_telemetry::LiveTelemetryState,
+    pub audience: chaffra_telemetry::config::TelemetryAudience,
 }
 
 #[derive(Debug, Clone)]
@@ -32,12 +33,14 @@ impl ManagementServer {
         config: ManagementConfig,
         collector: chaffra_telemetry::TelemetryCollector,
         live_state: chaffra_telemetry::LiveTelemetryState,
+        audience: chaffra_telemetry::config::TelemetryAudience,
     ) -> Self {
         Self {
             config,
             state: Arc::new(SharedState {
                 collector,
                 live_state,
+                audience,
             }),
         }
     }
@@ -96,6 +99,7 @@ mod tests {
         Arc::new(SharedState {
             collector,
             live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         })
     }
 
@@ -193,6 +197,7 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -233,6 +238,7 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -297,6 +303,7 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
