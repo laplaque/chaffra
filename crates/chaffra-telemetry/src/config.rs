@@ -11,11 +11,11 @@ use std::collections::HashMap;
 #[serde(rename_all = "kebab-case")]
 pub enum TelemetryAudience {
     /// Both user-facing and operator metrics.
-    #[default]
     On,
     /// All telemetry disabled.
     Off,
     /// Only user-facing metrics (finding counts, durations in output).
+    #[default]
     UserOnly,
     /// Only operator metrics (backend sinks, no output decoration).
     OperatorOnly,
@@ -123,7 +123,7 @@ fn default_sampling_rate() -> f64 {
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            audience: TelemetryAudience::On,
+            audience: TelemetryAudience::UserOnly,
             backends: default_backends(),
             sampling_rate: 1.0,
             sampling_strategy: SamplingStrategy::default(),
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_audience_default() {
-        assert_eq!(TelemetryAudience::default(), TelemetryAudience::On);
+        assert_eq!(TelemetryAudience::default(), TelemetryAudience::UserOnly);
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let cfg = TelemetryConfig::default();
-        assert_eq!(cfg.audience, TelemetryAudience::On);
+        assert_eq!(cfg.audience, TelemetryAudience::UserOnly);
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].kind, BackendKind::JsonFile);
         assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
@@ -287,7 +287,7 @@ mod tests {
     fn test_from_module_config_defaults() {
         let mc = HashMap::new();
         let cfg = TelemetryConfig::from_module_config(&mc);
-        assert_eq!(cfg.audience, TelemetryAudience::On);
+        assert_eq!(cfg.audience, TelemetryAudience::UserOnly);
         assert_eq!(cfg.backends[0].kind, BackendKind::JsonFile);
         assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
         assert_eq!(cfg.sampling_strategy, SamplingStrategy::Rate);
