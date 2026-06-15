@@ -47,8 +47,8 @@ struct Cli {
     config: Option<String>,
 
     /// Telemetry mode: on, off, user-only, operator-only (default: user-only).
-    #[arg(long, global = true, default_value = "user-only")]
-    telemetry: String,
+    #[arg(long, global = true)]
+    telemetry: Option<String>,
 
     /// Override telemetry backend (json-file, stderr, prometheus, otlp, statsd).
     #[arg(long = "telemetry-backend", global = true)]
@@ -347,6 +347,7 @@ fn fingerprints_from_findings(
 fn merge_telemetry_config(
     cli_config: &chaffra_telemetry::TelemetryConfig,
     project_config: &ChaffraConfig,
+    explicit_cli_audience: bool,
 ) -> chaffra_telemetry::TelemetryConfig {
     let mut config = cli_config.clone();
     let module_cfg = project_config.module_config("telemetry");
@@ -355,11 +356,7 @@ fn merge_telemetry_config(
         config.sampling_rate = project_tel.sampling_rate;
         config.sampling_strategy = project_tel.sampling_strategy;
 
-        let cli_is_default_audience =
-            config.audience == chaffra_telemetry::TelemetryAudience::UserOnly;
-        if cli_is_default_audience
-            && project_tel.audience != chaffra_telemetry::TelemetryAudience::UserOnly
-        {
+        if !explicit_cli_audience {
             config.audience = project_tel.audience;
         }
 
@@ -1126,9 +1123,15 @@ fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<Strin
     Ok(out)
 }
 
-fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
-    let audience = chaffra_telemetry::TelemetryAudience::from_str_loose(&cli.telemetry)
-        .unwrap_or(chaffra_telemetry::TelemetryAudience::UserOnly);
+fn build_telemetry_config(cli: &Cli) -> (chaffra_telemetry::TelemetryConfig, bool) {
+    let (audience, explicit) = match cli.telemetry.as_deref() {
+        Some(s) => (
+            chaffra_telemetry::TelemetryAudience::from_str_loose(s)
+                .unwrap_or(chaffra_telemetry::TelemetryAudience::UserOnly),
+            true,
+        ),
+        None => (chaffra_telemetry::TelemetryAudience::UserOnly, false),
+    };
 
     let backends = if let Some(ref backend_str) = cli.telemetry_backend {
         if let Some(kind) = chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
@@ -1152,11 +1155,14 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
         chaffra_telemetry::TelemetryConfig::default().backends
     };
 
-    chaffra_telemetry::TelemetryConfig {
-        audience,
-        backends,
-        ..Default::default()
-    }
+    (
+        chaffra_telemetry::TelemetryConfig {
+            audience,
+            backends,
+            ..Default::default()
+        },
+        explicit,
+    )
 }
 
 fn cmd_telemetry_status(tel_config: &chaffra_telemetry::TelemetryConfig) -> String {
@@ -1296,13 +1302,15 @@ fn cmd_workspaces(root: &Path, format: OutputFormat) -> String {
 fn run_with_telemetry<F>(
     tel_config: &chaffra_telemetry::TelemetryConfig,
     project_config: &ChaffraConfig,
+    explicit_cli_audience: bool,
     command_name: &str,
     f: F,
 ) -> Result<String>
 where
     F: FnOnce(&chaffra_telemetry::TelemetryCollector) -> Result<String>,
 {
-    let effective_config = merge_telemetry_config(tel_config, project_config);
+    let effective_config =
+        merge_telemetry_config(tel_config, project_config, explicit_cli_audience);
 
     if matches!(
         effective_config.audience,
@@ -1386,7 +1394,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_str_loose(&cli.format).unwrap_or(OutputFormat::Terminal);
     let formatter = create_formatter(format);
-    let tel_config = build_telemetry_config(&cli);
+    let (tel_config, explicit_cli_audience) = build_telemetry_config(&cli);
 
     match cli.command {
         Command::Health { path } => {
@@ -1394,9 +1402,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "health", |_collector| {
-                    cmd_health(&root, &config, formatter.as_ref())
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "health",
+                    |_collector| { cmd_health(&root, &config, formatter.as_ref()) }
+                )?
             );
         }
 
@@ -1405,9 +1417,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
-                    cmd_dead_code(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "dead-code",
+                    |collector| { cmd_dead_code(&root, &config, formatter.as_ref(), collector) }
+                )?
             );
         }
 
@@ -1416,9 +1432,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "security", |collector| {
-                    cmd_security(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "security",
+                    |collector| { cmd_security(&root, &config, formatter.as_ref(), collector) }
+                )?
             );
         }
 
@@ -1427,9 +1447,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "audit", |collector| {
-                    cmd_audit(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "audit",
+                    |collector| { cmd_audit(&root, &config, formatter.as_ref(), collector) }
+                )?
             );
         }
 
@@ -1438,9 +1462,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "hotspot", |collector| {
-                    cmd_hotspot(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "hotspot",
+                    |collector| { cmd_hotspot(&root, &config, formatter.as_ref(), collector) }
+                )?
             );
         }
 
@@ -1449,9 +1477,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "ai-quality", |collector| {
-                    cmd_ai_quality(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "ai-quality",
+                    |collector| { cmd_ai_quality(&root, &config, formatter.as_ref(), collector) }
+                )?
             );
         }
 
@@ -1460,9 +1492,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "llm-defense", |collector| {
-                    cmd_llm_defense(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "llm-defense",
+                    |collector| { cmd_llm_defense(&root, &config, formatter.as_ref(), collector) }
+                )?
             );
         }
 
@@ -1471,9 +1507,15 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "cicd-security", |collector| {
-                    cmd_cicd_security(&root, &config, formatter.as_ref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "cicd-security",
+                    |collector| {
+                        cmd_cicd_security(&root, &config, formatter.as_ref(), collector)
+                    }
+                )?
             );
         }
 
@@ -1486,16 +1528,22 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "duplication", |collector| {
-                    cmd_dupes(
-                        &root,
-                        &config,
-                        formatter.as_ref(),
-                        &mode,
-                        &min_tokens,
-                        collector,
-                    )
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "duplication",
+                    |collector| {
+                        cmd_dupes(
+                            &root,
+                            &config,
+                            formatter.as_ref(),
+                            &mode,
+                            &min_tokens,
+                            collector,
+                        )
+                    }
+                )?
             );
         }
 
@@ -1504,15 +1552,21 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "architecture", |collector| {
-                    cmd_boundaries(
-                        &root,
-                        &config,
-                        formatter.as_ref(),
-                        preset.as_deref(),
-                        collector,
-                    )
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "architecture",
+                    |collector| {
+                        cmd_boundaries(
+                            &root,
+                            &config,
+                            formatter.as_ref(),
+                            preset.as_deref(),
+                            collector,
+                        )
+                    }
+                )?
             );
         }
 
@@ -1544,9 +1598,13 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "fix", |collector| {
-                    cmd_fix(&root, &config, dry_run, rule.as_deref(), collector)
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "fix",
+                    |collector| { cmd_fix(&root, &config, dry_run, rule.as_deref(), collector) }
+                )?
             );
         }
 
@@ -1615,17 +1673,23 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(&tel_config, &config, "impact", |collector| {
-                    cmd_impact(
-                        &root,
-                        &config,
-                        save_snapshot.as_deref(),
-                        baseline.as_deref(),
-                        label.clone(),
-                        format,
-                        collector,
-                    )
-                })?
+                run_with_telemetry(
+                    &tel_config,
+                    &config,
+                    explicit_cli_audience,
+                    "impact",
+                    |collector| {
+                        cmd_impact(
+                            &root,
+                            &config,
+                            save_snapshot.as_deref(),
+                            baseline.as_deref(),
+                            label.clone(),
+                            format,
+                            collector,
+                        )
+                    }
+                )?
             );
         }
 
@@ -1676,8 +1740,12 @@ async fn main() -> Result<()> {
         },
 
         Command::Management { port } => {
-            let audience = tel_config.audience;
-            let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
+            let project_config =
+                ChaffraConfig::load_from_dir(&std::env::current_dir()?).unwrap_or_default();
+            let effective_tel =
+                merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience);
+            let audience = effective_tel.audience;
+            let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel);
             collector.register_core_metrics();
             let live_state = if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
                 chaffra_telemetry::LiveTelemetryState::new()
@@ -2707,7 +2775,7 @@ mod tests {
         .unwrap();
         let project_config = load_config(None, dir.path()).unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config);
+        let merged = merge_telemetry_config(&cli_config, &project_config, false);
         assert!(
             (merged.sampling_rate - 0.5).abs() < f64::EPSILON,
             "project config sampling-rate should override default"
@@ -2772,7 +2840,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
 
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+        let output = run_with_telemetry(&tel_config, &config, false, "dead-code", |collector| {
             cmd_dead_code(&root, &config, formatter.as_ref(), collector)
         })
         .unwrap();
@@ -2819,7 +2887,7 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
-        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+        let result = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
             anyhow::bail!("simulated analysis failure")
         });
 
@@ -2869,7 +2937,7 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
-        let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+        let result = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
             anyhow::bail!("simulated analysis failure")
         });
 
@@ -2942,7 +3010,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _ = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+        let _ = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
             anyhow::bail!("simulated failure to trigger error flush")
         });
 
@@ -2990,7 +3058,7 @@ mod tests {
         };
 
         let formatter = create_formatter(OutputFormat::Terminal);
-        let _ = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+        let _ = run_with_telemetry(&tel_config, &config, false, "dead-code", |collector| {
             cmd_dead_code(&root, &config, formatter.as_ref(), collector)
         });
 
@@ -3031,29 +3099,43 @@ mod tests {
     #[test]
     fn test_build_telemetry_config_invalid_string_falls_back_to_user_only() {
         let cli = Cli::parse_from(["chaffra", "--telemetry", "garbage-value", "health", "."]);
-        let config = build_telemetry_config(&cli);
+        let (config, explicit) = build_telemetry_config(&cli);
         assert_eq!(
             config.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly,
             "Invalid telemetry flag should fall back to UserOnly"
         );
+        assert!(explicit, "CLI flag was provided even if invalid");
     }
 
     #[test]
     fn test_build_telemetry_config_valid_off() {
         let cli = Cli::parse_from(["chaffra", "--telemetry", "off", "health", "."]);
-        let config = build_telemetry_config(&cli);
+        let (config, explicit) = build_telemetry_config(&cli);
         assert_eq!(config.audience, chaffra_telemetry::TelemetryAudience::Off);
+        assert!(explicit);
     }
 
     #[test]
     fn test_build_telemetry_config_valid_operator_only() {
         let cli = Cli::parse_from(["chaffra", "--telemetry", "operator-only", "health", "."]);
-        let config = build_telemetry_config(&cli);
+        let (config, explicit) = build_telemetry_config(&cli);
         assert_eq!(
             config.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly
         );
+        assert!(explicit);
+    }
+
+    #[test]
+    fn test_build_telemetry_config_omitted_is_not_explicit() {
+        let cli = Cli::parse_from(["chaffra", "health", "."]);
+        let (config, explicit) = build_telemetry_config(&cli);
+        assert_eq!(
+            config.audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly
+        );
+        assert!(!explicit, "Omitted --telemetry flag should not be explicit");
     }
 
     #[test]
@@ -3062,7 +3144,7 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config);
+        let merged = merge_telemetry_config(&cli_config, &project_config, false);
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::Off,
@@ -3079,7 +3161,7 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config);
+        let merged = merge_telemetry_config(&cli_config, &project_config, true);
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly,
@@ -3093,11 +3175,25 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config);
+        let merged = merge_telemetry_config(&cli_config, &project_config, false);
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::On,
             "Project audience=on should enable operator opt-in"
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_explicit_user_only_not_overridden() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config, true);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+            "Explicit --telemetry user-only should not be overridden by project audience=on"
         );
     }
 }
