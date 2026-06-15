@@ -45,7 +45,6 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     let mut module_call_durations = HashMap::new();
     let mut module_error_counts = HashMap::new();
     let mut findings_by_module = HashMap::new();
-    let mut findings_by_severity = HashMap::new();
 
     // dead-code: health 92, fast, findings mostly warnings
     let dc_findings = 3 + (iteration % 3);
@@ -102,14 +101,47 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     module_call_durations.insert("security".to_owned(), 850);
     findings_by_module.insert("security".to_owned(), sec_findings);
 
-    // Severity distribution across modules
-    let error_count = 2 + (iteration % 2);
-    let warning_count = dc_findings + cx_findings - error_count;
-    let info_count = sec_findings;
-    findings_by_severity.insert("error".to_owned(), error_count);
-    findings_by_severity.insert("warning".to_owned(), warning_count);
-    findings_by_severity.insert("info".to_owned(), info_count);
+    // Per-module severity distribution
+    // dead-code: all warnings
+    let mut module_severities: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    module_severities.insert(
+        "dead-code".to_owned(),
+        [("warning".to_owned(), dc_findings)].into_iter().collect(),
+    );
+    // complexity: mix of warnings and info
+    let cx_warnings = cx_findings / 2;
+    let cx_info = cx_findings - cx_warnings;
+    module_severities.insert(
+        "complexity".to_owned(),
+        [
+            ("warning".to_owned(), cx_warnings),
+            ("info".to_owned(), cx_info),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    // security: errors, warnings, and info
+    let sec_errors = 1 + (iteration % 2);
+    let sec_warnings = sec_findings.saturating_sub(sec_errors + 1);
+    let sec_info = sec_findings.saturating_sub(sec_errors + sec_warnings);
+    module_severities.insert(
+        "security".to_owned(),
+        [
+            ("error".to_owned(), sec_errors),
+            ("warning".to_owned(), sec_warnings),
+            ("info".to_owned(), sec_info),
+        ]
+        .into_iter()
+        .collect(),
+    );
 
+    // Aggregate severity totals from per-module counts
+    let mut findings_by_severity = HashMap::new();
+    for per_sev in module_severities.values() {
+        for (sev, count) in per_sev {
+            *findings_by_severity.entry(sev.clone()).or_insert(0u64) += count;
+        }
+    }
     // Module error: security has an error on every other iteration
     if iteration % 2 == 1 {
         module_error_counts.insert("security".to_owned(), 1);
@@ -152,22 +184,27 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
         });
     }
 
-    // Per-module, per-severity findings (sorted)
-    let mut sorted_severities: Vec<_> = findings_by_severity.keys().cloned().collect();
-    sorted_severities.sort();
+    // Per-module, per-severity findings (sorted, using per-module counts)
+    let mut all_severities: Vec<_> = findings_by_severity.keys().cloned().collect();
+    all_severities.sort();
     for module in &sorted_modules {
-        for severity in &sorted_severities {
-            data_points.push(MetricDataPoint {
-                name: "chaffra.analysis.findings_by_severity".to_owned(),
-                value: *findings_by_severity.get(severity).unwrap_or(&0) as f64,
-                labels: {
-                    let mut m = HashMap::new();
-                    m.insert("module".to_owned(), module.clone());
-                    m.insert("severity".to_owned(), severity.clone());
-                    m
-                },
-                timestamp_ms: ts,
-            });
+        let empty = HashMap::new();
+        let mod_sevs = module_severities.get(module).unwrap_or(&empty);
+        for severity in &all_severities {
+            let count = mod_sevs.get(severity).copied().unwrap_or(0);
+            if count > 0 {
+                data_points.push(MetricDataPoint {
+                    name: "chaffra.analysis.findings_by_severity".to_owned(),
+                    value: count as f64,
+                    labels: {
+                        let mut m = HashMap::new();
+                        m.insert("module".to_owned(), module.clone());
+                        m.insert("severity".to_owned(), severity.clone());
+                        m
+                    },
+                    timestamp_ms: ts,
+                });
+            }
         }
     }
 
@@ -639,6 +676,54 @@ mod tests {
             modules_with_findings.len() >= 2,
             "expected findings across 2+ modules, got {}",
             modules_with_findings.len()
+        );
+    }
+
+    #[test]
+    fn test_seed_per_module_severity_counts_match_finding_totals() {
+        let state = seed_live_state();
+        let current = state.current().unwrap();
+
+        let severity_dps: Vec<_> = current
+            .data_points
+            .iter()
+            .filter(|p| p.name == "chaffra.analysis.findings_by_severity")
+            .collect();
+
+        assert!(
+            !severity_dps.is_empty(),
+            "expected findings_by_severity datapoints"
+        );
+
+        let mut module_severity_totals: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for dp in &severity_dps {
+            let module = dp.labels.get("module").expect("missing module label");
+            *module_severity_totals.entry(module.clone()).or_insert(0) += dp.value as u64;
+        }
+
+        for (module, expected_count) in &current.user_summary.findings_by_module {
+            let severity_total = module_severity_totals.get(module).copied().unwrap_or(0);
+            assert_eq!(
+                severity_total, *expected_count,
+                "module {module}: severity total ({severity_total}) should equal finding count ({expected_count})"
+            );
+        }
+
+        assert!(
+            module_severity_totals.contains_key("security"),
+            "security module should have severity datapoints"
+        );
+        let sec_severities: Vec<_> = severity_dps
+            .iter()
+            .filter(|dp| dp.labels.get("module").map(|m| m.as_str()) == Some("security"))
+            .collect();
+        let has_error = sec_severities
+            .iter()
+            .any(|dp| dp.labels.get("severity").map(|s| s.as_str()) == Some("error"));
+        assert!(
+            has_error,
+            "security module should have error-severity findings"
         );
     }
 }

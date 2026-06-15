@@ -97,7 +97,12 @@ fn default_window() -> String {
 }
 
 pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<MetricsResponse> {
-    let snapshot = state.collector.snapshot();
+    let raw_snapshot = state.collector.snapshot();
+    let snapshot = if state.audience.operator_enabled() {
+        raw_snapshot
+    } else {
+        raw_snapshot.user_scoped()
+    };
     let data_points = snapshot
         .data_points
         .iter()

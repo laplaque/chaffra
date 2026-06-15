@@ -405,4 +405,70 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_user_only_hides_operator_datapoints() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 150, false);
+        collector.set_files_total(10);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dps = parsed["data_points"].as_array().unwrap();
+        for dp in dps {
+            let name = dp["name"].as_str().unwrap();
+            assert!(
+                !name.starts_with("chaffra.module.call_duration"),
+                "operator datapoint {name} leaked through UserOnly metrics endpoint"
+            );
+            assert!(
+                !name.starts_with("chaffra.module.error_total"),
+                "operator datapoint {name} leaked through UserOnly metrics endpoint"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_operator_includes_all_datapoints() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 150, false);
+        collector.set_files_total(10);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::On,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dps = parsed["data_points"].as_array().unwrap();
+        let has_call_duration = dps
+            .iter()
+            .any(|dp| dp["name"].as_str().unwrap().contains("call_duration"));
+        assert!(
+            has_call_duration,
+            "operator audience should include call_duration datapoints"
+        );
+    }
 }
