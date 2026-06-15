@@ -354,6 +354,26 @@ fn merge_telemetry_config(
         let project_tel = chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg);
         config.sampling_rate = project_tel.sampling_rate;
         config.sampling_strategy = project_tel.sampling_strategy;
+
+        let cli_is_default_audience =
+            config.audience == chaffra_telemetry::TelemetryAudience::UserOnly;
+        if cli_is_default_audience
+            && project_tel.audience != chaffra_telemetry::TelemetryAudience::UserOnly
+        {
+            config.audience = project_tel.audience;
+        }
+
+        let cli_is_default_backends = config.backends.len() == 1
+            && config.backends[0].kind == chaffra_telemetry::BackendKind::JsonFile
+            && config.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
+        if cli_is_default_backends && !project_tel.backends.is_empty() {
+            let proj_is_default = project_tel.backends.len() == 1
+                && project_tel.backends[0].kind == chaffra_telemetry::BackendKind::JsonFile
+                && project_tel.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
+            if !proj_is_default {
+                config.backends = project_tel.backends;
+            }
+        }
     }
     config
 }
@@ -2922,14 +2942,9 @@ mod tests {
             ..Default::default()
         };
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let _ = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
             anyhow::bail!("simulated failure to trigger error flush")
         });
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(
             telemetry_path.exists(),
@@ -3011,5 +3026,78 @@ mod tests {
 
         let spans = parsed["spans"].as_array().unwrap();
         assert!(spans.is_empty(), "UserOnly flush should have no spans");
+    }
+
+    #[test]
+    fn test_build_telemetry_config_invalid_string_falls_back_to_user_only() {
+        let cli = Cli::parse_from(["chaffra", "--telemetry", "garbage-value", "health", "."]);
+        let config = build_telemetry_config(&cli);
+        assert_eq!(
+            config.audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+            "Invalid telemetry flag should fall back to UserOnly"
+        );
+    }
+
+    #[test]
+    fn test_build_telemetry_config_valid_off() {
+        let cli = Cli::parse_from(["chaffra", "--telemetry", "off", "health", "."]);
+        let config = build_telemetry_config(&cli);
+        assert_eq!(config.audience, chaffra_telemetry::TelemetryAudience::Off);
+    }
+
+    #[test]
+    fn test_build_telemetry_config_valid_operator_only() {
+        let cli = Cli::parse_from(["chaffra", "--telemetry", "operator-only", "health", "."]);
+        let config = build_telemetry_config(&cli);
+        assert_eq!(
+            config.audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_audience_from_project() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::Off,
+            "Project audience=off should override CLI default"
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_cli_audience_takes_precedence() {
+        let cli_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::OperatorOnly,
+            ..Default::default()
+        };
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly,
+            "Explicit CLI audience should take precedence over project config"
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_operator_opt_in_from_project() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::On,
+            "Project audience=on should enable operator opt-in"
+        );
     }
 }
