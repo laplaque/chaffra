@@ -11,8 +11,10 @@ use std::collections::HashMap;
 /// Deterministic base timestamp (fixed, not wall-clock dependent).
 const BASE_TS: u64 = 1_718_000_000_000;
 
-/// Interval between historical snapshots (~16 hours in milliseconds).
-const SNAPSHOT_INTERVAL: u64 = 57_600_000;
+/// Interval between historical snapshots (~15 hours in milliseconds).
+/// 12 snapshots × 11 intervals × 54M ms = 594M ms < 604.8M ms (7 days),
+/// so all snapshots fit within a 7-day query window.
+const SNAPSHOT_INTERVAL: u64 = 54_000_000;
 
 /// Build a `LiveTelemetryState` pre-loaded with deterministic demo data.
 ///
@@ -30,7 +32,7 @@ pub fn seed_live_state() -> LiveTelemetryState {
     for i in 0..12 {
         let ts = BASE_TS + i * SNAPSHOT_INTERVAL;
         let snapshot = build_seeded_snapshot(ts, i);
-        state.push_snapshot(snapshot);
+        state.push_seeded(snapshot);
     }
 
     state.set_source(StateSource::Seeded);
@@ -118,8 +120,11 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     // --- Data points ---
     let mut data_points = Vec::new();
 
-    // Per-module call durations
-    for (module, &dur) in &module_call_durations {
+    // Per-module call durations (sorted for deterministic order)
+    let mut sorted_modules: Vec<_> = module_call_durations.keys().cloned().collect();
+    sorted_modules.sort();
+    for module in &sorted_modules {
+        let dur = module_call_durations[module];
         data_points.push(MetricDataPoint {
             name: "chaffra.module.call_duration_ms".to_owned(),
             value: dur as f64,
@@ -132,8 +137,9 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
         });
     }
 
-    // Per-module findings
-    for (module, &count) in &findings_by_module {
+    // Per-module findings (sorted for deterministic order)
+    for module in &sorted_modules {
+        let count = findings_by_module[module];
         data_points.push(MetricDataPoint {
             name: "chaffra.analysis.findings_total".to_owned(),
             value: count as f64,
@@ -144,6 +150,25 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
             },
             timestamp_ms: ts,
         });
+    }
+
+    // Per-module, per-severity findings (sorted)
+    let mut sorted_severities: Vec<_> = findings_by_severity.keys().cloned().collect();
+    sorted_severities.sort();
+    for module in &sorted_modules {
+        for severity in &sorted_severities {
+            data_points.push(MetricDataPoint {
+                name: "chaffra.analysis.findings_by_severity".to_owned(),
+                value: *findings_by_severity.get(severity).unwrap_or(&0) as f64,
+                labels: {
+                    let mut m = HashMap::new();
+                    m.insert("module".to_owned(), module.clone());
+                    m.insert("severity".to_owned(), severity.clone());
+                    m
+                },
+                timestamp_ms: ts,
+            });
+        }
     }
 
     // Finding churn (simulated)
@@ -306,6 +331,11 @@ fn core_definitions() -> HashMap<String, MetricDefinition> {
             "Total findings per module",
         ),
         (
+            "chaffra.analysis.findings_by_severity",
+            MetricKind::Counter,
+            "Findings per module and severity",
+        ),
+        (
             "chaffra.module.call_duration_ms",
             MetricKind::Histogram,
             "Per-module call duration",
@@ -314,6 +344,16 @@ fn core_definitions() -> HashMap<String, MetricDefinition> {
             "chaffra.module.error_total",
             MetricKind::Counter,
             "Per-module error count",
+        ),
+        (
+            "chaffra.module.load_error_total",
+            MetricKind::Counter,
+            "Module load failures",
+        ),
+        (
+            "chaffra.plugin.connect_error_total",
+            MetricKind::Counter,
+            "External module gRPC connection failures",
         ),
         (
             "chaffra.findings.new",

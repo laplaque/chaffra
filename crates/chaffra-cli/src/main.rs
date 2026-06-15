@@ -1646,11 +1646,13 @@ async fn main() -> Result<()> {
         },
 
         Command::Management { port } => {
+            let audience = tel_config.audience;
             let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
             collector.register_core_metrics();
             let live_state = chaffra_telemetry::seed::seed_live_state();
             let config = chaffra_management::ManagementConfig { port };
-            let server = chaffra_management::ManagementServer::new(config, collector, live_state);
+            let server =
+                chaffra_management::ManagementServer::new(config, collector, live_state, audience);
             server.run().await?;
         }
     }

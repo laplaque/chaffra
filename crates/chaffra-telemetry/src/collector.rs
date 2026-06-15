@@ -60,6 +60,39 @@ pub struct OperatorSummary {
     pub module_error_counts: HashMap<String, u64>,
 }
 
+impl TelemetrySnapshot {
+    /// Return a copy with operator-level fields stripped.
+    ///
+    /// Removes `operator_summary`, `spans`, and raw `data_points` that contain
+    /// operator-level detail (module call durations, error counts, etc.).
+    /// Keeps `user_summary`, `definitions`, `timestamp_ms`, and user-scoped
+    /// data points (findings, churn, cache metrics).
+    pub fn user_scoped(&self) -> Self {
+        let user_data_points = self
+            .data_points
+            .iter()
+            .filter(|dp| {
+                !dp.name.starts_with("chaffra.module.call_duration")
+                    && !dp.name.starts_with("chaffra.module.error_total")
+                    && !dp.name.starts_with("chaffra.module.load_error")
+                    && !dp.name.starts_with("chaffra.plugin.connect_error")
+                    && !dp.name.starts_with("chaffra.module.startup_duration")
+                    && !dp.name.starts_with("chaffra.startup.total_duration")
+            })
+            .cloned()
+            .collect();
+
+        Self {
+            timestamp_ms: self.timestamp_ms,
+            definitions: self.definitions.clone(),
+            data_points: user_data_points,
+            spans: Vec::new(),
+            user_summary: self.user_summary.clone(),
+            operator_summary: OperatorSummary::default(),
+        }
+    }
+}
+
 /// Thread-safe telemetry collector.
 ///
 /// Modules call `register_metrics`, `record_data_point`, and `record_span`

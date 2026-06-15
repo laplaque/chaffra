@@ -147,15 +147,23 @@ pub async fn get_metrics_history(
                 window: query.window,
                 snapshots: Vec::new(),
                 status: "empty".to_owned(),
-                message: "No telemetry data available. Run an analysis or start with --seed to populate metrics.".to_owned(),
+                message: "No telemetry data available. Start the management server with seeded data, or run an analysis with a co-located management server.".to_owned(),
             });
         }
     };
 
     let snapshots = state.live_state.history_window(&query.window);
+    let include_operator = state.audience.operator_enabled();
     let snapshot_values: Vec<serde_json::Value> = snapshots
         .iter()
-        .filter_map(|s| serde_json::to_value(s).ok())
+        .map(|s| {
+            if include_operator {
+                s.clone()
+            } else {
+                s.user_scoped()
+            }
+        })
+        .filter_map(|s| serde_json::to_value(&s).ok())
         .collect();
 
     Json(MetricsHistoryResponse {
