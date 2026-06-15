@@ -2974,15 +2974,10 @@ mod tests {
             ..Default::default()
         };
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let formatter = create_formatter(OutputFormat::Terminal);
         let _ = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
             cmd_dead_code(&root, &config, formatter.as_ref(), collector)
         });
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(
             telemetry_path.exists(),
