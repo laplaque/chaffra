@@ -2955,4 +2955,66 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_user_only_success_flush_redacts_operator_fields() {
+        let dir = TempDir::new().unwrap();
+        let telemetry_path = dir.path().join("telemetry.json");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(telemetry_path.to_str().unwrap().to_owned()),
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let _ = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+            cmd_dead_code(&root, &config, formatter.as_ref(), collector)
+        });
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(
+            telemetry_path.exists(),
+            "telemetry JSON should be flushed for UserOnly success path"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        let op_summary = &parsed["operator_summary"];
+        let durations = op_summary["module_call_durations"]
+            .as_object()
+            .map(|o| o.len())
+            .unwrap_or(0);
+        assert_eq!(
+            durations, 0,
+            "UserOnly success flush should have empty operator_summary"
+        );
+
+        let data_points = parsed["data_points"].as_array().unwrap();
+        for dp in data_points {
+            let name = dp["name"].as_str().unwrap();
+            assert!(
+                !name.starts_with("chaffra.module.call_duration"),
+                "UserOnly success flush should not contain operator datapoint {name}"
+            );
+            assert!(
+                !name.starts_with("chaffra.module.error_total"),
+                "UserOnly success flush should not contain operator datapoint {name}"
+            );
+        }
+
+        let spans = parsed["spans"].as_array().unwrap();
+        assert!(spans.is_empty(), "UserOnly flush should have no spans");
+    }
 }
