@@ -1073,3 +1073,161 @@ fn test_wire_compat_health_grade_values() {
         assert_eq!(core_json, types_json, "grade mismatch at score={score}");
     }
 }
+
+// --- Duplication module integration tests ---
+
+fn make_duplication_files() -> Vec<FileInfo> {
+    let block: String = (0..60)
+        .map(|i| format!("    line{i} := doWork({i})\n"))
+        .collect();
+    let mut files = Vec::new();
+    for i in 0..10 {
+        let content = format!("package p{i}\n\nfunc F{i}() {{\n{block}}}\n");
+        files.push(FileInfo {
+            path: format!("pkg{i}/f.go"),
+            content: content.into_bytes(),
+        });
+    }
+    files
+}
+
+#[test]
+fn test_duplication_grpc_roundtrip_bounded_output() {
+    use chaffra_duplication::DuplicationModule;
+
+    let mut host = GrpcModuleHost::new();
+    host.register(Box::new(DuplicationModule::new())).unwrap();
+
+    let files = make_duplication_files();
+
+    let toml = r#"
+[modules.duplication]
+min-tokens = "15"
+"#;
+    let config = chaffra_core::config::ChaffraConfig::parse(toml).unwrap();
+    let result = host.analyze("duplication", &files, &config).unwrap();
+
+    assert!(
+        !result.findings.is_empty(),
+        "should produce duplication findings through gRPC"
+    );
+    assert!(
+        result.findings.len() <= 200,
+        "findings must be bounded by max-families cap, got {}",
+        result.findings.len()
+    );
+
+    let serialized = serde_json::to_vec(&result.findings).unwrap();
+    assert!(
+        serialized.len() < 4_000_000,
+        "serialized findings must fit within 4MB gRPC limit, got {} bytes",
+        serialized.len()
+    );
+
+    for f in &result.findings {
+        assert!(
+            f.metadata.contains_key("family_id"),
+            "finding must include family_id metadata"
+        );
+        assert!(
+            f.metadata.contains_key("clone_locations"),
+            "finding must include clone_locations metadata"
+        );
+        let locs = f.metadata.get("clone_locations").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(locs)
+            .unwrap_or_else(|e| panic!("clone_locations must be valid JSON: {e}\ngot: {locs}"));
+        assert!(parsed.is_array(), "clone_locations must be a JSON array");
+    }
+}
+
+#[test]
+fn test_duplication_json_output_consumer() {
+    use chaffra_duplication::DuplicationModule;
+
+    let module = DuplicationModule::new();
+    let files = make_duplication_files();
+    let mut config = HashMap::new();
+    config.insert("min-tokens".to_owned(), "15".to_owned());
+    let result = module.analyze(&files, &config).unwrap();
+
+    let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Json);
+    let json_str = formatter.format_result(&result, None);
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("JSON formatter must produce valid JSON: {e}"));
+    let findings = parsed.get("findings").expect("must have findings key");
+    assert!(findings.is_array());
+    assert!(!findings.as_array().unwrap().is_empty());
+
+    let metrics = parsed
+        .get("metrics")
+        .expect("must include metrics in output");
+    let counters = metrics.get("counters").expect("metrics must have counters");
+    assert!(
+        counters.get("raw_clone_pairs").is_some(),
+        "must include raw_clone_pairs counter"
+    );
+    assert!(
+        counters.get("clone_families").is_some(),
+        "must include clone_families counter"
+    );
+    assert!(
+        counters.get("reported_findings").is_some(),
+        "must include reported_findings counter"
+    );
+    assert!(
+        counters.get("collapsed_matches").is_some(),
+        "must include collapsed_matches counter"
+    );
+}
+
+#[test]
+fn test_duplication_terminal_output_consumer() {
+    use chaffra_duplication::DuplicationModule;
+
+    let module = DuplicationModule::new();
+    let files = make_duplication_files();
+    let mut config = HashMap::new();
+    config.insert("min-tokens".to_owned(), "15".to_owned());
+    let result = module.analyze(&files, &config).unwrap();
+
+    let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Terminal);
+    let text = formatter.format_result(&result, None);
+    assert!(
+        text.contains("[W]"),
+        "terminal output must contain warning severity indicator"
+    );
+    assert!(
+        text.contains("duplicate"),
+        "terminal output must contain 'duplicate' in rule description"
+    );
+}
+
+#[test]
+fn test_duplication_sarif_output_consumer() {
+    use chaffra_duplication::DuplicationModule;
+
+    let module = DuplicationModule::new();
+    let files = make_duplication_files();
+    let mut config = HashMap::new();
+    config.insert("min-tokens".to_owned(), "15".to_owned());
+    let result = module.analyze(&files, &config).unwrap();
+
+    let formatter = chaffra_output::create_formatter(chaffra_output::OutputFormat::Sarif);
+    let sarif_str = formatter.format_result(&result, None);
+    let parsed: serde_json::Value = serde_json::from_str(&sarif_str)
+        .unwrap_or_else(|e| panic!("SARIF formatter must produce valid JSON: {e}"));
+
+    assert!(
+        parsed.get("$schema").is_some(),
+        "SARIF output must include $schema field"
+    );
+    assert_eq!(parsed["version"], "2.1.0");
+
+    let runs = parsed["runs"].as_array().expect("must have runs array");
+    assert!(!runs.is_empty());
+    let results = runs[0]["results"].as_array().expect("must have results");
+    assert!(
+        !results.is_empty(),
+        "SARIF output must contain duplication results"
+    );
+}

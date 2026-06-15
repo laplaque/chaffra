@@ -340,6 +340,7 @@ dependencies = [
  "chaffra-core",
  "chaffra-parse",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror",
 ]

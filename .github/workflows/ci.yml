@@ -45,6 +45,57 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy -- -D warnings
 
+  duplication-regression:
+    name: duplication bounded output
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build CLI
+        run: cargo build -p chaffra-cli
+      - name: "Regression: default JSON dupes"
+        run: |
+          cargo run -p chaffra-cli -- dupes . --format json --telemetry off > /tmp/dupes-default.json
+          size=$(wc -c < /tmp/dupes-default.json)
+          echo "Output size: ${size} bytes"
+          if [ "$size" -ge 4194304 ]; then echo "FAIL: output >= 4MB gRPC limit"; exit 1; fi
+          python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/dupes-default.json'))
+          c = d['metrics']['counters']
+          print(f\"findings={len(d['findings'])} raw={c['raw_clone_pairs']} families={c['clone_families']} reported={c['reported_findings']} collapsed={c['collapsed_matches']}\")
+          assert len(d['findings']) > 0, 'no findings'
+          assert c['raw_clone_pairs'] >= c['clone_families'], 'raw < families'
+          "
+      - name: "Regression: terminal bounded output"
+        run: |
+          cargo run -p chaffra-cli -- dupes . --min-tokens 100 --format terminal --telemetry off > /tmp/dupes-terminal.txt
+          lines=$(wc -l < /tmp/dupes-terminal.txt)
+          warnings=$(grep -c '\[W\]' /tmp/dupes-terminal.txt || true)
+          families=$(grep -c 'clone family' /tmp/dupes-terminal.txt || true)
+          echo "Output lines: ${lines}, [W] warnings: ${warnings}, clone family mentions: ${families}"
+          if [ "$lines" -ge 500 ]; then echo "FAIL: terminal output >= 500 lines"; exit 1; fi
+          if [ "$warnings" -ge 200 ]; then echo "FAIL: [W] count >= 200 (old baseline was 1566)"; exit 1; fi
+          if [ "$families" -eq 0 ]; then echo "FAIL: no 'clone family' in output — grouped format missing"; exit 1; fi
+          echo "Terminal regression OK: ${warnings} warnings, ${families} clone families, ${lines} lines"
+      - name: "Regression: mild mode JSON dupes"
+        run: |
+          cargo run -p chaffra-cli -- dupes . --mode mild --min-tokens 30 --format json --telemetry off > /tmp/dupes-mild.json
+          size=$(wc -c < /tmp/dupes-mild.json)
+          echo "Output size: ${size} bytes"
+          if [ "$size" -ge 4194304 ]; then echo "FAIL: output >= 4MB gRPC limit"; exit 1; fi
+          python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/dupes-mild.json'))
+          c = d['metrics']['counters']
+          print(f\"findings={len(d['findings'])} raw={c['raw_clone_pairs']} families={c['clone_families']} reported={c['reported_findings']} collapsed={c['collapsed_matches']}\")
+          assert len(d['findings']) <= 200, f'findings {len(d[\"findings\"])} exceeds max-families cap'
+          assert c['raw_clone_pairs'] >= c['clone_families'], 'raw < families'
+          "
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
