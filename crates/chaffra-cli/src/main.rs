@@ -46,8 +46,8 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<String>,
 
-    /// Telemetry mode: on, off, user-only, operator-only.
-    #[arg(long, global = true, default_value = "on")]
+    /// Telemetry mode: on, off, user-only, operator-only (default: user-only).
+    #[arg(long, global = true, default_value = "user-only")]
     telemetry: String,
 
     /// Override telemetry backend (json-file, stderr, prometheus, otlp, statsd).
@@ -354,6 +354,26 @@ fn merge_telemetry_config(
         let project_tel = chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg);
         config.sampling_rate = project_tel.sampling_rate;
         config.sampling_strategy = project_tel.sampling_strategy;
+
+        let cli_is_default_audience =
+            config.audience == chaffra_telemetry::TelemetryAudience::UserOnly;
+        if cli_is_default_audience
+            && project_tel.audience != chaffra_telemetry::TelemetryAudience::UserOnly
+        {
+            config.audience = project_tel.audience;
+        }
+
+        let cli_is_default_backends = config.backends.len() == 1
+            && config.backends[0].kind == chaffra_telemetry::BackendKind::JsonFile
+            && config.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
+        if cli_is_default_backends && !project_tel.backends.is_empty() {
+            let proj_is_default = project_tel.backends.len() == 1
+                && project_tel.backends[0].kind == chaffra_telemetry::BackendKind::JsonFile
+                && project_tel.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
+            if !proj_is_default {
+                config.backends = project_tel.backends;
+            }
+        }
     }
     config
 }
@@ -1108,7 +1128,7 @@ fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<Strin
 
 fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
     let audience = chaffra_telemetry::TelemetryAudience::from_str_loose(&cli.telemetry)
-        .unwrap_or(chaffra_telemetry::TelemetryAudience::On);
+        .unwrap_or(chaffra_telemetry::TelemetryAudience::UserOnly);
 
     let backends = if let Some(ref backend_str) = cli.telemetry_backend {
         if let Some(kind) = chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
@@ -1325,8 +1345,13 @@ where
             let (backends, _) =
                 chaffra_telemetry::backends::create_backends(&effective_config.backends);
             let snapshot = collector.snapshot();
+            let flushed = if effective_config.audience.operator_enabled() {
+                snapshot
+            } else {
+                snapshot.user_scoped()
+            };
             for backend in &backends {
-                let _ = backend.flush(&snapshot);
+                let _ = backend.flush(&flushed);
             }
         }
 
@@ -1343,8 +1368,13 @@ where
         let (backends, _) =
             chaffra_telemetry::backends::create_backends(&effective_config.backends);
         let snapshot = collector.snapshot();
+        let flushed = if effective_config.audience.operator_enabled() {
+            snapshot
+        } else {
+            snapshot.user_scoped()
+        };
         for backend in &backends {
-            let _ = backend.flush(&snapshot);
+            let _ = backend.flush(&flushed);
         }
     }
 
@@ -1646,10 +1676,17 @@ async fn main() -> Result<()> {
         },
 
         Command::Management { port } => {
+            let audience = tel_config.audience;
             let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
             collector.register_core_metrics();
+            let live_state = if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
+                chaffra_telemetry::LiveTelemetryState::new()
+            } else {
+                chaffra_telemetry::seed::seed_live_state()
+            };
             let config = chaffra_management::ManagementConfig { port };
-            let server = chaffra_management::ManagementServer::new(config, collector);
+            let server =
+                chaffra_management::ManagementServer::new(config, collector, live_state, audience);
             server.run().await?;
         }
     }
@@ -2885,6 +2922,182 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.contains("secrets_backup")),
             "files in ignored directory should not be discovered"
+        );
+    }
+
+    #[test]
+    fn test_user_only_backend_flush_redacts_operator_fields() {
+        let dir = TempDir::new().unwrap();
+        let telemetry_path = dir.path().join("telemetry.json");
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(telemetry_path.to_str().unwrap().to_owned()),
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+
+        let _ = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
+            anyhow::bail!("simulated failure to trigger error flush")
+        });
+
+        assert!(
+            telemetry_path.exists(),
+            "telemetry JSON should be flushed for UserOnly"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let op_summary = &parsed["operator_summary"];
+        let durations = op_summary["module_call_durations"]
+            .as_object()
+            .map(|o| o.len())
+            .unwrap_or(0);
+        assert_eq!(
+            durations, 0,
+            "UserOnly flush should have empty operator_summary.module_call_durations"
+        );
+        let data_points = parsed["data_points"].as_array().unwrap();
+        for dp in data_points {
+            let name = dp["name"].as_str().unwrap();
+            assert!(
+                !name.starts_with("chaffra.module.call_duration"),
+                "UserOnly flush should not contain operator datapoint {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_only_success_flush_redacts_operator_fields() {
+        let dir = TempDir::new().unwrap();
+        let telemetry_path = dir.path().join("telemetry.json");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/go/simple");
+
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(telemetry_path.to_str().unwrap().to_owned()),
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+
+        let formatter = create_formatter(OutputFormat::Terminal);
+        let _ = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
+            cmd_dead_code(&root, &config, formatter.as_ref(), collector)
+        });
+
+        assert!(
+            telemetry_path.exists(),
+            "telemetry JSON should be flushed for UserOnly success path"
+        );
+        let content = std::fs::read_to_string(&telemetry_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        let op_summary = &parsed["operator_summary"];
+        let durations = op_summary["module_call_durations"]
+            .as_object()
+            .map(|o| o.len())
+            .unwrap_or(0);
+        assert_eq!(
+            durations, 0,
+            "UserOnly success flush should have empty operator_summary"
+        );
+
+        let data_points = parsed["data_points"].as_array().unwrap();
+        for dp in data_points {
+            let name = dp["name"].as_str().unwrap();
+            assert!(
+                !name.starts_with("chaffra.module.call_duration"),
+                "UserOnly success flush should not contain operator datapoint {name}"
+            );
+            assert!(
+                !name.starts_with("chaffra.module.error_total"),
+                "UserOnly success flush should not contain operator datapoint {name}"
+            );
+        }
+
+        let spans = parsed["spans"].as_array().unwrap();
+        assert!(spans.is_empty(), "UserOnly flush should have no spans");
+    }
+
+    #[test]
+    fn test_build_telemetry_config_invalid_string_falls_back_to_user_only() {
+        let cli = Cli::parse_from(["chaffra", "--telemetry", "garbage-value", "health", "."]);
+        let config = build_telemetry_config(&cli);
+        assert_eq!(
+            config.audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+            "Invalid telemetry flag should fall back to UserOnly"
+        );
+    }
+
+    #[test]
+    fn test_build_telemetry_config_valid_off() {
+        let cli = Cli::parse_from(["chaffra", "--telemetry", "off", "health", "."]);
+        let config = build_telemetry_config(&cli);
+        assert_eq!(config.audience, chaffra_telemetry::TelemetryAudience::Off);
+    }
+
+    #[test]
+    fn test_build_telemetry_config_valid_operator_only() {
+        let cli = Cli::parse_from(["chaffra", "--telemetry", "operator-only", "health", "."]);
+        let config = build_telemetry_config(&cli);
+        assert_eq!(
+            config.audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_audience_from_project() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::Off,
+            "Project audience=off should override CLI default"
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_cli_audience_takes_precedence() {
+        let cli_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::OperatorOnly,
+            ..Default::default()
+        };
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly,
+            "Explicit CLI audience should take precedence over project config"
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_operator_opt_in_from_project() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config);
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::On,
+            "Project audience=on should enable operator opt-in"
         );
     }
 }

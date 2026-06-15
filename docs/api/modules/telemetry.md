@@ -73,8 +73,10 @@ Per-module initialization time (relevant post-Phase 11 when all modules are gRPC
 
 | Audience | Scope | Default |
 |----------|-------|---------|
-| User-facing | Finding counts, durations, health scores in output | on |
-| Operator | Call latencies, error rates, memory pressure to backends | on |
+| User-facing | Finding counts, durations, health scores in output | **user-only** (default) |
+| Operator | Call latencies, error rates, memory pressure to backends | off (opt-in) |
+
+Default changed from `on` to `user-only` in Phase 15a. Operator-level telemetry (backend sinks) requires explicit opt-in via `--telemetry on` or `--telemetry operator-only`. This aligns with GDPR data minimization: operators must consciously enable system-level metric collection.
 
 Control via `--telemetry on|off|user-only|operator-only`.
 
@@ -115,7 +117,7 @@ sampling-strategy = "rate"  # rate | on-change
 
 ```toml
 [modules.telemetry]
-audience = "on"              # on | off | user-only | operator-only
+audience = "user-only"       # on | off | user-only (default) | operator-only
 backend = "json-file"        # json-file | stderr | prometheus | otlp | statsd | cloudwatch
 endpoint = ""                # For OTLP/StatsD/CloudWatch
 path = "chaffra-telemetry.json"  # For json-file backend
@@ -198,5 +200,74 @@ service TelemetryCollector {
   rpc RegisterMetrics(RegisterMetricsRequest) returns (RegisterMetricsResponse);
   rpc RecordMetrics(RecordMetricsRequest) returns (RecordMetricsResponse);
   rpc RecordSpan(RecordSpanRequest) returns (RecordSpanResponse);
+}
+```
+
+## Live Telemetry State (Phase 15a)
+
+Thread-safe shared telemetry state store (`LiveTelemetryState`) that maintains:
+
+- The latest `TelemetrySnapshot`
+- A bounded circular history buffer (max 1000 snapshots, `VecDeque`)
+- State source tracking: `Live`, `Seeded`, or `Empty`
+
+### State Sources
+
+| Source | Meaning |
+|--------|---------|
+| `Live` | Populated from real analysis runs |
+| `Seeded` | Populated with deterministic demo/test data |
+| `Empty` | No data has been pushed yet |
+
+### Querying History
+
+Queryable by time window:
+
+| Window | Duration |
+|--------|----------|
+| `1h` | 3,600,000 ms |
+| `24h` | 86,400,000 ms |
+| `7d` | 604,800,000 ms |
+
+Queryable by dimension: `history_by_module(module, window)` filters snapshots that contain data for a specific module.
+
+### Seeded / Demo Mode
+
+`seed::seed_live_state()` returns a `LiveTelemetryState` pre-loaded with 12 deterministic snapshots:
+
+- 3 modules (dead-code=92, complexity=78, security=65 health scores)
+- Findings across error, warning, info severities
+- Finding churn (new, resolved, unchanged)
+- One intentionally slow module (security=850ms)
+- Module errors and backend connectivity warnings
+- Cache hit/miss metrics
+- Snapshots spaced ~16 hours apart over a simulated 7-day window
+- Deterministic timestamps (base: `1_718_000_000_000`)
+
+The standalone `management` command starts with seeded data automatically.
+
+### Management API History
+
+The `/api/v1/metrics/history` endpoint now returns real data from the live state:
+
+```
+GET /api/v1/metrics/history?window=7d
+```
+
+Response includes a `status` field indicating the data source:
+
+| Status | Meaning |
+|--------|---------|
+| `"live"` | Real analysis data |
+| `"seeded"` | Deterministic demo data |
+| `"empty"` | No data available |
+
+Empty state response:
+```json
+{
+  "status": "empty",
+  "message": "No telemetry data available...",
+  "window": "7d",
+  "snapshots": []
 }
 ```
