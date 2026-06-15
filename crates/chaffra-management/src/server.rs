@@ -328,4 +328,81 @@ mod tests {
             snapshots.len()
         );
     }
+
+    #[tokio::test]
+    async fn test_metrics_history_live_source() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.set_files_total(10);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics/history?window=7d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "live");
+        assert_eq!(parsed["snapshots"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_history_operator_audience() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let live_state = chaffra_telemetry::seed::seed_live_state();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::On,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics/history?window=7d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let snapshots = parsed["snapshots"].as_array().unwrap();
+        assert!(!snapshots.is_empty());
+        let first = &snapshots[0];
+        assert!(first.get("operator_summary").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_management_server_constructor_and_router() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let config = ManagementConfig { port: 0 };
+        let server = ManagementServer::new(
+            config,
+            collector,
+            live_state,
+            chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        );
+        let app = server.router();
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
