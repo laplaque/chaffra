@@ -662,4 +662,205 @@ mod tests {
         );
         assert_eq!(result.is_error, Some(true));
     }
+
+    // ---- Test module that produces Error-severity findings ----
+
+    use chaffra_core::diagnostic::*;
+    use chaffra_core::module::{AnalysisModule, empty_metrics};
+
+    struct ErrorSeverityModule;
+
+    impl AnalysisModule for ErrorSeverityModule {
+        fn describe(&self) -> ModuleInfo {
+            ModuleInfo {
+                id: "error-mod".to_owned(),
+                name: "Error Module".to_owned(),
+                version: "0.1.0".to_owned(),
+                languages: vec!["go".to_owned()],
+                capabilities: vec!["analyze".to_owned()],
+                rules: vec![Rule {
+                    id: "err-rule".to_owned(),
+                    name: "Error Rule".to_owned(),
+                    description: "A rule that emits Error findings".to_owned(),
+                    default_severity: Severity::Error,
+                    category: "test".to_owned(),
+                }],
+            }
+        }
+
+        fn analyze(
+            &self,
+            files: &[FileInfo],
+            _config: &std::collections::HashMap<String, String>,
+        ) -> chaffra_core::error::Result<AnalysisResult> {
+            Ok(AnalysisResult {
+                findings: vec![
+                    Finding {
+                        rule_id: "err-rule".to_owned(),
+                        message: "critical error finding".to_owned(),
+                        severity: Severity::Error,
+                        location: Location {
+                            file: "main.go".to_owned(),
+                            start_line: 10,
+                            end_line: 15,
+                            start_column: 0,
+                            end_column: 20,
+                        },
+                        confidence: 0.99,
+                        actions: vec![],
+                        metadata: std::collections::HashMap::new(),
+                    },
+                    Finding {
+                        rule_id: "err-rule".to_owned(),
+                        message: "warning finding".to_owned(),
+                        severity: Severity::Warning,
+                        location: Location {
+                            file: "util.go".to_owned(),
+                            start_line: 5,
+                            end_line: 5,
+                            start_column: 0,
+                            end_column: 10,
+                        },
+                        confidence: 0.8,
+                        actions: vec![],
+                        metadata: std::collections::HashMap::new(),
+                    },
+                ],
+                metrics: empty_metrics(files.len() as u64),
+            })
+        }
+
+        fn explain(&self, _rule_id: &str) -> chaffra_core::error::Result<RuleExplanation> {
+            Err(chaffra_core::error::ChaffraError::RuleNotFound(
+                "not implemented".to_owned(),
+            ))
+        }
+
+        fn fix(
+            &self,
+            _findings: &[Finding],
+            _dry_run: bool,
+        ) -> chaffra_core::error::Result<Vec<FixResult>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn test_record_analysis_error_severity_findings() {
+        let mut host = GrpcModuleHost::new();
+        let _ = host.register(Box::new(ErrorSeverityModule));
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let config = ChaffraConfig::default();
+        let result = record_analysis_and_push(&host, "error-mod", &[], &config, &ls, &tc());
+        assert!(result.is_ok());
+        let analysis = result.unwrap();
+        // Verify we got findings with both Error and Warning severity.
+        assert_eq!(analysis.findings.len(), 2);
+        assert!(
+            analysis
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Error)
+        );
+        assert!(
+            analysis
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Warning)
+        );
+        // Verify telemetry was populated.
+        let snapshot = ls.current().expect("live state should have a snapshot");
+        let sev = &snapshot.user_summary.findings_by_severity;
+        assert_eq!(sev.get("error"), Some(&1));
+        assert_eq!(sev.get("warning"), Some(&1));
+    }
+
+    #[test]
+    fn test_record_analysis_and_push_err_path() {
+        let host = build_module_host();
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let config = ChaffraConfig::default();
+        // Pass an unknown module_id to trigger the Err branch.
+        let result =
+            record_analysis_and_push(&host, "nonexistent-module", &[], &config, &ls, &tc());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("nonexistent-module"),
+            "error should mention the missing module id, got: {err_msg}"
+        );
+        // The Err path calls flush_snapshot, which should populate live state.
+        assert!(
+            ls.current().is_some(),
+            "flush_snapshot should populate live state even on error"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_snapshot_operator_scoped() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+
+        // Build a snapshot with operator-level data (module_call_durations).
+        let mut module_call_durations = std::collections::HashMap::new();
+        module_call_durations.insert("dead-code".to_owned(), 42u64);
+        let snapshot = chaffra_telemetry::collector::TelemetrySnapshot {
+            timestamp_ms: 1000,
+            definitions: std::collections::HashMap::new(),
+            data_points: vec![chaffra_telemetry::MetricDataPoint {
+                name: "chaffra.module.call_duration_ms".to_owned(),
+                value: 42.0,
+                labels: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("module".to_owned(), "dead-code".to_owned());
+                    m
+                },
+                timestamp_ms: 1000,
+            }],
+            spans: vec![],
+            user_summary: chaffra_telemetry::collector::UserSummary {
+                analysis_duration_ms: 100,
+                files_total: 5,
+                findings_by_severity: std::collections::HashMap::new(),
+                findings_by_module: std::collections::HashMap::new(),
+                module_summaries: std::collections::HashMap::new(),
+            },
+            operator_summary: chaffra_telemetry::collector::OperatorSummary {
+                module_call_durations,
+                module_error_counts: std::collections::HashMap::new(),
+            },
+        };
+        ls.push_snapshot(snapshot);
+
+        // With TelemetryAudience::On, operator_enabled() returns true,
+        // so execute_telemetry should return the full (non-user-scoped) snapshot.
+        let mut on_config = tc();
+        on_config.audience = chaffra_telemetry::TelemetryAudience::On;
+        let result = execute_telemetry(&serde_json::json!({"action": "snapshot"}), &ls, &on_config);
+        assert!(result.is_error.is_none());
+        let text = &result.content[0].text;
+        // The full snapshot includes operator data: module_call_durations with "dead-code".
+        assert!(
+            text.contains("module_call_durations"),
+            "operator-scoped snapshot should include module_call_durations"
+        );
+        assert!(
+            text.contains("dead-code"),
+            "operator-scoped snapshot should include module name"
+        );
+
+        // With default audience (UserOnly), operator_enabled() returns false,
+        // so execute_telemetry should return the user-scoped snapshot
+        // with empty operator_summary.
+        let result_user = execute_telemetry(&serde_json::json!({"action": "snapshot"}), &ls, &tc());
+        assert!(result_user.is_error.is_none());
+        let user_text = &result_user.content[0].text;
+        // The user-scoped snapshot zeroes out operator_summary.
+        let parsed: serde_json::Value =
+            serde_json::from_str(user_text).expect("should be valid JSON");
+        let op_durations = &parsed["operator_summary"]["module_call_durations"];
+        assert!(
+            op_durations.as_object().map_or(true, |m| m.is_empty()),
+            "user-scoped snapshot should have empty module_call_durations"
+        );
+    }
 }

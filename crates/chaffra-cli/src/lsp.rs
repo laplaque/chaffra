@@ -91,6 +91,36 @@ pub fn finding_to_diagnostic(finding: &Finding) -> Diagnostic {
     }
 }
 
+/// Merge server-level telemetry config with project-level workspace config.
+///
+/// Returns `None` if the project sets `audience = "off"` (caller should use
+/// the no-telemetry path). Otherwise returns the merged config with project
+/// sampling overrides applied.
+pub(crate) fn merge_lsp_telemetry_config(
+    server_config: &chaffra_telemetry::TelemetryConfig,
+    workspace_config: &chaffra_core::config::ChaffraConfig,
+) -> Option<chaffra_telemetry::TelemetryConfig> {
+    let module_cfg = workspace_config.module_config("telemetry");
+    if module_cfg.is_empty() {
+        return Some(server_config.clone());
+    }
+    match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
+        Ok(project_tel) => {
+            if matches!(
+                project_tel.audience,
+                chaffra_telemetry::TelemetryAudience::Off
+            ) {
+                return None;
+            }
+            let mut merged = server_config.clone();
+            merged.sampling_rate = project_tel.sampling_rate;
+            merged.sampling_strategy = project_tel.sampling_strategy;
+            Some(merged)
+        }
+        Err(_) => Some(server_config.clone()),
+    }
+}
+
 /// Run analysis on a file and return diagnostics grouped by file URI.
 pub fn analyze_file_for_diagnostics(
     file_path: &str,
@@ -136,27 +166,9 @@ pub fn analyze_file_for_diagnostics(
         })
         .unwrap_or_default();
 
-    let effective_tel = {
-        let module_cfg = workspace_config.module_config("telemetry");
-        if module_cfg.is_empty() {
-            tel_config.clone()
-        } else {
-            match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
-                Ok(project_tel) => {
-                    if matches!(
-                        project_tel.audience,
-                        chaffra_telemetry::TelemetryAudience::Off
-                    ) {
-                        return analyze_file_no_telemetry(file_path, content);
-                    }
-                    let mut merged = tel_config.clone();
-                    merged.sampling_rate = project_tel.sampling_rate;
-                    merged.sampling_strategy = project_tel.sampling_strategy;
-                    merged
-                }
-                Err(_) => tel_config.clone(),
-            }
-        }
+    let effective_tel = match merge_lsp_telemetry_config(tel_config, &workspace_config) {
+        Some(merged) => merged,
+        None => return analyze_file_no_telemetry(file_path, content),
     };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
@@ -696,5 +708,86 @@ mod tests {
             assert!(text.contains("Cognitive"));
         }
         // It's OK if the function doesn't match on this line in simple cases.
+    }
+
+    // --- merge_lsp_telemetry_config tests ---
+
+    fn make_workspace_config_with_telemetry(
+        entries: Vec<(&str, &str)>,
+    ) -> chaffra_core::config::ChaffraConfig {
+        let mut toml_str = String::from("[modules.telemetry]\n");
+        for (k, v) in entries {
+            toml_str.push_str(&format!("{k} = \"{v}\"\n"));
+        }
+        chaffra_core::config::ChaffraConfig::parse(&toml_str).unwrap()
+    }
+
+    #[test]
+    fn test_merge_lsp_config_off_returns_none() {
+        let server = test_tel_config();
+        let workspace = make_workspace_config_with_telemetry(vec![("audience", "off")]);
+        let result = merge_lsp_telemetry_config(&server, &workspace);
+        assert!(result.is_none(), "audience=off should return None");
+    }
+
+    #[test]
+    fn test_merge_lsp_config_merges_sampling() {
+        let server = test_tel_config();
+        let workspace = make_workspace_config_with_telemetry(vec![
+            ("audience", "on"),
+            ("sampling-rate", "0.5"),
+        ]);
+        let result = merge_lsp_telemetry_config(&server, &workspace);
+        assert!(result.is_some());
+        let merged = result.unwrap();
+        assert!(
+            (merged.sampling_rate - 0.5).abs() < f64::EPSILON,
+            "sampling rate should be 0.5, got {}",
+            merged.sampling_rate
+        );
+    }
+
+    #[test]
+    fn test_merge_lsp_config_empty_passthrough() {
+        let server = test_tel_config();
+        let workspace = chaffra_core::config::ChaffraConfig::default();
+        let result = merge_lsp_telemetry_config(&server, &workspace);
+        assert!(result.is_some());
+        let merged = result.unwrap();
+        // With no project overrides, sampling rate should match server config.
+        assert!(
+            (merged.sampling_rate - server.sampling_rate).abs() < f64::EPSILON,
+            "empty workspace should pass through server config"
+        );
+    }
+
+    #[test]
+    fn test_merge_lsp_config_invalid_falls_back() {
+        let server = test_tel_config();
+        // "bogus" is not a valid audience value, so from_module_config returns Err.
+        let workspace = make_workspace_config_with_telemetry(vec![("audience", "bogus")]);
+        let result = merge_lsp_telemetry_config(&server, &workspace);
+        assert!(
+            result.is_some(),
+            "invalid audience should fall back to server config"
+        );
+        let merged = result.unwrap();
+        assert!(
+            (merged.sampling_rate - server.sampling_rate).abs() < f64::EPSILON,
+            "fallback should preserve server sampling rate"
+        );
+    }
+
+    #[test]
+    fn test_analyze_file_for_diagnostics_telemetry_off() {
+        let ls = test_live_state();
+        let mut off_config = test_tel_config();
+        off_config.audience = chaffra_telemetry::TelemetryAudience::Off;
+        let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
+        // This should take the early-return path into analyze_file_no_telemetry.
+        let diagnostics =
+            analyze_file_for_diagnostics("/tmp/test_off.go", content, &ls, &off_config);
+        // Should run without panicking and produce a valid map.
+        let _total: usize = diagnostics.values().map(|v| v.len()).sum();
     }
 }

@@ -171,15 +171,66 @@ pub fn extract_changed_paths(events: &[DebouncedEvent]) -> Vec<PathBuf> {
     paths
 }
 
+/// Run a single watch iteration: analyze changed files, emit output, handle
+/// telemetry. Returns `Some(text)` with the formatted output on success, or
+/// `None` on analysis error.
+pub(crate) fn run_watch_iteration(
+    changed: &[PathBuf],
+    root: &Path,
+    config: &ChaffraConfig,
+    format: OutputFormat,
+    watch_config: &WatchConfig,
+) -> Option<String> {
+    let is_off = matches!(
+        watch_config.tel_config.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    );
+
+    if is_off {
+        return match run_analysis_on_changes(changed, root, config, format, None) {
+            Ok(ao) => Some(ao.text),
+            Err(_) => None,
+        };
+    }
+
+    let collector = chaffra_telemetry::TelemetryCollector::new(watch_config.tel_config.clone());
+    collector.register_core_metrics();
+    let start = std::time::Instant::now();
+
+    match run_analysis_on_changes(changed, root, config, format, Some(&collector)) {
+        Ok(ao) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call("watch", duration_ms, false);
+
+            collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
+
+            chaffra_telemetry::finalize_and_flush(
+                &collector,
+                &watch_config.live_state,
+                &watch_config.tel_config,
+            );
+
+            Some(ao.text)
+        }
+        Err(_) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call("watch", duration_ms, true);
+            chaffra_telemetry::flush_snapshot(
+                &collector,
+                &watch_config.live_state,
+                &watch_config.tel_config,
+            );
+
+            None
+        }
+    }
+}
+
 /// Run the watch loop. Blocks until interrupted.
 pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
     let root = watch_config.root.clone();
     let config = watch_config.config.clone();
     let format = watch_config.format;
-    let is_off = matches!(
-        watch_config.tel_config.audience,
-        chaffra_telemetry::TelemetryAudience::Off
-    );
 
     eprintln!(
         "Watching {} for changes (debounce: {}ms)...",
@@ -208,50 +259,10 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
 
         eprintln!("\n--- Change detected: {} file(s) ---", changed.len());
 
-        if is_off {
-            match run_analysis_on_changes(&changed, &root, &config, format, None) {
-                Ok(ao) => {
-                    if !ao.text.is_empty() {
-                        print!("{}", ao.text);
-                    }
-                }
-                Err(e) => eprintln!("Analysis error: {e}"),
-            }
-            continue;
-        }
-
-        let collector = chaffra_telemetry::TelemetryCollector::new(watch_config.tel_config.clone());
-        collector.register_core_metrics();
-        let start = std::time::Instant::now();
-
-        match run_analysis_on_changes(&changed, &root, &config, format, Some(&collector)) {
-            Ok(ao) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
-                collector.record_module_call("watch", duration_ms, false);
-
-                collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
-
-                chaffra_telemetry::finalize_and_flush(
-                    &collector,
-                    &watch_config.live_state,
-                    &watch_config.tel_config,
-                );
-
-                if !ao.text.is_empty() {
-                    print!("{}", ao.text);
-                }
-            }
-            Err(e) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
-                collector.record_module_call("watch", duration_ms, true);
-                chaffra_telemetry::flush_snapshot(
-                    &collector,
-                    &watch_config.live_state,
-                    &watch_config.tel_config,
-                );
-
-                eprintln!("Analysis error: {e}");
-            }
+        match run_watch_iteration(&changed, &root, &config, format, &watch_config) {
+            Some(text) if !text.is_empty() => print!("{text}"),
+            Some(_) => {}
+            None => eprintln!("Analysis error"),
         }
     }
 
@@ -424,6 +435,138 @@ mod tests {
         )
         .unwrap();
         assert!(!result.text.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_analysis_with_collector_severity_counting() {
+        let dir = std::env::temp_dir().join("chaffra_watch_test_sev");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let go_file = dir.join("main.go");
+        fs::write(
+            &go_file,
+            "package main\n\nfunc main() {}\n\nfunc unused() {}\n",
+        )
+        .unwrap();
+
+        let tel_config = chaffra_telemetry::TelemetryConfig::default();
+        let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
+        collector.register_core_metrics();
+
+        let result = run_analysis_on_changes(
+            &[go_file],
+            &dir,
+            &ChaffraConfig::default(),
+            OutputFormat::Terminal,
+            Some(&collector),
+        )
+        .unwrap();
+        // Should produce output and findings (severity counting path exercised).
+        assert!(!result.text.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_watch_iteration_telemetry_off() {
+        let dir = std::env::temp_dir().join("chaffra_watch_iter_off");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let go_file = dir.join("main.go");
+        fs::write(
+            &go_file,
+            "package main\n\nfunc main() {}\n\nfunc unused() {}\n",
+        )
+        .unwrap();
+
+        let mut tel_config = chaffra_telemetry::TelemetryConfig::default();
+        tel_config.audience = chaffra_telemetry::TelemetryAudience::Off;
+
+        let watch_cfg = WatchConfig::new(
+            dir.clone(),
+            OutputFormat::Terminal,
+            ChaffraConfig::default(),
+            tel_config,
+            chaffra_telemetry::LiveTelemetryState::new(),
+        );
+
+        let result = run_watch_iteration(
+            &[go_file],
+            &dir,
+            &ChaffraConfig::default(),
+            OutputFormat::Terminal,
+            &watch_cfg,
+        );
+        assert!(result.is_some(), "telemetry-off iteration should succeed");
+        assert!(!result.unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_watch_iteration_with_telemetry() {
+        let dir = std::env::temp_dir().join("chaffra_watch_iter_tel");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let go_file = dir.join("main.go");
+        fs::write(
+            &go_file,
+            "package main\n\nfunc main() {}\n\nfunc unused() {}\n",
+        )
+        .unwrap();
+
+        let watch_cfg = WatchConfig::new(
+            dir.clone(),
+            OutputFormat::Terminal,
+            ChaffraConfig::default(),
+            chaffra_telemetry::TelemetryConfig::default(),
+            chaffra_telemetry::LiveTelemetryState::new(),
+        );
+
+        let result = run_watch_iteration(
+            &[go_file],
+            &dir,
+            &ChaffraConfig::default(),
+            OutputFormat::Terminal,
+            &watch_cfg,
+        );
+        assert!(
+            result.is_some(),
+            "telemetry-on iteration should succeed on a valid file"
+        );
+        assert!(!result.unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_watch_iteration_no_source_files() {
+        let dir = std::env::temp_dir().join("chaffra_watch_iter_nosrc");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let readme = dir.join("readme.md");
+        fs::write(&readme, "# Test").unwrap();
+
+        let watch_cfg = WatchConfig::new(
+            dir.clone(),
+            OutputFormat::Terminal,
+            ChaffraConfig::default(),
+            chaffra_telemetry::TelemetryConfig::default(),
+            chaffra_telemetry::LiveTelemetryState::new(),
+        );
+
+        let result = run_watch_iteration(
+            &[readme],
+            &dir,
+            &ChaffraConfig::default(),
+            OutputFormat::Terminal,
+            &watch_cfg,
+        );
+        // Non-source files should produce empty output (not None).
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

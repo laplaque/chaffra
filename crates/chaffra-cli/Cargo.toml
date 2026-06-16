@@ -49,3 +49,4 @@ notify-debouncer-full = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+toml = { workspace = true }

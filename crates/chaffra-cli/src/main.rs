@@ -1792,28 +1792,12 @@ async fn main() -> Result<()> {
                 }
                 analysis_collector
                     .set_finding_fingerprints(fingerprints_from_findings(&all_findings));
-                let current_fingerprints = analysis_collector.finding_fingerprints();
-                let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
-                let previous_state = chaffra_telemetry::churn::load_state(state_path);
-                let current_hash =
-                    chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
-                if let Some(ref prev) = previous_state {
-                    let churn =
-                        chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
-                    analysis_collector.record_finding_churn(&churn);
-                }
-                let snapshot = analysis_collector.snapshot();
                 let state = chaffra_telemetry::LiveTelemetryState::new();
-                state.push_snapshot(snapshot);
-                let new_state = chaffra_telemetry::churn::ChurnState {
-                    fingerprints: current_fingerprints,
-                    findings_hash: current_hash,
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                };
-                let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+                chaffra_telemetry::finalize_and_flush(
+                    &analysis_collector,
+                    &state,
+                    analysis_collector.config(),
+                );
                 state
             } else {
                 chaffra_telemetry::seed::seed_live_state()
@@ -3302,6 +3286,137 @@ mod tests {
         assert!(
             err_msg.contains("offf"),
             "Error should mention the invalid value"
+        );
+    }
+
+    // --- merge_telemetry_config: project overrides backends ---
+
+    #[test]
+    fn test_merge_telemetry_config_project_overrides_backends() {
+        // CLI starts with the default backend (JsonFile -> "chaffra-telemetry.json").
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        assert_eq!(cli_config.backends.len(), 1);
+        assert_eq!(
+            cli_config.backends[0].kind,
+            chaffra_telemetry::BackendKind::JsonFile
+        );
+        assert_eq!(
+            cli_config.backends[0].path.as_deref(),
+            Some("chaffra-telemetry.json")
+        );
+
+        // Project config specifies a non-default backend (stderr).
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\nbackend = \"stderr\"\n").unwrap();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config, false).unwrap();
+        assert_eq!(merged.backends.len(), 1, "should have exactly one backend");
+        assert_eq!(
+            merged.backends[0].kind,
+            chaffra_telemetry::BackendKind::Stderr,
+            "project backend=stderr should override the default JsonFile backend"
+        );
+    }
+
+    // --- cmd_telemetry_inspect: user-scoped vs operator snapshot formatting ---
+
+    #[test]
+    fn test_cmd_telemetry_inspect_user_scoped_output() {
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            ..Default::default()
+        };
+        let output = cmd_telemetry_inspect(&tel_config).unwrap();
+        assert!(
+            output.contains("user-scoped snapshot"),
+            "UserOnly inspect should show user-scoped notice, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_cmd_telemetry_inspect_operator_output() {
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            ..Default::default()
+        };
+        let output = cmd_telemetry_inspect(&tel_config).unwrap();
+        assert!(
+            !output.contains("user-scoped snapshot"),
+            "Operator (On) inspect should NOT show user-scoped notice, got: {output}"
+        );
+    }
+
+    // --- run_with_telemetry: success, error, off, live-state paths ---
+
+    #[test]
+    fn test_run_with_telemetry_success_path() {
+        let config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config = ChaffraConfig::default();
+        let result = run_with_telemetry(
+            &config,
+            &project_config,
+            false,
+            "test",
+            None,
+            |_collector| Ok("success".to_owned()),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "success");
+    }
+
+    #[test]
+    fn test_run_with_telemetry_error_path() {
+        let config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config = ChaffraConfig::default();
+        let result = run_with_telemetry(
+            &config,
+            &project_config,
+            false,
+            "test",
+            None,
+            |_collector| anyhow::bail!("test error"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_with_telemetry_off_skips_lifecycle() {
+        let mut config = chaffra_telemetry::TelemetryConfig::default();
+        config.audience = chaffra_telemetry::TelemetryAudience::Off;
+        let project_config = ChaffraConfig::default();
+        let result = run_with_telemetry(
+            &config,
+            &project_config,
+            false,
+            "test",
+            None,
+            |_collector| Ok("done".to_owned()),
+        );
+        assert_eq!(result.unwrap(), "done");
+    }
+
+    #[test]
+    fn test_run_with_telemetry_with_live_state() {
+        let config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config = ChaffraConfig::default();
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let result = run_with_telemetry(
+            &config,
+            &project_config,
+            false,
+            "test",
+            Some(&live_state),
+            |collector| {
+                collector.set_files_total(5);
+                Ok("with-live".to_owned())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "with-live");
+        // LiveTelemetryState should have been updated by finalize_and_flush_sampled.
+        assert!(
+            live_state.current().is_some(),
+            "live state should have a snapshot after successful run"
         );
     }
 }

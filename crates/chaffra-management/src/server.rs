@@ -732,6 +732,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_history_filter_by_module() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.set_files_total(20);
+        collector.record_module_call("dead-code", 150, false);
+        collector.record_module_findings(
+            "dead-code",
+            5,
+            &[("warning".to_owned(), 3), ("info".to_owned(), 2)]
+                .into_iter()
+                .collect(),
+        );
+        collector.record_module_call("complexity", 80, false);
+        collector.record_module_findings(
+            "complexity",
+            2,
+            &[("info".to_owned(), 2)].into_iter().collect(),
+        );
+
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::On,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics/history?module=dead-code")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "live");
+        let snapshots = parsed["snapshots"].as_array().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        // Verify snapshot contains the dead-code module in its user_summary
+        let snap = &snapshots[0];
+        let modules = snap["user_summary"]["module_summaries"]
+            .as_object()
+            .unwrap();
+        assert!(
+            modules.contains_key("dead-code"),
+            "filtered snapshot should contain dead-code module"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_history_filter_by_severity() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.set_files_total(10);
+        collector.record_module_call("dead-code", 100, false);
+        collector.record_module_findings(
+            "dead-code",
+            5,
+            &[("warning".to_owned(), 3), ("info".to_owned(), 2)]
+                .into_iter()
+                .collect(),
+        );
+
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics/history?severity=warning")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "live");
+        let snapshots = parsed["snapshots"].as_array().unwrap();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "should return 1 snapshot matching severity=warning"
+        );
+        // Verify findings_by_severity contains warning
+        let snap = &snapshots[0];
+        let sev = snap["user_summary"]["findings_by_severity"]
+            .as_object()
+            .unwrap();
+        assert!(
+            sev.contains_key("warning"),
+            "filtered snapshot should have warning severity"
+        );
+        assert_eq!(sev["warning"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_history_filter_by_metric() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.set_files_total(10);
+        collector.record_module_call("dead-code", 150, false);
+
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::On,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/metrics/history?metric=chaffra.module.call_duration_ms")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "live");
+        let snapshots = parsed["snapshots"].as_array().unwrap();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "should return 1 snapshot matching metric=chaffra.module.call_duration_ms"
+        );
+        // Verify data_points contain the metric
+        let snap = &snapshots[0];
+        let dps = snap["data_points"].as_array().unwrap();
+        let has_metric = dps.iter().any(|dp| {
+            dp["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("chaffra.module.call_duration_ms")
+        });
+        assert!(
+            has_metric,
+            "filtered snapshot should contain chaffra.module.call_duration_ms data point"
+        );
+    }
+
+    #[tokio::test]
     async fn test_live_snapshot_feeds_all_endpoints() {
         let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
         collector.set_files_total(50);
