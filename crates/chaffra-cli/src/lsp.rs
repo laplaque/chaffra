@@ -122,11 +122,48 @@ pub fn analyze_file_for_diagnostics(
         content: content.to_vec(),
     }];
 
-    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
+    let workspace_config = Path::new(file_path)
+        .parent()
+        .and_then(|dir| {
+            let mut d = dir;
+            loop {
+                let candidate = d.join(".chaffra.toml");
+                if candidate.exists() {
+                    return Some(ChaffraConfig::load_from_dir(d).unwrap_or_default());
+                }
+                d = d.parent()?;
+            }
+        })
+        .unwrap_or_default();
+
+    let effective_tel = {
+        let module_cfg = workspace_config.module_config("telemetry");
+        if module_cfg.is_empty() {
+            tel_config.clone()
+        } else {
+            match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
+                Ok(project_tel) => {
+                    if matches!(
+                        project_tel.audience,
+                        chaffra_telemetry::TelemetryAudience::Off
+                    ) {
+                        return analyze_file_no_telemetry(file_path, content);
+                    }
+                    let mut merged = tel_config.clone();
+                    merged.sampling_rate = project_tel.sampling_rate;
+                    merged.sampling_strategy = project_tel.sampling_strategy;
+                    merged
+                }
+                Err(_) => tel_config.clone(),
+            }
+        }
+    };
+
+    let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel);
     collector.register_core_metrics();
     collector.set_files_total(1);
     let host = crate::build_module_host_with_telemetry(Some(&collector));
-    let config = ChaffraConfig::default();
+    let config = workspace_config;
     let start = std::time::Instant::now();
     let mut had_error = false;
     let mut all_findings = Vec::new();
@@ -166,9 +203,30 @@ pub fn analyze_file_for_diagnostics(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     collector.record_module_call("lsp", duration_ms, had_error);
-    collector.set_finding_fingerprints(crate::fingerprints_from_findings(&all_findings));
+    let fingerprints = crate::fingerprints_from_findings(&all_findings);
+    collector.set_finding_fingerprints(fingerprints.clone());
+
+    let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
+    let previous_state = chaffra_telemetry::churn::load_state(state_path);
+    let current_hash = chaffra_telemetry::churn::hash_fingerprints(&fingerprints);
+
+    if let Some(ref prev) = previous_state {
+        let churn = chaffra_telemetry::churn::compute_churn(&fingerprints, prev);
+        collector.record_finding_churn(&churn);
+    }
+
     let snapshot = collector.snapshot();
     live_state.push_snapshot(snapshot);
+
+    let new_state = chaffra_telemetry::churn::ChurnState {
+        fingerprints,
+        findings_hash: current_hash,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
 
     diagnostics
 }

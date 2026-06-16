@@ -42,8 +42,9 @@ impl TelemetryModule {
             .unwrap_or_else(TelemetryCollector::with_defaults)
     }
 
-    fn get_config(&self, config: &HashMap<String, String>) -> TelemetryConfig {
-        TelemetryConfig::from_module_config(config).unwrap_or_default()
+    fn get_config(&self, config: &HashMap<String, String>) -> Result<TelemetryConfig> {
+        TelemetryConfig::from_module_config(config)
+            .map_err(|e| ChaffraError::Config(format!("telemetry module config: {e}")))
     }
 }
 
@@ -105,7 +106,7 @@ impl AnalysisModule for TelemetryModule {
         _files: &[FileInfo],
         config: &HashMap<String, String>,
     ) -> Result<AnalysisResult> {
-        let tel_config = self.get_config(config);
+        let tel_config = self.get_config(config)?;
         let collector = self.get_collector();
 
         // Create backends and check status.
@@ -373,6 +374,15 @@ mod tests {
         let finding = backend_status_finding(&status);
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.message.contains("connected"));
+    }
+
+    #[test]
+    fn test_module_analyze_invalid_config_fails_closed() {
+        let module = TelemetryModule::new();
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), "bogus-value".to_owned());
+        let err = module.analyze(&[], &config).unwrap_err();
+        assert!(matches!(err, ChaffraError::Config(_)));
     }
 
     #[test]

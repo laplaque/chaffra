@@ -16,6 +16,33 @@ pub fn build_module_host() -> GrpcModuleHost {
     host
 }
 
+fn merge_project_telemetry_config(
+    server_config: &chaffra_telemetry::TelemetryConfig,
+    project_config: &ChaffraConfig,
+) -> chaffra_telemetry::TelemetryConfig {
+    let module_cfg = project_config.module_config("telemetry");
+    if module_cfg.is_empty() {
+        return server_config.clone();
+    }
+    let project_tel = match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
+        Ok(cfg) => cfg,
+        Err(_) => return server_config.clone(),
+    };
+
+    let mut merged = server_config.clone();
+    merged.sampling_rate = project_tel.sampling_rate;
+    merged.sampling_strategy = project_tel.sampling_strategy;
+
+    if matches!(
+        project_tel.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        merged.audience = chaffra_telemetry::TelemetryAudience::Off;
+    }
+
+    merged
+}
+
 fn record_analysis_and_push(
     host: &GrpcModuleHost,
     module_id: &str,
@@ -63,9 +90,30 @@ fn record_analysis_and_push(
                     )
                 })
                 .collect();
-            collector.set_finding_fingerprints(fingerprints);
+            collector.set_finding_fingerprints(fingerprints.clone());
+
+            let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
+            let previous_state = chaffra_telemetry::churn::load_state(state_path);
+            let current_hash = chaffra_telemetry::churn::hash_fingerprints(&fingerprints);
+
+            if let Some(ref prev) = previous_state {
+                let churn = chaffra_telemetry::churn::compute_churn(&fingerprints, prev);
+                collector.record_finding_churn(&churn);
+            }
+
             let snapshot = collector.snapshot();
             live_state.push_snapshot(snapshot);
+
+            let new_state = chaffra_telemetry::churn::ChurnState {
+                fingerprints,
+                findings_hash: current_hash,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+
             Ok(result)
         }
         Err(e) => {
@@ -170,6 +218,7 @@ pub fn execute_health(
     };
 
     let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
+    let effective_tel = merge_project_telemetry_config(tel_config, &config);
     let files = discover_and_read_files(&root, &config);
 
     if files.is_empty() {
@@ -177,7 +226,14 @@ pub fn execute_health(
     }
 
     let host = build_module_host();
-    let _ = record_analysis_and_push(&host, "complexity", &files, &config, live_state, tel_config);
+    let _ = record_analysis_and_push(
+        &host,
+        "complexity",
+        &files,
+        &config,
+        live_state,
+        &effective_tel,
+    );
 
     match chaffra_complexity::analyze_project_health(
         &files,
@@ -206,6 +262,7 @@ pub fn execute_dead_code(
     };
 
     let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
+    let effective_tel = merge_project_telemetry_config(tel_config, &config);
     let files = discover_and_read_files(&root, &config);
 
     if files.is_empty() {
@@ -213,7 +270,14 @@ pub fn execute_dead_code(
     }
 
     let host = build_module_host();
-    match record_analysis_and_push(&host, "dead-code", &files, &config, live_state, tel_config) {
+    match record_analysis_and_push(
+        &host,
+        "dead-code",
+        &files,
+        &config,
+        live_state,
+        &effective_tel,
+    ) {
         Ok(result) => match serde_json::to_string_pretty(&result) {
             Ok(json) => ToolCallResult::text(json),
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -482,5 +546,27 @@ mod tests {
         let host = build_module_host();
         let list = host.list();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_no_module_section() {
+        let server = tc();
+        let project = ChaffraConfig::default();
+        let merged = merge_project_telemetry_config(&server, &project);
+        assert_eq!(merged.audience, server.audience);
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_off_overrides() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert("audience".to_owned(), toml::Value::String("off".to_owned()));
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let merged = merge_project_telemetry_config(&server, &project);
+        assert!(matches!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::Off
+        ));
     }
 }

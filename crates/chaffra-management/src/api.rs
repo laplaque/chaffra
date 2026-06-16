@@ -90,6 +90,9 @@ pub struct ConfigResponse {
 pub struct HistoryQuery {
     #[serde(default = "default_window")]
     pub window: String,
+    pub module: Option<String>,
+    pub severity: Option<String>,
+    pub metric: Option<String>,
 }
 
 fn default_window() -> String {
@@ -164,7 +167,17 @@ pub async fn get_metrics_history(
         }
     };
 
-    let snapshots = state.live_state.history_window(&query.window);
+    let snapshots = if let Some(ref module) = query.module {
+        state.live_state.history_by_module(module, &query.window)
+    } else if let Some(ref severity) = query.severity {
+        state
+            .live_state
+            .history_by_severity(severity, &query.window)
+    } else if let Some(ref metric) = query.metric {
+        state.live_state.history_by_metric(metric, &query.window)
+    } else {
+        state.live_state.history_window(&query.window)
+    };
     let include_operator = state.audience.operator_enabled();
     let snapshot_values: Vec<serde_json::Value> = snapshots
         .iter()
@@ -375,5 +388,30 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: FindingsChurnResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.new_count, 3);
+    }
+
+    #[test]
+    fn test_history_query_deserialize_with_filters() {
+        let json = r#"{"window":"1h","module":"dead-code"}"#;
+        let q: HistoryQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.window, "1h");
+        assert_eq!(q.module.as_deref(), Some("dead-code"));
+        assert!(q.severity.is_none());
+        assert!(q.metric.is_none());
+    }
+
+    #[test]
+    fn test_history_query_deserialize_severity() {
+        let json = r#"{"severity":"warning"}"#;
+        let q: HistoryQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.window, "7d");
+        assert_eq!(q.severity.as_deref(), Some("warning"));
+    }
+
+    #[test]
+    fn test_history_query_deserialize_metric() {
+        let json = r#"{"metric":"chaffra.module.call_duration_ms"}"#;
+        let q: HistoryQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.metric.as_deref(), Some("chaffra.module.call_duration_ms"));
     }
 }
