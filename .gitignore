@@ -24,5 +24,8 @@ target
 chaffra-telemetry.json
 .chaffra-telemetry-state.json
 
+# Coverage reports
+tarpaulin-report.json
+
 # Claude Code
 .claude/
