@@ -3419,4 +3419,19 @@ mod tests {
             "live state should have a snapshot after successful run"
         );
     }
+
+    #[test]
+    fn test_run_with_telemetry_invalid_config_propagates_error() {
+        let config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"bogus\"\n").unwrap();
+        let result = run_with_telemetry(&config, &project_config, false, "test", None, |_| {
+            panic!("closure should never be called when config is invalid");
+        });
+        assert!(result.is_err(), "invalid config should propagate as error");
+        assert!(
+            result.unwrap_err().to_string().contains("bogus"),
+            "error should mention the invalid value"
+        );
+    }
 }
