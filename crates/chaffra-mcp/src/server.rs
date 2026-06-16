@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// MCP server that reads JSON-RPC requests from stdin and writes responses to stdout.
 pub struct McpServer {
     initialized: bool,
-    _live_state: chaffra_telemetry::LiveTelemetryState,
+    live_state: chaffra_telemetry::LiveTelemetryState,
 }
 
 impl McpServer {
@@ -17,7 +17,7 @@ impl McpServer {
     pub fn new(live_state: chaffra_telemetry::LiveTelemetryState) -> Self {
         Self {
             initialized: false,
-            _live_state: live_state,
+            live_state,
         }
     }
 
@@ -139,7 +139,7 @@ impl McpServer {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        let result = tools::dispatch_tool(&tool_name, &tool_args);
+        let result = tools::dispatch_tool(&tool_name, &tool_args, &self.live_state);
         JsonRpcResponse::success(request.id.clone(), serde_json::to_value(result).unwrap())
     }
 

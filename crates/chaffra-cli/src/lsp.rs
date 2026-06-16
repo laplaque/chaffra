@@ -95,6 +95,7 @@ pub fn finding_to_diagnostic(finding: &Finding) -> Diagnostic {
 pub fn analyze_file_for_diagnostics(
     file_path: &str,
     content: &[u8],
+    live_state: &chaffra_telemetry::LiveTelemetryState,
 ) -> HashMap<String, Vec<Diagnostic>> {
     use chaffra_core::config::ChaffraConfig;
     use chaffra_core::diagnostic::FileInfo;
@@ -113,28 +114,49 @@ pub fn analyze_file_for_diagnostics(
         content: content.to_vec(),
     }];
 
-    let host = crate::build_module_host();
+    let collector =
+        chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig::default());
+    collector.register_core_metrics();
+    collector.set_files_total(1);
+    let host = crate::build_module_host_with_telemetry(Some(&collector));
     let config = ChaffraConfig::default();
+    let start = std::time::Instant::now();
+    let mut had_error = false;
 
     // Run dead-code analysis.
-    if let Ok(result) = host.analyze("dead-code", &files, &config) {
-        for finding in &result.findings {
-            diagnostics
-                .entry(file_path.to_owned())
-                .or_default()
-                .push(finding_to_diagnostic(finding));
+    match host.analyze("dead-code", &files, &config) {
+        Ok(result) => {
+            for finding in &result.findings {
+                diagnostics
+                    .entry(file_path.to_owned())
+                    .or_default()
+                    .push(finding_to_diagnostic(finding));
+            }
+        }
+        Err(_) => {
+            had_error = true;
         }
     }
 
     // Run complexity analysis.
-    if let Ok(result) = host.analyze("complexity", &files, &config) {
-        for finding in &result.findings {
-            diagnostics
-                .entry(file_path.to_owned())
-                .or_default()
-                .push(finding_to_diagnostic(finding));
+    match host.analyze("complexity", &files, &config) {
+        Ok(result) => {
+            for finding in &result.findings {
+                diagnostics
+                    .entry(file_path.to_owned())
+                    .or_default()
+                    .push(finding_to_diagnostic(finding));
+            }
+        }
+        Err(_) => {
+            had_error = true;
         }
     }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    collector.record_module_call("lsp", duration_ms, had_error);
+    let snapshot = collector.snapshot();
+    live_state.push_snapshot(snapshot);
 
     diagnostics
 }
@@ -191,7 +213,7 @@ async fn read_content_length(reader: &mut BufReader<tokio::io::Stdin>) -> Result
 /// Implements proper Content-Length-based message framing per the LSP spec:
 /// reads `Content-Length: N\r\n...\r\n` headers, then reads exactly N bytes
 /// of JSON payload.
-pub async fn run_lsp_server(_live_state: chaffra_telemetry::LiveTelemetryState) -> Result<()> {
+pub async fn run_lsp_server(live_state: chaffra_telemetry::LiveTelemetryState) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -210,7 +232,7 @@ pub async fn run_lsp_server(_live_state: chaffra_telemetry::LiveTelemetryState) 
             Err(_) => continue,
         };
 
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &live_state);
         for resp in responses {
             let json = serde_json::to_string(&resp)?;
             stdout
@@ -224,7 +246,10 @@ pub async fn run_lsp_server(_live_state: chaffra_telemetry::LiveTelemetryState) 
 }
 
 /// Handle a single LSP request and return responses/notifications.
-fn handle_lsp_request(request: &LspRequest) -> Vec<LspResponse> {
+fn handle_lsp_request(
+    request: &LspRequest,
+    live_state: &chaffra_telemetry::LiveTelemetryState,
+) -> Vec<LspResponse> {
     match request.method.as_str() {
         "initialize" => {
             let capabilities = ServerCapabilities {
@@ -265,7 +290,8 @@ fn handle_lsp_request(request: &LspRequest) -> Vec<LspResponse> {
                     let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
 
                     if let Ok(content) = std::fs::read(file_path) {
-                        let diagnostics_map = analyze_file_for_diagnostics(file_path, &content);
+                        let diagnostics_map =
+                            analyze_file_for_diagnostics(file_path, &content, live_state);
 
                         let mut responses = Vec::new();
                         for (path, diags) in diagnostics_map {
@@ -318,7 +344,8 @@ fn handle_lsp_request(request: &LspRequest) -> Vec<LspResponse> {
                     let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
                     let content = open_params.text_document.text.as_bytes();
 
-                    let diagnostics_map = analyze_file_for_diagnostics(file_path, content);
+                    let diagnostics_map =
+                        analyze_file_for_diagnostics(file_path, content, live_state);
 
                     let mut responses = Vec::new();
                     for (path, diags) in diagnostics_map {
@@ -432,15 +459,20 @@ mod tests {
         assert!(diag.message.contains("foo"));
     }
 
+    fn test_live_state() -> chaffra_telemetry::LiveTelemetryState {
+        chaffra_telemetry::LiveTelemetryState::new()
+    }
+
     #[test]
     fn test_handle_initialize() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: Some(serde_json::json!(1)),
             method: "initialize".to_owned(),
             params: Some(serde_json::json!({})),
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert_eq!(responses.len(), 1);
         assert!(responses[0].result.is_some());
         let result = responses[0].result.as_ref().unwrap();
@@ -449,82 +481,89 @@ mod tests {
 
     #[test]
     fn test_handle_initialized() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: None,
             method: "initialized".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert!(responses.is_empty());
     }
 
     #[test]
     fn test_handle_shutdown() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: Some(serde_json::json!(2)),
             method: "shutdown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
 
     #[test]
     fn test_handle_unknown_request() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: Some(serde_json::json!(3)),
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert_eq!(responses.len(), 1);
     }
 
     #[test]
     fn test_handle_unknown_notification() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: None,
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert!(responses.is_empty());
     }
 
     #[test]
     fn test_handle_hover_no_params() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: Some(serde_json::json!(4)),
             method: "textDocument/hover".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
 
     #[test]
     fn test_handle_did_save_no_params() {
+        let ls = test_live_state();
         let request = LspRequest {
             jsonrpc: "2.0".to_owned(),
             id: None,
             method: "textDocument/didSave".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request);
+        let responses = handle_lsp_request(&request, &ls);
         assert!(responses.is_empty());
     }
 
     #[test]
     fn test_analyze_file_go_content() {
+        let ls = test_live_state();
         let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
-        let diagnostics = analyze_file_for_diagnostics("/tmp/test.go", content);
+        let diagnostics = analyze_file_for_diagnostics("/tmp/test.go", content, &ls);
         // Should produce at least dead-code findings for unused function.
         let all_diags: Vec<&Diagnostic> = diagnostics.values().flatten().collect();
         // The analysis should run without panicking.
@@ -533,8 +572,9 @@ mod tests {
 
     #[test]
     fn test_analyze_file_unknown_extension() {
+        let ls = test_live_state();
         let content = b"some content";
-        let diagnostics = analyze_file_for_diagnostics("/tmp/test.txt", content);
+        let diagnostics = analyze_file_for_diagnostics("/tmp/test.txt", content, &ls);
         // Unknown extension should produce no diagnostics.
         let total: usize = diagnostics.values().map(|v| v.len()).sum();
         assert_eq!(total, 0);

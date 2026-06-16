@@ -46,14 +46,18 @@ Current metric values.
 
 ### `GET /api/v1/metrics/history?window=7d`
 
-**Status: not implemented.** Returns an explicit `not_implemented` status. Time-series history requires the streaming/watch mode integration (co-located mode). This endpoint will return populated snapshots once that integration is available.
+Time-series snapshot history. The response `status` indicates the data source:
+
+- `seeded` — deterministic demo data (default standalone mode)
+- `live` — real analysis data from `--path` mode or pushed by watch/MCP/LSP
+- `empty` — no data available (`--telemetry off` mode)
 
 ```json
 {
   "window": "7d",
-  "snapshots": [],
-  "status": "not_implemented",
-  "message": "Time-series history requires the streaming/watch mode integration. This endpoint will return snapshots once co-located mode is available."
+  "snapshots": [ { "..." : "..." } ],
+  "status": "seeded",
+  "message": "Seeded demo/test data. Run an analysis to populate live metrics."
 }
 ```
 
@@ -112,17 +116,19 @@ Active configuration (redacted secrets).
 
 ```json
 {
-  "audience": "On",
+  "audience": "on",
   "sampling_rate": 1.0,
-  "sampling_strategy": "Rate",
-  "backends": ["JsonFile"]
+  "sampling_strategy": "rate",
+  "backends": ["json-file"]
 }
 ```
 
 ## Lifecycle
 
-- **Standalone mode** (`chaffra management`): starts an empty collector with core metric definitions registered. Useful for verifying the dashboard UI, API shape, and backend connectivity. Does not contain analysis data.
-- **Co-located mode** (watch/MCP/LSP): the management server shares the live `TelemetryCollector` used by analysis, exposing real-time metrics, findings, and churn data. Wiring into these modes is planned for a future phase.
+- **Default mode** (`chaffra management`): starts with deterministic seeded demo data. All data endpoints return pre-built snapshots for verifying the dashboard UI, API shape, and backend connectivity.
+- **Live mode** (`chaffra management --path .`): runs analysis on the given directory and serves real telemetry data, including module results, finding counts, severity breakdowns, and churn.
+- **Off mode** (`chaffra --telemetry off management`): starts with empty state. All data endpoints return zero/empty defaults.
+- Watch, MCP, and LSP modes push live snapshots into the shared `LiveTelemetryState` during analysis, populating the same endpoints.
 - Clean shutdown on Ctrl+C
 - Binds to `127.0.0.1` only (localhost)
 

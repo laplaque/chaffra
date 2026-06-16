@@ -16,6 +16,47 @@ pub fn build_module_host() -> GrpcModuleHost {
     host
 }
 
+fn record_analysis_and_push(
+    host: &GrpcModuleHost,
+    module_id: &str,
+    files: &[FileInfo],
+    config: &ChaffraConfig,
+    live_state: &chaffra_telemetry::LiveTelemetryState,
+) -> Result<chaffra_core::diagnostic::AnalysisResult, String> {
+    let collector =
+        chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig::default());
+    collector.register_core_metrics();
+    collector.set_files_total(files.len() as u64);
+    let start = std::time::Instant::now();
+
+    match host.analyze(module_id, files, config) {
+        Ok(result) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call(module_id, duration_ms, false);
+            let mut sev_counts = std::collections::HashMap::new();
+            for finding in &result.findings {
+                let sev = match finding.severity {
+                    chaffra_core::diagnostic::Severity::Error => "error",
+                    chaffra_core::diagnostic::Severity::Warning => "warning",
+                    chaffra_core::diagnostic::Severity::Info => "info",
+                };
+                *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+            }
+            collector.record_module_findings(module_id, result.findings.len() as u64, &sev_counts);
+            let snapshot = collector.snapshot();
+            live_state.push_snapshot(snapshot);
+            Ok(result)
+        }
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call(module_id, duration_ms, true);
+            let snapshot = collector.snapshot();
+            live_state.push_snapshot(snapshot);
+            Err(e.to_string())
+        }
+    }
+}
+
 /// Return the list of available MCP tool definitions.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -95,36 +136,10 @@ fn discover_and_read_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo>
 }
 
 /// Execute the chaffra/health tool.
-pub fn execute_health(params: &serde_json::Value) -> ToolCallResult {
-    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-
-    let root = match Path::new(path).canonicalize() {
-        Ok(r) => r,
-        Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
-    };
-
-    let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
-    let files = discover_and_read_files(&root, &config);
-
-    if files.is_empty() {
-        return ToolCallResult::text("No source files found.".to_owned());
-    }
-
-    match chaffra_complexity::analyze_project_health(
-        &files,
-        config.health.max_cyclomatic,
-        config.health.max_cognitive,
-    ) {
-        Ok(health) => match serde_json::to_string_pretty(&health) {
-            Ok(json) => ToolCallResult::text(json),
-            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
-        },
-        Err(e) => ToolCallResult::error(format!("Analysis error: {e}")),
-    }
-}
-
-/// Execute the chaffra/dead-code tool.
-pub fn execute_dead_code(params: &serde_json::Value) -> ToolCallResult {
+pub fn execute_health(
+    params: &serde_json::Value,
+    live_state: &chaffra_telemetry::LiveTelemetryState,
+) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
     let root = match Path::new(path).canonicalize() {
@@ -140,7 +155,42 @@ pub fn execute_dead_code(params: &serde_json::Value) -> ToolCallResult {
     }
 
     let host = build_module_host();
-    match host.analyze("dead-code", &files, &config) {
+    let _ = record_analysis_and_push(&host, "complexity", &files, &config, live_state);
+
+    match chaffra_complexity::analyze_project_health(
+        &files,
+        config.health.max_cyclomatic,
+        config.health.max_cognitive,
+    ) {
+        Ok(health) => match serde_json::to_string_pretty(&health) {
+            Ok(json) => ToolCallResult::text(json),
+            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
+        },
+        Err(e) => ToolCallResult::error(format!("Analysis error: {e}")),
+    }
+}
+
+/// Execute the chaffra/dead-code tool.
+pub fn execute_dead_code(
+    params: &serde_json::Value,
+    live_state: &chaffra_telemetry::LiveTelemetryState,
+) -> ToolCallResult {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+    let root = match Path::new(path).canonicalize() {
+        Ok(r) => r,
+        Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
+    };
+
+    let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
+    let files = discover_and_read_files(&root, &config);
+
+    if files.is_empty() {
+        return ToolCallResult::text("No source files found.".to_owned());
+    }
+
+    let host = build_module_host();
+    match record_analysis_and_push(&host, "dead-code", &files, &config, live_state) {
         Ok(result) => match serde_json::to_string_pretty(&result) {
             Ok(json) => ToolCallResult::text(json),
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -217,10 +267,14 @@ pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
 }
 
 /// Dispatch a tool call by name.
-pub fn dispatch_tool(name: &str, params: &serde_json::Value) -> ToolCallResult {
+pub fn dispatch_tool(
+    name: &str,
+    params: &serde_json::Value,
+    live_state: &chaffra_telemetry::LiveTelemetryState,
+) -> ToolCallResult {
     match name {
-        "chaffra/health" => execute_health(params),
-        "chaffra/dead-code" => execute_dead_code(params),
+        "chaffra/health" => execute_health(params, live_state),
+        "chaffra/dead-code" => execute_dead_code(params, live_state),
         "chaffra/explain" => execute_explain(params),
         "chaffra/telemetry" => execute_telemetry(params),
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
@@ -260,7 +314,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_unknown_tool() {
-        let result = dispatch_tool("unknown/tool", &serde_json::json!({}));
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = dispatch_tool("unknown/tool", &serde_json::json!({}), &ls);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Unknown tool"));
     }
@@ -287,23 +342,26 @@ mod tests {
 
     #[test]
     fn test_health_invalid_path() {
-        let result = execute_health(&serde_json::json!({"path": "/nonexistent/path/xyz"}));
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = execute_health(&serde_json::json!({"path": "/nonexistent/path/xyz"}), &ls);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
     }
 
     #[test]
     fn test_dead_code_invalid_path() {
-        let result = execute_dead_code(&serde_json::json!({"path": "/nonexistent/path/xyz"}));
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = execute_dead_code(&serde_json::json!({"path": "/nonexistent/path/xyz"}), &ls);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
     }
 
     #[test]
     fn test_health_empty_dir() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
         let dir = std::env::temp_dir().join("chaffra_mcp_test_empty");
         let _ = std::fs::create_dir_all(&dir);
-        let result = execute_health(&serde_json::json!({"path": dir.to_str().unwrap()}));
+        let result = execute_health(&serde_json::json!({"path": dir.to_str().unwrap()}), &ls);
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -311,9 +369,10 @@ mod tests {
 
     #[test]
     fn test_dead_code_empty_dir() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
         let dir = std::env::temp_dir().join("chaffra_mcp_test_dc_empty");
         let _ = std::fs::create_dir_all(&dir);
-        let result = execute_dead_code(&serde_json::json!({"path": dir.to_str().unwrap()}));
+        let result = execute_dead_code(&serde_json::json!({"path": dir.to_str().unwrap()}), &ls);
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -321,11 +380,13 @@ mod tests {
 
     #[test]
     fn test_dispatch_health() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
         let dir = std::env::temp_dir().join("chaffra_mcp_dispatch_health");
         let _ = std::fs::create_dir_all(&dir);
         let result = dispatch_tool(
             "chaffra/health",
             &serde_json::json!({"path": dir.to_str().unwrap()}),
+            &ls,
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -333,11 +394,13 @@ mod tests {
 
     #[test]
     fn test_dispatch_dead_code() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
         let dir = std::env::temp_dir().join("chaffra_mcp_dispatch_dc");
         let _ = std::fs::create_dir_all(&dir);
         let result = dispatch_tool(
             "chaffra/dead-code",
             &serde_json::json!({"path": dir.to_str().unwrap()}),
+            &ls,
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -345,9 +408,11 @@ mod tests {
 
     #[test]
     fn test_dispatch_explain() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
         let result = dispatch_tool(
             "chaffra/explain",
             &serde_json::json!({"rule_id": "dead-code:unused-function"}),
+            &ls,
         );
         assert!(result.is_error.is_none());
     }

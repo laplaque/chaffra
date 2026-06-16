@@ -1133,13 +1133,14 @@ fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<Strin
     Ok(out)
 }
 
-fn build_telemetry_config(cli: &Cli) -> (chaffra_telemetry::TelemetryConfig, bool) {
+fn build_telemetry_config(cli: &Cli) -> Result<(chaffra_telemetry::TelemetryConfig, bool)> {
     let (audience, explicit) = match cli.telemetry.as_deref() {
-        Some(s) => (
-            chaffra_telemetry::TelemetryAudience::from_str_loose(s)
-                .unwrap_or(chaffra_telemetry::TelemetryAudience::UserOnly),
-            true,
-        ),
+        Some(s) => match chaffra_telemetry::TelemetryAudience::from_str_loose(s) {
+            Some(a) => (a, true),
+            None => anyhow::bail!(
+                "invalid --telemetry value: {s:?}; valid values: on, off, user-only, operator-only"
+            ),
+        },
         None => (chaffra_telemetry::TelemetryAudience::UserOnly, false),
     };
 
@@ -1165,14 +1166,14 @@ fn build_telemetry_config(cli: &Cli) -> (chaffra_telemetry::TelemetryConfig, boo
         chaffra_telemetry::TelemetryConfig::default().backends
     };
 
-    (
+    Ok((
         chaffra_telemetry::TelemetryConfig {
             audience,
             backends,
             ..Default::default()
         },
         explicit,
-    )
+    ))
 }
 
 fn cmd_telemetry_status(tel_config: &chaffra_telemetry::TelemetryConfig) -> String {
@@ -1385,7 +1386,9 @@ where
                 snapshot.user_scoped()
             };
             for backend in &backends {
-                let _ = backend.flush(&flushed);
+                if let Err(e) = backend.flush(&flushed) {
+                    eprintln!("Warning: telemetry backend flush failed: {e}");
+                }
             }
         }
 
@@ -1425,7 +1428,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_str_loose(&cli.format).unwrap_or(OutputFormat::Terminal);
     let formatter = create_formatter(format);
-    let (tel_config, explicit_cli_audience) = build_telemetry_config(&cli);
+    let (tel_config, explicit_cli_audience) = build_telemetry_config(&cli)?;
     let live_state = chaffra_telemetry::LiveTelemetryState::new();
 
     match cli.command {
@@ -1786,8 +1789,14 @@ async fn main() -> Result<()> {
         },
 
         Command::Management { port, path } => {
-            let cwd = std::env::current_dir()?;
-            let project_config = load_config(cli.config.as_deref(), &cwd)?;
+            let config_root = if let Some(ref analysis_path) = path {
+                Path::new(analysis_path)
+                    .canonicalize()
+                    .context("invalid path")?
+            } else {
+                std::env::current_dir()?
+            };
+            let project_config = load_config(cli.config.as_deref(), &config_root)?;
             let effective_tel =
                 merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience);
             let audience = effective_tel.audience;
@@ -1795,19 +1804,15 @@ async fn main() -> Result<()> {
             collector.register_core_metrics();
             let mgmt_live_state = if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
                 chaffra_telemetry::LiveTelemetryState::new()
-            } else if let Some(ref analysis_path) = path {
-                let root = Path::new(analysis_path)
-                    .canonicalize()
-                    .context("invalid path")?;
-                let analysis_config = load_config(cli.config.as_deref(), &root)?;
+            } else if path.is_some() {
                 let analysis_collector = chaffra_telemetry::TelemetryCollector::new(effective_tel);
                 analysis_collector.register_core_metrics();
                 let host = build_module_host_with_telemetry(Some(&analysis_collector));
-                let files = discover_and_read_files(&root, &analysis_config);
+                let files = discover_and_read_files(&config_root, &project_config);
                 analysis_collector.set_files_total(files.len() as u64);
                 for module_info in host.list() {
                     let start = std::time::Instant::now();
-                    match host.analyze(&module_info.id, &files, &analysis_config) {
+                    match host.analyze(&module_info.id, &files, &project_config) {
                         Ok(result) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             analysis_collector.record_module_call(
@@ -1840,9 +1845,28 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                let current_fingerprints = analysis_collector.finding_fingerprints();
+                let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
+                let previous_state = chaffra_telemetry::churn::load_state(state_path);
+                let current_hash =
+                    chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
+                if let Some(ref prev) = previous_state {
+                    let churn =
+                        chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
+                    analysis_collector.record_finding_churn(&churn);
+                }
                 let snapshot = analysis_collector.snapshot();
                 let state = chaffra_telemetry::LiveTelemetryState::new();
                 state.push_snapshot(snapshot);
+                let new_state = chaffra_telemetry::churn::ChurnState {
+                    fingerprints: current_fingerprints,
+                    findings_hash: current_hash,
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                };
+                let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
                 state
             } else {
                 chaffra_telemetry::seed::seed_live_state()
@@ -3216,21 +3240,21 @@ mod tests {
     }
 
     #[test]
-    fn test_build_telemetry_config_invalid_string_falls_back_to_user_only() {
+    fn test_build_telemetry_config_invalid_string_is_rejected() {
         let cli = Cli::parse_from(["chaffra", "--telemetry", "garbage-value", "health", "."]);
-        let (config, explicit) = build_telemetry_config(&cli);
-        assert_eq!(
-            config.audience,
-            chaffra_telemetry::TelemetryAudience::UserOnly,
-            "Invalid telemetry flag should fall back to UserOnly"
+        let result = build_telemetry_config(&cli);
+        assert!(result.is_err(), "Invalid telemetry flag should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid --telemetry value"),
+            "Error should describe the invalid value: {err_msg}"
         );
-        assert!(explicit, "CLI flag was provided even if invalid");
     }
 
     #[test]
     fn test_build_telemetry_config_valid_off() {
         let cli = Cli::parse_from(["chaffra", "--telemetry", "off", "health", "."]);
-        let (config, explicit) = build_telemetry_config(&cli);
+        let (config, explicit) = build_telemetry_config(&cli).unwrap();
         assert_eq!(config.audience, chaffra_telemetry::TelemetryAudience::Off);
         assert!(explicit);
     }
@@ -3238,7 +3262,7 @@ mod tests {
     #[test]
     fn test_build_telemetry_config_valid_operator_only() {
         let cli = Cli::parse_from(["chaffra", "--telemetry", "operator-only", "health", "."]);
-        let (config, explicit) = build_telemetry_config(&cli);
+        let (config, explicit) = build_telemetry_config(&cli).unwrap();
         assert_eq!(
             config.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly
@@ -3249,7 +3273,7 @@ mod tests {
     #[test]
     fn test_build_telemetry_config_omitted_is_not_explicit() {
         let cli = Cli::parse_from(["chaffra", "health", "."]);
-        let (config, explicit) = build_telemetry_config(&cli);
+        let (config, explicit) = build_telemetry_config(&cli).unwrap();
         assert_eq!(
             config.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly
