@@ -204,47 +204,9 @@ pub fn analyze_file_for_diagnostics(
     let duration_ms = start.elapsed().as_millis() as u64;
     collector.record_module_call("lsp", duration_ms, had_error);
     let fingerprints = crate::fingerprints_from_findings(&all_findings);
-    collector.set_finding_fingerprints(fingerprints.clone());
+    collector.set_finding_fingerprints(fingerprints);
 
-    let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
-    let previous_state = chaffra_telemetry::churn::load_state(state_path);
-    let current_hash = chaffra_telemetry::churn::hash_fingerprints(&fingerprints);
-
-    if let Some(ref prev) = previous_state {
-        let churn = chaffra_telemetry::churn::compute_churn(&fingerprints, prev);
-        collector.record_finding_churn(&churn);
-    }
-
-    let snapshot = collector.snapshot();
-    live_state.push_snapshot(snapshot.clone());
-
-    if effective_tel.audience.operator_enabled() {
-        let (backends, _) = chaffra_telemetry::backends::create_backends(&effective_tel.backends);
-        let flushed = snapshot;
-        for backend in &backends {
-            if let Err(e) = backend.flush(&flushed) {
-                eprintln!("[lsp] telemetry backend flush error: {e}");
-            }
-        }
-    } else {
-        let (backends, _) = chaffra_telemetry::backends::create_backends(&effective_tel.backends);
-        let flushed = snapshot.user_scoped();
-        for backend in &backends {
-            if let Err(e) = backend.flush(&flushed) {
-                eprintln!("[lsp] telemetry backend flush error: {e}");
-            }
-        }
-    }
-
-    let new_state = chaffra_telemetry::churn::ChurnState {
-        fingerprints,
-        findings_hash: current_hash,
-        timestamp_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    };
-    let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+    chaffra_telemetry::finalize_and_flush(&collector, live_state, &effective_tel);
 
     diagnostics
 }

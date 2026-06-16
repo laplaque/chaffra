@@ -230,43 +230,12 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
                 collector.record_module_call("watch", duration_ms, false);
 
                 collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
-                let current_fingerprints = collector.finding_fingerprints();
-                let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
-                let previous_state = chaffra_telemetry::churn::load_state(state_path);
-                let current_hash =
-                    chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
 
-                if let Some(ref prev) = previous_state {
-                    let churn =
-                        chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
-                    collector.record_finding_churn(&churn);
-                }
-
-                let snapshot = collector.snapshot();
-                watch_config.live_state.push_snapshot(snapshot.clone());
-
-                let flushed = if watch_config.tel_config.audience.operator_enabled() {
-                    snapshot
-                } else {
-                    snapshot.user_scoped()
-                };
-                let (backends, _) =
-                    chaffra_telemetry::backends::create_backends(&watch_config.tel_config.backends);
-                for backend in &backends {
-                    if let Err(e) = backend.flush(&flushed) {
-                        eprintln!("Warning: telemetry backend flush failed: {e}");
-                    }
-                }
-
-                let new_state = chaffra_telemetry::churn::ChurnState {
-                    fingerprints: current_fingerprints,
-                    findings_hash: current_hash,
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                };
-                let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+                chaffra_telemetry::finalize_and_flush(
+                    &collector,
+                    &watch_config.live_state,
+                    &watch_config.tel_config,
+                );
 
                 if !ao.text.is_empty() {
                     print!("{}", ao.text);
@@ -275,21 +244,11 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 collector.record_module_call("watch", duration_ms, true);
-                let snapshot = collector.snapshot();
-                watch_config.live_state.push_snapshot(snapshot.clone());
-
-                let flushed = if watch_config.tel_config.audience.operator_enabled() {
-                    snapshot
-                } else {
-                    snapshot.user_scoped()
-                };
-                let (backends, _) =
-                    chaffra_telemetry::backends::create_backends(&watch_config.tel_config.backends);
-                for backend in &backends {
-                    if let Err(e) = backend.flush(&flushed) {
-                        eprintln!("Warning: telemetry backend flush failed: {e}");
-                    }
-                }
+                chaffra_telemetry::flush_snapshot(
+                    &collector,
+                    &watch_config.live_state,
+                    &watch_config.tel_config,
+                );
 
                 eprintln!("Analysis error: {e}");
             }

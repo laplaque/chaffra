@@ -90,49 +90,16 @@ fn record_analysis_and_push(
                     )
                 })
                 .collect();
-            collector.set_finding_fingerprints(fingerprints.clone());
+            collector.set_finding_fingerprints(fingerprints);
 
-            let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
-            let previous_state = chaffra_telemetry::churn::load_state(state_path);
-            let current_hash = chaffra_telemetry::churn::hash_fingerprints(&fingerprints);
-
-            if let Some(ref prev) = previous_state {
-                let churn = chaffra_telemetry::churn::compute_churn(&fingerprints, prev);
-                collector.record_finding_churn(&churn);
-            }
-
-            let snapshot = collector.snapshot();
-            live_state.push_snapshot(snapshot.clone());
-
-            let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
-            let flushed = if tel_config.audience.operator_enabled() {
-                snapshot
-            } else {
-                snapshot.user_scoped()
-            };
-            for backend in &backends {
-                if let Err(e) = backend.flush(&flushed) {
-                    eprintln!("[mcp] telemetry backend flush error: {e}");
-                }
-            }
-
-            let new_state = chaffra_telemetry::churn::ChurnState {
-                fingerprints,
-                findings_hash: current_hash,
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            };
-            let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+            chaffra_telemetry::finalize_and_flush(&collector, live_state, tel_config);
 
             Ok(result)
         }
         Err(e) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             collector.record_module_call(module_id, duration_ms, true);
-            let snapshot = collector.snapshot();
-            live_state.push_snapshot(snapshot);
+            chaffra_telemetry::flush_snapshot(&collector, live_state, tel_config);
             Err(e.to_string())
         }
     }

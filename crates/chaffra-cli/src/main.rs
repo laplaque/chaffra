@@ -1353,74 +1353,13 @@ where
     let failed = result.is_err();
     collector.record_module_call(command_name, duration_ms, failed);
 
+    let fallback_state = chaffra_telemetry::LiveTelemetryState::new();
+    let ls = live_state.unwrap_or(&fallback_state);
+
     if !failed {
-        let current_fingerprints = collector.finding_fingerprints();
-        let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
-        let previous_state = chaffra_telemetry::churn::load_state(state_path);
-
-        let current_hash = chaffra_telemetry::churn::hash_fingerprints(&current_fingerprints);
-
-        if let Some(ref prev) = previous_state {
-            let churn = chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
-            collector.record_finding_churn(&churn);
-        }
-
-        let snapshot = collector.snapshot();
-
-        if let Some(ls) = live_state {
-            ls.push_snapshot(snapshot.clone());
-        }
-
-        let decision = chaffra_telemetry::sampling::should_sample(
-            effective_config.sampling_strategy,
-            effective_config.sampling_rate,
-            current_hash,
-            previous_state.as_ref().map(|s| s.findings_hash),
-        );
-
-        if decision == chaffra_telemetry::SamplingDecision::Emit {
-            let (backends, _) =
-                chaffra_telemetry::backends::create_backends(&effective_config.backends);
-            let flushed = if effective_config.audience.operator_enabled() {
-                snapshot
-            } else {
-                snapshot.user_scoped()
-            };
-            for backend in &backends {
-                if let Err(e) = backend.flush(&flushed) {
-                    eprintln!("Warning: telemetry backend flush failed: {e}");
-                }
-            }
-        }
-
-        let new_state = chaffra_telemetry::churn::ChurnState {
-            fingerprints: current_fingerprints,
-            findings_hash: current_hash,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        };
-        let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
+        chaffra_telemetry::finalize_and_flush_sampled(&collector, ls, &effective_config);
     } else {
-        let snapshot = collector.snapshot();
-
-        if let Some(ls) = live_state {
-            ls.push_snapshot(snapshot.clone());
-        }
-
-        let (backends, _) =
-            chaffra_telemetry::backends::create_backends(&effective_config.backends);
-        let flushed = if effective_config.audience.operator_enabled() {
-            snapshot
-        } else {
-            snapshot.user_scoped()
-        };
-        for backend in &backends {
-            if let Err(e) = backend.flush(&flushed) {
-                eprintln!("Warning: telemetry backend flush failed: {e}");
-            }
-        }
+        chaffra_telemetry::flush_snapshot(&collector, ls, &effective_config);
     }
 
     result

@@ -17,6 +17,7 @@ pub mod config;
 pub mod dashboard;
 pub mod error;
 pub mod grpc_service;
+pub mod lifecycle;
 pub mod live_state;
 pub mod metrics;
 pub mod module;
@@ -26,6 +27,9 @@ pub mod seed;
 pub use collector::TelemetryCollector;
 pub use config::{BackendConfig, BackendKind, TelemetryAudience, TelemetryConfig};
 pub use error::TelemetryError;
+pub use lifecycle::{
+    FinalizeResult, finalize_and_flush, finalize_and_flush_sampled, flush_snapshot,
+};
 pub use live_state::{LiveTelemetryState, StateSource};
 pub use metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 pub use module::TelemetryModule;
