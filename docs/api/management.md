@@ -128,7 +128,7 @@ Active configuration (redacted secrets).
 - **Default mode** (`chaffra management`): starts with deterministic seeded demo data. All data endpoints return pre-built snapshots for verifying the dashboard UI, API shape, and backend connectivity.
 - **Live mode** (`chaffra management --path .`): runs analysis on the given directory and serves real telemetry data, including module results, finding counts, severity breakdowns, and churn.
 - **Off mode** (`chaffra --telemetry off management`): starts with empty state. All data endpoints return zero/empty defaults.
-- Watch, MCP, and LSP modes push live snapshots into the shared `LiveTelemetryState` during analysis, populating the same endpoints.
+- Watch, MCP, and LSP run as separate CLI commands (`chaffra watch`, `chaffra mcp`, `chaffra lsp`) with their own process-local `LiveTelemetryState`. Each pushes snapshots during analysis, but these are not shared across processes. To expose their telemetry through the management API, run management in a co-located process or use a shared telemetry backend.
 - Clean shutdown on Ctrl+C
 - Binds to `127.0.0.1` only (localhost)
 

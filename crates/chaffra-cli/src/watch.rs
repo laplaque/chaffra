@@ -72,6 +72,12 @@ fn is_source_file(path: &Path) -> bool {
         })
 }
 
+/// Analysis result: formatted output and raw findings for telemetry.
+pub struct AnalysisOutput {
+    pub text: String,
+    pub findings: Vec<chaffra_core::diagnostic::Finding>,
+}
+
 /// Run analysis on changed files and print results.
 pub fn run_analysis_on_changes(
     changed_paths: &[PathBuf],
@@ -79,11 +85,14 @@ pub fn run_analysis_on_changes(
     config: &ChaffraConfig,
     format: OutputFormat,
     collector: Option<&chaffra_telemetry::TelemetryCollector>,
-) -> Result<String> {
+) -> Result<AnalysisOutput> {
     let source_files: Vec<&PathBuf> = changed_paths.iter().filter(|p| is_source_file(p)).collect();
 
     if source_files.is_empty() {
-        return Ok(String::new());
+        return Ok(AnalysisOutput {
+            text: String::new(),
+            findings: Vec::new(),
+        });
     }
 
     let files: Vec<FileInfo> = source_files
@@ -103,24 +112,35 @@ pub fn run_analysis_on_changes(
         .collect();
 
     if files.is_empty() {
-        return Ok(String::new());
+        return Ok(AnalysisOutput {
+            text: String::new(),
+            findings: Vec::new(),
+        });
     }
 
     let host = crate::build_module_host_with_telemetry(collector);
     let formatter = create_formatter(format);
     let mut output = String::new();
+    let mut all_findings = Vec::new();
 
-    // Run dead-code analysis.
-    if let Ok(result) = host.analyze("dead-code", &files, config) {
-        if !result.findings.is_empty() {
-            output.push_str(&formatter.format_findings(&result.findings));
-        }
-    }
-
-    // Run complexity analysis.
-    if let Ok(result) = host.analyze("complexity", &files, config) {
-        if !result.findings.is_empty() {
-            output.push_str(&formatter.format_findings(&result.findings));
+    for module_id in &["dead-code", "complexity"] {
+        if let Ok(result) = host.analyze(module_id, &files, config) {
+            if let Some(c) = collector {
+                let mut sev_counts = std::collections::HashMap::new();
+                for finding in &result.findings {
+                    let sev = match finding.severity {
+                        chaffra_core::diagnostic::Severity::Error => "error",
+                        chaffra_core::diagnostic::Severity::Warning => "warning",
+                        chaffra_core::diagnostic::Severity::Info => "info",
+                    };
+                    *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+                }
+                c.record_module_findings(module_id, result.findings.len() as u64, &sev_counts);
+            }
+            if !result.findings.is_empty() {
+                output.push_str(&formatter.format_findings(&result.findings));
+            }
+            all_findings.extend(result.findings);
         }
     }
 
@@ -132,7 +152,10 @@ pub fn run_analysis_on_changes(
         output = format!("No issues found in: {}\n", file_names.join(", "));
     }
 
-    Ok(output)
+    Ok(AnalysisOutput {
+        text: output,
+        findings: all_findings,
+    })
 }
 
 /// Extract changed file paths from debounced events.
@@ -187,9 +210,9 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
 
         if is_off {
             match run_analysis_on_changes(&changed, &root, &config, format, None) {
-                Ok(output) => {
-                    if !output.is_empty() {
-                        print!("{output}");
+                Ok(ao) => {
+                    if !ao.text.is_empty() {
+                        print!("{}", ao.text);
                     }
                 }
                 Err(e) => eprintln!("Analysis error: {e}"),
@@ -202,10 +225,11 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
         let start = std::time::Instant::now();
 
         match run_analysis_on_changes(&changed, &root, &config, format, Some(&collector)) {
-            Ok(output) => {
+            Ok(ao) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 collector.record_module_call("watch", duration_ms, false);
 
+                collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
                 let current_fingerprints = collector.finding_fingerprints();
                 let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
                 let previous_state = chaffra_telemetry::churn::load_state(state_path);
@@ -244,8 +268,8 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
                 };
                 let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
 
-                if !output.is_empty() {
-                    print!("{output}");
+                if !ao.text.is_empty() {
+                    print!("{}", ao.text);
                 }
             }
             Err(e) => {
@@ -328,7 +352,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(result.is_empty());
+        assert!(result.text.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -354,7 +378,7 @@ mod tests {
         )
         .unwrap();
         // Should produce some output (either findings or "no issues").
-        assert!(!result.is_empty());
+        assert!(!result.text.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -375,7 +399,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(result.contains("No issues") || !result.is_empty());
+        assert!(result.text.contains("No issues") || !result.text.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -400,7 +424,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!result.is_empty());
+        assert!(!result.text.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -419,7 +443,7 @@ mod tests {
         )
         .unwrap();
         // Nonexistent file should produce empty result.
-        assert!(result.is_empty());
+        assert!(result.text.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -440,7 +464,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!result.is_empty());
+        assert!(!result.text.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -70,8 +70,13 @@ impl LiveTelemetryState {
 
     /// Push a new snapshot. Updates `current` and appends to history.
     /// If the history buffer is full, the oldest snapshot is evicted.
+    /// When transitioning from `Seeded` to `Live`, clears seeded history
+    /// so the buffer only contains live data.
     pub fn push_snapshot(&self, snapshot: TelemetrySnapshot) {
         let mut inner = self.inner.write().unwrap();
+        if inner.source == StateSource::Seeded {
+            inner.history.clear();
+        }
         inner.current = Some(snapshot.clone());
         if inner.history.len() >= inner.max_history {
             inner.history.pop_front();
@@ -114,12 +119,10 @@ impl LiveTelemetryState {
     ///
     /// Supported windows: `"1h"`, `"24h"`, `"7d"`.
     /// Returns snapshots whose `timestamp_ms` falls within `[latest - window, latest]`.
-    /// If the window string is unrecognized, returns all history.
+    /// If the window string is unrecognized, defaults to `"7d"`.
     pub fn history_window(&self, window: &str) -> Vec<TelemetrySnapshot> {
         let inner = self.inner.read().unwrap();
-        let Some(window_ms) = parse_window_ms(window) else {
-            return inner.history.iter().cloned().collect();
-        };
+        let window_ms = parse_window_ms(window).unwrap_or(604_800_000);
 
         let latest_ts = inner.current.as_ref().map(|s| s.timestamp_ms).unwrap_or(0);
         let cutoff = latest_ts.saturating_sub(window_ms);
@@ -149,6 +152,31 @@ impl LiveTelemetryState {
             .collect()
     }
 
+    /// Query history snapshots that contain findings of a specific severity within a time window.
+    ///
+    /// Matches against `user_summary.findings_by_severity`.
+    pub fn history_by_severity(&self, severity: &str, window: &str) -> Vec<TelemetrySnapshot> {
+        self.history_window(window)
+            .into_iter()
+            .filter(|s| {
+                s.user_summary
+                    .findings_by_severity
+                    .get(severity)
+                    .is_some_and(|&count| count > 0)
+            })
+            .collect()
+    }
+
+    /// Query history snapshots that contain a specific metric within a time window.
+    ///
+    /// Matches against `data_points` by metric name prefix.
+    pub fn history_by_metric(&self, metric: &str, window: &str) -> Vec<TelemetrySnapshot> {
+        self.history_window(window)
+            .into_iter()
+            .filter(|s| s.data_points.iter().any(|dp| dp.name.starts_with(metric)))
+            .collect()
+    }
+
     /// Clear all state, resetting to `Empty`.
     pub fn clear(&self) {
         let mut inner = self.inner.write().unwrap();
@@ -174,6 +202,7 @@ impl Default for LiveTelemetryState {
 mod tests {
     use super::*;
     use crate::collector::{ModuleSummary, OperatorSummary, TelemetrySnapshot, UserSummary};
+    use crate::metrics::MetricDataPoint;
     use std::collections::HashMap;
 
     fn make_snapshot(ts: u64, modules: &[&str]) -> TelemetrySnapshot {
@@ -283,13 +312,18 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_window_returns_all() {
+    fn test_unknown_window_defaults_to_7d() {
         let state = LiveTelemetryState::new();
-        state.push_snapshot(make_snapshot(100, &["a"]));
-        state.push_snapshot(make_snapshot(200, &["b"]));
+        let base = 1_000_000_000_000u64;
+        state.push_snapshot(make_snapshot(base, &["a"]));
+        state.push_snapshot(make_snapshot(base + 604_800_001, &["b"]));
 
-        let all = state.history_window("30d");
-        assert_eq!(all.len(), 2);
+        // "30d" is not recognized, defaults to 7d window
+        // cutoff = (base + 604_800_001) - 604_800_000 = base + 1
+        // snap at `base` is below cutoff, so only snap2 returned
+        let result = state.history_window("30d");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].timestamp_ms, base + 604_800_001);
     }
 
     #[test]
@@ -373,5 +407,149 @@ mod tests {
         let state = LiveTelemetryState::new();
         let result = state.history_window("1h");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_seeded_to_live_clears_seeded_history() {
+        let state = LiveTelemetryState::new();
+        state.push_seeded(make_snapshot(1000, &["a"]));
+        state.push_seeded(make_snapshot(2000, &["b"]));
+        state.set_source(StateSource::Seeded);
+
+        assert_eq!(state.snapshot_count(), 2);
+        assert_eq!(state.source(), StateSource::Seeded);
+
+        state.push_snapshot(make_snapshot(3000, &["c"]));
+
+        assert_eq!(state.source(), StateSource::Live);
+        assert_eq!(state.snapshot_count(), 1);
+        assert_eq!(state.current().unwrap().timestamp_ms, 3000);
+    }
+
+    #[test]
+    fn test_live_push_does_not_clear_history() {
+        let state = LiveTelemetryState::new();
+        state.push_snapshot(make_snapshot(1000, &["a"]));
+        state.push_snapshot(make_snapshot(2000, &["b"]));
+
+        assert_eq!(state.snapshot_count(), 2);
+        assert_eq!(state.source(), StateSource::Live);
+    }
+
+    fn make_snapshot_with_severity(ts: u64, severities: &[(&str, u64)]) -> TelemetrySnapshot {
+        let mut findings_by_severity = HashMap::new();
+        for &(sev, count) in severities {
+            findings_by_severity.insert(sev.to_owned(), count);
+        }
+        TelemetrySnapshot {
+            timestamp_ms: ts,
+            definitions: HashMap::new(),
+            data_points: Vec::new(),
+            spans: Vec::new(),
+            user_summary: UserSummary {
+                analysis_duration_ms: 100,
+                files_total: 10,
+                findings_by_severity,
+                findings_by_module: HashMap::new(),
+                module_summaries: HashMap::new(),
+            },
+            operator_summary: OperatorSummary {
+                module_call_durations: HashMap::new(),
+                module_error_counts: HashMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_history_by_severity() {
+        let state = LiveTelemetryState::new();
+        let base = 1_000_000_000_000u64;
+        state.push_snapshot(make_snapshot_with_severity(base, &[("warning", 3)]));
+        state.push_snapshot(make_snapshot_with_severity(
+            base + 1000,
+            &[("error", 1), ("warning", 2)],
+        ));
+        state.push_snapshot(make_snapshot_with_severity(base + 2000, &[("info", 5)]));
+
+        let errors = state.history_by_severity("error", "7d");
+        assert_eq!(errors.len(), 1);
+
+        let warnings = state.history_by_severity("warning", "7d");
+        assert_eq!(warnings.len(), 2);
+
+        let infos = state.history_by_severity("info", "7d");
+        assert_eq!(infos.len(), 1);
+
+        let none = state.history_by_severity("critical", "7d");
+        assert_eq!(none.len(), 0);
+    }
+
+    #[test]
+    fn test_history_by_severity_zero_count_excluded() {
+        let state = LiveTelemetryState::new();
+        let base = 1_000_000_000_000u64;
+        state.push_snapshot(make_snapshot_with_severity(base, &[("error", 0)]));
+
+        let errors = state.history_by_severity("error", "7d");
+        assert_eq!(errors.len(), 0);
+    }
+
+    fn make_snapshot_with_metrics(ts: u64, metric_names: &[&str]) -> TelemetrySnapshot {
+        let data_points = metric_names
+            .iter()
+            .map(|name| MetricDataPoint {
+                name: name.to_string(),
+                value: 1.0,
+                labels: HashMap::new(),
+                timestamp_ms: ts,
+            })
+            .collect();
+        TelemetrySnapshot {
+            timestamp_ms: ts,
+            definitions: HashMap::new(),
+            data_points,
+            spans: Vec::new(),
+            user_summary: UserSummary {
+                analysis_duration_ms: 100,
+                files_total: 10,
+                findings_by_severity: HashMap::new(),
+                findings_by_module: HashMap::new(),
+                module_summaries: HashMap::new(),
+            },
+            operator_summary: OperatorSummary {
+                module_call_durations: HashMap::new(),
+                module_error_counts: HashMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_history_by_metric() {
+        let state = LiveTelemetryState::new();
+        let base = 1_000_000_000_000u64;
+        state.push_snapshot(make_snapshot_with_metrics(
+            base,
+            &[
+                "chaffra.analysis.findings_total",
+                "chaffra.module.call_duration",
+            ],
+        ));
+        state.push_snapshot(make_snapshot_with_metrics(
+            base + 1000,
+            &["chaffra.analysis.findings_total"],
+        ));
+        state.push_snapshot(make_snapshot_with_metrics(
+            base + 2000,
+            &["chaffra.module.call_duration"],
+        ));
+
+        let findings = state.history_by_metric("chaffra.analysis.findings_total", "7d");
+        assert_eq!(findings.len(), 2);
+
+        let durations = state.history_by_metric("chaffra.module.call_duration", "7d");
+        assert_eq!(durations.len(), 2);
+
+        let missing = state.history_by_metric("chaffra.nonexistent", "7d");
+        assert_eq!(missing.len(), 0);
     }
 }

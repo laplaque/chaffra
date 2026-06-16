@@ -43,7 +43,7 @@ impl TelemetryModule {
     }
 
     fn get_config(&self, config: &HashMap<String, String>) -> TelemetryConfig {
-        TelemetryConfig::from_module_config(config)
+        TelemetryConfig::from_module_config(config).unwrap_or_default()
     }
 }
 

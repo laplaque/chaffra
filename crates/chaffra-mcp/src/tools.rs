@@ -22,9 +22,18 @@ fn record_analysis_and_push(
     files: &[FileInfo],
     config: &ChaffraConfig,
     live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
 ) -> Result<chaffra_core::diagnostic::AnalysisResult, String> {
-    let collector =
-        chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig::default());
+    if matches!(
+        tel_config.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        return host
+            .analyze(module_id, files, config)
+            .map_err(|e| e.to_string());
+    }
+
+    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
     collector.set_files_total(files.len() as u64);
     let start = std::time::Instant::now();
@@ -43,6 +52,18 @@ fn record_analysis_and_push(
                 *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
             }
             collector.record_module_findings(module_id, result.findings.len() as u64, &sev_counts);
+            let fingerprints: std::collections::HashSet<_> = result
+                .findings
+                .iter()
+                .map(|f| {
+                    chaffra_telemetry::churn::FindingFingerprint::new(
+                        &f.rule_id,
+                        &f.location.file,
+                        f.location.start_line,
+                    )
+                })
+                .collect();
+            collector.set_finding_fingerprints(fingerprints);
             let snapshot = collector.snapshot();
             live_state.push_snapshot(snapshot);
             Ok(result)
@@ -139,6 +160,7 @@ fn discover_and_read_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo>
 pub fn execute_health(
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
 ) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -155,7 +177,7 @@ pub fn execute_health(
     }
 
     let host = build_module_host();
-    let _ = record_analysis_and_push(&host, "complexity", &files, &config, live_state);
+    let _ = record_analysis_and_push(&host, "complexity", &files, &config, live_state, tel_config);
 
     match chaffra_complexity::analyze_project_health(
         &files,
@@ -174,6 +196,7 @@ pub fn execute_health(
 pub fn execute_dead_code(
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
 ) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -190,7 +213,7 @@ pub fn execute_dead_code(
     }
 
     let host = build_module_host();
-    match record_analysis_and_push(&host, "dead-code", &files, &config, live_state) {
+    match record_analysis_and_push(&host, "dead-code", &files, &config, live_state, tel_config) {
         Ok(result) => match serde_json::to_string_pretty(&result) {
             Ok(json) => ToolCallResult::text(json),
             Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -218,35 +241,48 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
 
 /// Execute the chaffra/telemetry tool.
 ///
-/// Returns default configuration and backend info. Does not share state with
-/// a running analysis — use CLI `chaffra telemetry inspect` for live previews.
-pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
+/// `snapshot` reads from the shared live state; `status` and `backends` use
+/// the effective telemetry config.
+pub fn execute_telemetry(
+    params: &serde_json::Value,
+    live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
+) -> ToolCallResult {
     let action = params
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("status");
 
-    let config = chaffra_telemetry::TelemetryConfig::default();
-    let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
-    collector.register_core_metrics();
-
     match action {
         "status" => {
-            let (_, statuses) = chaffra_telemetry::backends::create_backends(&config.backends);
+            let (_, statuses) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
             match serde_json::to_string_pretty(&statuses) {
                 Ok(json) => ToolCallResult::text(json),
                 Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
             }
         }
         "snapshot" => {
-            let snapshot = collector.snapshot();
+            let snapshot = match live_state.current() {
+                Some(s) => {
+                    if tel_config.audience.operator_enabled() {
+                        s
+                    } else {
+                        s.user_scoped()
+                    }
+                }
+                None => {
+                    return ToolCallResult::text(
+                        "No telemetry snapshots available yet.".to_owned(),
+                    );
+                }
+            };
             match serde_json::to_string_pretty(&snapshot) {
                 Ok(json) => ToolCallResult::text(json),
                 Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
             }
         }
         "backends" => {
-            let backends_info: Vec<serde_json::Value> = config
+            let backends_info: Vec<serde_json::Value> = tel_config
                 .backends
                 .iter()
                 .map(|b| {
@@ -271,12 +307,13 @@ pub fn dispatch_tool(
     name: &str,
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
 ) -> ToolCallResult {
     match name {
-        "chaffra/health" => execute_health(params, live_state),
-        "chaffra/dead-code" => execute_dead_code(params, live_state),
+        "chaffra/health" => execute_health(params, live_state, tel_config),
+        "chaffra/dead-code" => execute_dead_code(params, live_state, tel_config),
         "chaffra/explain" => execute_explain(params),
-        "chaffra/telemetry" => execute_telemetry(params),
+        "chaffra/telemetry" => execute_telemetry(params, live_state, tel_config),
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -312,10 +349,14 @@ mod tests {
         }
     }
 
+    fn tc() -> chaffra_telemetry::TelemetryConfig {
+        chaffra_telemetry::TelemetryConfig::default()
+    }
+
     #[test]
     fn test_dispatch_unknown_tool() {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
-        let result = dispatch_tool("unknown/tool", &serde_json::json!({}), &ls);
+        let result = dispatch_tool("unknown/tool", &serde_json::json!({}), &ls, &tc());
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Unknown tool"));
     }
@@ -343,7 +384,11 @@ mod tests {
     #[test]
     fn test_health_invalid_path() {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
-        let result = execute_health(&serde_json::json!({"path": "/nonexistent/path/xyz"}), &ls);
+        let result = execute_health(
+            &serde_json::json!({"path": "/nonexistent/path/xyz"}),
+            &ls,
+            &tc(),
+        );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
     }
@@ -351,7 +396,11 @@ mod tests {
     #[test]
     fn test_dead_code_invalid_path() {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
-        let result = execute_dead_code(&serde_json::json!({"path": "/nonexistent/path/xyz"}), &ls);
+        let result = execute_dead_code(
+            &serde_json::json!({"path": "/nonexistent/path/xyz"}),
+            &ls,
+            &tc(),
+        );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
     }
@@ -361,7 +410,11 @@ mod tests {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
         let dir = std::env::temp_dir().join("chaffra_mcp_test_empty");
         let _ = std::fs::create_dir_all(&dir);
-        let result = execute_health(&serde_json::json!({"path": dir.to_str().unwrap()}), &ls);
+        let result = execute_health(
+            &serde_json::json!({"path": dir.to_str().unwrap()}),
+            &ls,
+            &tc(),
+        );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -372,7 +425,11 @@ mod tests {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
         let dir = std::env::temp_dir().join("chaffra_mcp_test_dc_empty");
         let _ = std::fs::create_dir_all(&dir);
-        let result = execute_dead_code(&serde_json::json!({"path": dir.to_str().unwrap()}), &ls);
+        let result = execute_dead_code(
+            &serde_json::json!({"path": dir.to_str().unwrap()}),
+            &ls,
+            &tc(),
+        );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -387,6 +444,7 @@ mod tests {
             "chaffra/health",
             &serde_json::json!({"path": dir.to_str().unwrap()}),
             &ls,
+            &tc(),
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -401,6 +459,7 @@ mod tests {
             "chaffra/dead-code",
             &serde_json::json!({"path": dir.to_str().unwrap()}),
             &ls,
+            &tc(),
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -413,6 +472,7 @@ mod tests {
             "chaffra/explain",
             &serde_json::json!({"rule_id": "dead-code:unused-function"}),
             &ls,
+            &tc(),
         );
         assert!(result.is_error.is_none());
     }

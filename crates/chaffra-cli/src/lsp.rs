@@ -96,10 +96,18 @@ pub fn analyze_file_for_diagnostics(
     file_path: &str,
     content: &[u8],
     live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
 ) -> HashMap<String, Vec<Diagnostic>> {
     use chaffra_core::config::ChaffraConfig;
     use chaffra_core::diagnostic::FileInfo;
     use std::path::Path;
+
+    if matches!(
+        tel_config.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        return analyze_file_no_telemetry(file_path, content);
+    }
 
     let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
 
@@ -114,49 +122,85 @@ pub fn analyze_file_for_diagnostics(
         content: content.to_vec(),
     }];
 
-    let collector =
-        chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig::default());
+    let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
     collector.set_files_total(1);
     let host = crate::build_module_host_with_telemetry(Some(&collector));
     let config = ChaffraConfig::default();
     let start = std::time::Instant::now();
     let mut had_error = false;
+    let mut all_findings = Vec::new();
 
-    // Run dead-code analysis.
-    match host.analyze("dead-code", &files, &config) {
-        Ok(result) => {
-            for finding in &result.findings {
-                diagnostics
-                    .entry(file_path.to_owned())
-                    .or_default()
-                    .push(finding_to_diagnostic(finding));
+    for module_id in &["dead-code", "complexity"] {
+        match host.analyze(module_id, &files, &config) {
+            Ok(result) => {
+                let dur = start.elapsed().as_millis() as u64;
+                collector.record_module_call(module_id, dur, false);
+                let mut sev_counts = std::collections::HashMap::new();
+                for finding in &result.findings {
+                    let sev = match finding.severity {
+                        chaffra_core::diagnostic::Severity::Error => "error",
+                        chaffra_core::diagnostic::Severity::Warning => "warning",
+                        chaffra_core::diagnostic::Severity::Info => "info",
+                    };
+                    *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+                    diagnostics
+                        .entry(file_path.to_owned())
+                        .or_default()
+                        .push(finding_to_diagnostic(finding));
+                }
+                collector.record_module_findings(
+                    module_id,
+                    result.findings.len() as u64,
+                    &sev_counts,
+                );
+                all_findings.extend(result.findings);
             }
-        }
-        Err(_) => {
-            had_error = true;
-        }
-    }
-
-    // Run complexity analysis.
-    match host.analyze("complexity", &files, &config) {
-        Ok(result) => {
-            for finding in &result.findings {
-                diagnostics
-                    .entry(file_path.to_owned())
-                    .or_default()
-                    .push(finding_to_diagnostic(finding));
+            Err(_) => {
+                let dur = start.elapsed().as_millis() as u64;
+                collector.record_module_call(module_id, dur, true);
+                had_error = true;
             }
-        }
-        Err(_) => {
-            had_error = true;
         }
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
     collector.record_module_call("lsp", duration_ms, had_error);
+    collector.set_finding_fingerprints(crate::fingerprints_from_findings(&all_findings));
     let snapshot = collector.snapshot();
     live_state.push_snapshot(snapshot);
+
+    diagnostics
+}
+
+fn analyze_file_no_telemetry(file_path: &str, content: &[u8]) -> HashMap<String, Vec<Diagnostic>> {
+    use chaffra_core::config::ChaffraConfig;
+    use chaffra_core::diagnostic::FileInfo;
+    use std::path::Path;
+
+    let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+    let relative = Path::new(file_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let files = vec![FileInfo {
+        path: relative,
+        content: content.to_vec(),
+    }];
+    let host = crate::build_module_host_with_telemetry(None);
+    let config = ChaffraConfig::default();
+
+    for module_id in &["dead-code", "complexity"] {
+        if let Ok(result) = host.analyze(module_id, &files, &config) {
+            for finding in &result.findings {
+                diagnostics
+                    .entry(file_path.to_owned())
+                    .or_default()
+                    .push(finding_to_diagnostic(finding));
+            }
+        }
+    }
 
     diagnostics
 }
@@ -213,7 +257,10 @@ async fn read_content_length(reader: &mut BufReader<tokio::io::Stdin>) -> Result
 /// Implements proper Content-Length-based message framing per the LSP spec:
 /// reads `Content-Length: N\r\n...\r\n` headers, then reads exactly N bytes
 /// of JSON payload.
-pub async fn run_lsp_server(live_state: chaffra_telemetry::LiveTelemetryState) -> Result<()> {
+pub async fn run_lsp_server(
+    live_state: chaffra_telemetry::LiveTelemetryState,
+    tel_config: chaffra_telemetry::TelemetryConfig,
+) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -232,7 +279,7 @@ pub async fn run_lsp_server(live_state: chaffra_telemetry::LiveTelemetryState) -
             Err(_) => continue,
         };
 
-        let responses = handle_lsp_request(&request, &live_state);
+        let responses = handle_lsp_request(&request, &live_state, &tel_config);
         for resp in responses {
             let json = serde_json::to_string(&resp)?;
             stdout
@@ -249,6 +296,7 @@ pub async fn run_lsp_server(live_state: chaffra_telemetry::LiveTelemetryState) -
 fn handle_lsp_request(
     request: &LspRequest,
     live_state: &chaffra_telemetry::LiveTelemetryState,
+    tel_config: &chaffra_telemetry::TelemetryConfig,
 ) -> Vec<LspResponse> {
     match request.method.as_str() {
         "initialize" => {
@@ -290,8 +338,9 @@ fn handle_lsp_request(
                     let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
 
                     if let Ok(content) = std::fs::read(file_path) {
-                        let diagnostics_map =
-                            analyze_file_for_diagnostics(file_path, &content, live_state);
+                        let diagnostics_map = analyze_file_for_diagnostics(
+                            file_path, &content, live_state, tel_config,
+                        );
 
                         let mut responses = Vec::new();
                         for (path, diags) in diagnostics_map {
@@ -345,7 +394,7 @@ fn handle_lsp_request(
                     let content = open_params.text_document.text.as_bytes();
 
                     let diagnostics_map =
-                        analyze_file_for_diagnostics(file_path, content, live_state);
+                        analyze_file_for_diagnostics(file_path, content, live_state, tel_config);
 
                     let mut responses = Vec::new();
                     for (path, diags) in diagnostics_map {
@@ -463,6 +512,10 @@ mod tests {
         chaffra_telemetry::LiveTelemetryState::new()
     }
 
+    fn test_tel_config() -> chaffra_telemetry::TelemetryConfig {
+        chaffra_telemetry::TelemetryConfig::default()
+    }
+
     #[test]
     fn test_handle_initialize() {
         let ls = test_live_state();
@@ -472,7 +525,7 @@ mod tests {
             method: "initialize".to_owned(),
             params: Some(serde_json::json!({})),
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert_eq!(responses.len(), 1);
         assert!(responses[0].result.is_some());
         let result = responses[0].result.as_ref().unwrap();
@@ -488,7 +541,7 @@ mod tests {
             method: "initialized".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert!(responses.is_empty());
     }
 
@@ -501,7 +554,7 @@ mod tests {
             method: "shutdown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
@@ -515,7 +568,7 @@ mod tests {
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert_eq!(responses.len(), 1);
     }
 
@@ -528,7 +581,7 @@ mod tests {
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert!(responses.is_empty());
     }
 
@@ -541,7 +594,7 @@ mod tests {
             method: "textDocument/hover".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
@@ -555,7 +608,7 @@ mod tests {
             method: "textDocument/didSave".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
         assert!(responses.is_empty());
     }
 
@@ -563,7 +616,8 @@ mod tests {
     fn test_analyze_file_go_content() {
         let ls = test_live_state();
         let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
-        let diagnostics = analyze_file_for_diagnostics("/tmp/test.go", content, &ls);
+        let diagnostics =
+            analyze_file_for_diagnostics("/tmp/test.go", content, &ls, &test_tel_config());
         // Should produce at least dead-code findings for unused function.
         let all_diags: Vec<&Diagnostic> = diagnostics.values().flatten().collect();
         // The analysis should run without panicking.
@@ -574,7 +628,8 @@ mod tests {
     fn test_analyze_file_unknown_extension() {
         let ls = test_live_state();
         let content = b"some content";
-        let diagnostics = analyze_file_for_diagnostics("/tmp/test.txt", content, &ls);
+        let diagnostics =
+            analyze_file_for_diagnostics("/tmp/test.txt", content, &ls, &test_tel_config());
         // Unknown extension should produce no diagnostics.
         let total: usize = diagnostics.values().map(|v| v.len()).sum();
         assert_eq!(total, 0);

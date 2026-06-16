@@ -339,7 +339,7 @@ fn load_config(config_path: Option<&str>, analysis_path: &Path) -> Result<Chaffr
     }
 }
 
-fn fingerprints_from_findings(
+pub(crate) fn fingerprints_from_findings(
     findings: &[chaffra_core::diagnostic::Finding],
 ) -> HashSet<chaffra_telemetry::churn::FindingFingerprint> {
     findings
@@ -358,11 +358,12 @@ fn merge_telemetry_config(
     cli_config: &chaffra_telemetry::TelemetryConfig,
     project_config: &ChaffraConfig,
     explicit_cli_audience: bool,
-) -> chaffra_telemetry::TelemetryConfig {
+) -> Result<chaffra_telemetry::TelemetryConfig> {
     let mut config = cli_config.clone();
     let module_cfg = project_config.module_config("telemetry");
     if !module_cfg.is_empty() {
-        let project_tel = chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg);
+        let project_tel = chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         config.sampling_rate = project_tel.sampling_rate;
         config.sampling_strategy = project_tel.sampling_strategy;
 
@@ -382,7 +383,7 @@ fn merge_telemetry_config(
             }
         }
     }
-    config
+    Ok(config)
 }
 
 fn discover_and_read_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo> {
@@ -1332,7 +1333,7 @@ where
     F: FnOnce(&chaffra_telemetry::TelemetryCollector) -> Result<String>,
 {
     let effective_config =
-        merge_telemetry_config(tel_config, project_config, explicit_cli_audience);
+        merge_telemetry_config(tel_config, project_config, explicit_cli_audience)?;
 
     if matches!(
         effective_config.audience,
@@ -1416,7 +1417,9 @@ where
             snapshot.user_scoped()
         };
         for backend in &backends {
-            let _ = backend.flush(&flushed);
+            if let Err(e) = backend.flush(&flushed) {
+                eprintln!("Warning: telemetry backend flush failed: {e}");
+            }
         }
     }
 
@@ -1618,14 +1621,15 @@ async fn main() -> Result<()> {
         Command::Watch { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            let effective_tel = merge_telemetry_config(&tel_config, &config, explicit_cli_audience);
+            let effective_tel =
+                merge_telemetry_config(&tel_config, &config, explicit_cli_audience)?;
             let watch_config =
                 watch::WatchConfig::new(root, format, config, effective_tel, live_state.clone());
             watch::run_watch(watch_config)?;
         }
 
         Command::Mcp => {
-            let mut server = chaffra_mcp::McpServer::new(live_state.clone());
+            let mut server = chaffra_mcp::McpServer::new(live_state.clone(), tel_config.clone());
             server
                 .run()
                 .await
@@ -1633,7 +1637,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Lsp => {
-            lsp::run_lsp_server(live_state.clone()).await?;
+            lsp::run_lsp_server(live_state.clone(), tel_config.clone()).await?;
         }
 
         Command::Fix {
@@ -1798,7 +1802,7 @@ async fn main() -> Result<()> {
             };
             let project_config = load_config(cli.config.as_deref(), &config_root)?;
             let effective_tel =
-                merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience);
+                merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience)?;
             let audience = effective_tel.audience;
             let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
             collector.register_core_metrics();
@@ -1810,6 +1814,7 @@ async fn main() -> Result<()> {
                 let host = build_module_host_with_telemetry(Some(&analysis_collector));
                 let files = discover_and_read_files(&config_root, &project_config);
                 analysis_collector.set_files_total(files.len() as u64);
+                let mut all_findings = Vec::new();
                 for module_info in host.list() {
                     let start = std::time::Instant::now();
                     match host.analyze(&module_info.id, &files, &project_config) {
@@ -1834,6 +1839,7 @@ async fn main() -> Result<()> {
                                 result.findings.len() as u64,
                                 &sev_counts,
                             );
+                            all_findings.extend(result.findings);
                         }
                         Err(_) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
@@ -1845,6 +1851,8 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                analysis_collector
+                    .set_finding_fingerprints(fingerprints_from_findings(&all_findings));
                 let current_fingerprints = analysis_collector.finding_fingerprints();
                 let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
                 let previous_state = chaffra_telemetry::churn::load_state(state_path);
@@ -2898,7 +2906,7 @@ mod tests {
         .unwrap();
         let project_config = load_config(None, dir.path()).unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config, false);
+        let merged = merge_telemetry_config(&cli_config, &project_config, false).unwrap();
         assert!(
             (merged.sampling_rate - 0.5).abs() < f64::EPSILON,
             "project config sampling-rate should override default"
@@ -3287,7 +3295,7 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config, false);
+        let merged = merge_telemetry_config(&cli_config, &project_config, false).unwrap();
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::Off,
@@ -3304,7 +3312,7 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"off\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config, true);
+        let merged = merge_telemetry_config(&cli_config, &project_config, true).unwrap();
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly,
@@ -3318,7 +3326,7 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config, false);
+        let merged = merge_telemetry_config(&cli_config, &project_config, false).unwrap();
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::On,
@@ -3332,11 +3340,29 @@ mod tests {
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n").unwrap();
 
-        let merged = merge_telemetry_config(&cli_config, &project_config, true);
+        let merged = merge_telemetry_config(&cli_config, &project_config, true).unwrap();
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly,
             "Explicit --telemetry user-only should not be overridden by project audience=on"
+        );
+    }
+
+    #[test]
+    fn test_merge_telemetry_config_invalid_project_audience_rejected() {
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let project_config =
+            ChaffraConfig::parse("[modules.telemetry]\naudience = \"offf\"\n").unwrap();
+
+        let result = merge_telemetry_config(&cli_config, &project_config, false);
+        assert!(
+            result.is_err(),
+            "Invalid project audience should be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("offf"),
+            "Error should mention the invalid value"
         );
     }
 }

@@ -142,11 +142,18 @@ fn default_backends() -> Vec<BackendConfig> {
 
 impl TelemetryConfig {
     /// Build config from the `[modules.telemetry]` section of chaffra config.
-    pub fn from_module_config(config: &HashMap<String, String>) -> Self {
-        let audience = config
-            .get("audience")
-            .and_then(|v| TelemetryAudience::from_str_loose(v))
-            .unwrap_or_default();
+    ///
+    /// Returns an error if `audience` is present but not a recognized value.
+    pub fn from_module_config(config: &HashMap<String, String>) -> Result<Self, String> {
+        let audience = match config.get("audience") {
+            Some(v) => TelemetryAudience::from_str_loose(v).ok_or_else(|| {
+                format!(
+                    "invalid [modules.telemetry] audience: {v:?}; \
+                     valid values: on, off, user-only, operator-only"
+                )
+            })?,
+            None => TelemetryAudience::default(),
+        };
 
         let backend_kind = config
             .get("backend")
@@ -179,12 +186,12 @@ impl TelemetryConfig {
             .and_then(|v| SamplingStrategy::from_str_loose(v))
             .unwrap_or_default();
 
-        Self {
+        Ok(Self {
             audience,
             backends,
             sampling_rate,
             sampling_strategy,
-        }
+        })
     }
 }
 
@@ -273,7 +280,7 @@ mod tests {
         mc.insert("backend".to_owned(), "otlp".to_owned());
         mc.insert("endpoint".to_owned(), "http://localhost:4317".to_owned());
 
-        let cfg = TelemetryConfig::from_module_config(&mc);
+        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert_eq!(cfg.audience, TelemetryAudience::OperatorOnly);
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].kind, BackendKind::Otlp);
@@ -286,7 +293,7 @@ mod tests {
     #[test]
     fn test_from_module_config_defaults() {
         let mc = HashMap::new();
-        let cfg = TelemetryConfig::from_module_config(&mc);
+        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert_eq!(cfg.audience, TelemetryAudience::UserOnly);
         assert_eq!(cfg.backends[0].kind, BackendKind::JsonFile);
         assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
@@ -298,7 +305,7 @@ mod tests {
         let mut mc = HashMap::new();
         mc.insert("sampling-rate".to_owned(), "0.5".to_owned());
         mc.insert("sampling-strategy".to_owned(), "on-change".to_owned());
-        let cfg = TelemetryConfig::from_module_config(&mc);
+        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert!((cfg.sampling_rate - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.sampling_strategy, SamplingStrategy::OnChange);
     }
@@ -307,11 +314,11 @@ mod tests {
     fn test_sampling_rate_clamped() {
         let mut mc = HashMap::new();
         mc.insert("sampling-rate".to_owned(), "5.0".to_owned());
-        let cfg = TelemetryConfig::from_module_config(&mc);
+        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
 
         mc.insert("sampling-rate".to_owned(), "-1.0".to_owned());
-        let cfg = TelemetryConfig::from_module_config(&mc);
+        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert!((cfg.sampling_rate - 0.0).abs() < f64::EPSILON);
     }
 }

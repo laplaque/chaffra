@@ -10,14 +10,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 pub struct McpServer {
     initialized: bool,
     live_state: chaffra_telemetry::LiveTelemetryState,
+    tel_config: chaffra_telemetry::TelemetryConfig,
 }
 
 impl McpServer {
     /// Create a new MCP server.
-    pub fn new(live_state: chaffra_telemetry::LiveTelemetryState) -> Self {
+    pub fn new(
+        live_state: chaffra_telemetry::LiveTelemetryState,
+        tel_config: chaffra_telemetry::TelemetryConfig,
+    ) -> Self {
         Self {
             initialized: false,
             live_state,
+            tel_config,
         }
     }
 
@@ -139,7 +144,8 @@ impl McpServer {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        let result = tools::dispatch_tool(&tool_name, &tool_args, &self.live_state);
+        let result =
+            tools::dispatch_tool(&tool_name, &tool_args, &self.live_state, &self.tel_config);
         JsonRpcResponse::success(request.id.clone(), serde_json::to_value(result).unwrap())
     }
 
@@ -150,7 +156,10 @@ impl McpServer {
 
 impl Default for McpServer {
     fn default() -> Self {
-        Self::new(chaffra_telemetry::LiveTelemetryState::new())
+        Self::new(
+            chaffra_telemetry::LiveTelemetryState::new(),
+            chaffra_telemetry::TelemetryConfig::default(),
+        )
     }
 }
 
