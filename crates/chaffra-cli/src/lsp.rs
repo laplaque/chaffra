@@ -159,7 +159,7 @@ pub fn analyze_file_for_diagnostics(
         }
     };
 
-    let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel);
+    let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
     collector.register_core_metrics();
     collector.set_files_total(1);
     let host = crate::build_module_host_with_telemetry(Some(&collector));
@@ -216,7 +216,25 @@ pub fn analyze_file_for_diagnostics(
     }
 
     let snapshot = collector.snapshot();
-    live_state.push_snapshot(snapshot);
+    live_state.push_snapshot(snapshot.clone());
+
+    if effective_tel.audience.operator_enabled() {
+        let (backends, _) = chaffra_telemetry::backends::create_backends(&effective_tel.backends);
+        let flushed = snapshot;
+        for backend in &backends {
+            if let Err(e) = backend.flush(&flushed) {
+                eprintln!("[lsp] telemetry backend flush error: {e}");
+            }
+        }
+    } else {
+        let (backends, _) = chaffra_telemetry::backends::create_backends(&effective_tel.backends);
+        let flushed = snapshot.user_scoped();
+        for backend in &backends {
+            if let Err(e) = backend.flush(&flushed) {
+                eprintln!("[lsp] telemetry backend flush error: {e}");
+            }
+        }
+    }
 
     let new_state = chaffra_telemetry::churn::ChurnState {
         fingerprints,

@@ -186,10 +186,12 @@ chaffra telemetry audit-log   # Display telemetry audit log
 
 Tool name: `chaffra/telemetry`
 
-Actions (returns default configuration, not live analysis state):
-- `status` -- default backend configuration and availability
-- `snapshot` -- preview metrics snapshot (core metrics registered but no analysis data)
-- `backends` -- list of default backend definitions and their types
+Actions (reads from shared live telemetry state):
+- `status` -- backend configuration and connectivity status
+- `snapshot` -- latest live telemetry snapshot (redacted to user-scoped data unless operator audience is enabled)
+- `backends` -- list of configured backend definitions and their types
+
+MCP tool calls (`chaffra/health`, `chaffra/dead-code`) merge the target project's `[modules.telemetry]` config with the server-level config, compute finding churn, push snapshots to live state, and flush to configured backends.
 
 ## gRPC Service
 
@@ -229,7 +231,15 @@ Queryable by time window:
 | `24h` | 86,400,000 ms |
 | `7d` | 604,800,000 ms |
 
-Queryable by dimension: `history_by_module(module, window)` filters snapshots that contain data for a specific module.
+Queryable by dimension:
+
+| Method | Filter |
+|--------|--------|
+| `history_by_module(module, window)` | Snapshots containing data for a specific module |
+| `history_by_severity(severity, window)` | Snapshots with findings at a specific severity (non-zero count) |
+| `history_by_metric(metric, window)` | Snapshots containing a specific metric (prefix match) |
+
+The management API exposes these as query params on `GET /api/v1/metrics/history`: `?module=dead-code`, `?severity=warning`, `?metric=chaffra.module.call_duration_ms`. First matching filter wins; omit all for unfiltered results.
 
 ### Seeded / Demo Mode
 

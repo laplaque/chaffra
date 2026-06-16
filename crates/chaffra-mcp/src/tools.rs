@@ -102,7 +102,19 @@ fn record_analysis_and_push(
             }
 
             let snapshot = collector.snapshot();
-            live_state.push_snapshot(snapshot);
+            live_state.push_snapshot(snapshot.clone());
+
+            let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+            let flushed = if tel_config.audience.operator_enabled() {
+                snapshot
+            } else {
+                snapshot.user_scoped()
+            };
+            for backend in &backends {
+                if let Err(e) = backend.flush(&flushed) {
+                    eprintln!("[mcp] telemetry backend flush error: {e}");
+                }
+            }
 
             let new_state = chaffra_telemetry::churn::ChurnState {
                 fingerprints,
