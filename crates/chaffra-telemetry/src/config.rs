@@ -155,9 +155,15 @@ impl TelemetryConfig {
             None => TelemetryAudience::default(),
         };
 
-        let backend_kind = config
-            .get("backend")
-            .and_then(|v| BackendKind::from_str_loose(v));
+        let backend_kind = match config.get("backend") {
+            Some(v) => Some(BackendKind::from_str_loose(v).ok_or_else(|| {
+                format!(
+                    "invalid [modules.telemetry] backend: {v:?}; \
+                     valid values: json-file, stderr, prometheus, otlp, statsd, cloudwatch"
+                )
+            })?),
+            None => None,
+        };
 
         let endpoint = config.get("endpoint").cloned();
         let path = config.get("path").cloned();
@@ -173,18 +179,34 @@ impl TelemetryConfig {
             default_backends()
         };
 
-        let sampling_rate = config
+        let sampling_rate = match config
             .get("sampling-rate")
             .or_else(|| config.get("sampling_rate"))
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
+        {
+            Some(v) => v
+                .parse::<f64>()
+                .map_err(|_| {
+                    format!(
+                        "invalid [modules.telemetry] sampling-rate: {v:?}; \
+                     expected a number between 0.0 and 1.0"
+                    )
+                })?
+                .clamp(0.0, 1.0),
+            None => 1.0,
+        };
 
-        let sampling_strategy = config
+        let sampling_strategy = match config
             .get("sampling-strategy")
             .or_else(|| config.get("sampling_strategy"))
-            .and_then(|v| SamplingStrategy::from_str_loose(v))
-            .unwrap_or_default();
+        {
+            Some(v) => SamplingStrategy::from_str_loose(v).ok_or_else(|| {
+                format!(
+                    "invalid [modules.telemetry] sampling-strategy: {v:?}; \
+                     valid values: rate, on-change"
+                )
+            })?,
+            None => SamplingStrategy::default(),
+        };
 
         Ok(Self {
             audience,
@@ -192,6 +214,39 @@ impl TelemetryConfig {
             sampling_rate,
             sampling_strategy,
         })
+    }
+
+    /// Merge project-level `[modules.telemetry]` config into a base config.
+    ///
+    /// Fails closed: invalid project config is an error, not a silent fallback.
+    /// When `explicit_base_audience` is true, the base audience takes priority
+    /// over the project config (used when the CLI `--telemetry` flag was set).
+    pub fn merge_project_config(
+        &self,
+        project_config: &HashMap<String, String>,
+        explicit_base_audience: bool,
+    ) -> Result<Self, String> {
+        let project_tel = Self::from_module_config(project_config)?;
+        let mut merged = self.clone();
+        merged.sampling_rate = project_tel.sampling_rate;
+        merged.sampling_strategy = project_tel.sampling_strategy;
+
+        if !explicit_base_audience {
+            merged.audience = project_tel.audience;
+        }
+
+        let base_is_default_backends = merged.backends.len() == 1
+            && merged.backends[0].kind == BackendKind::JsonFile
+            && merged.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
+        if base_is_default_backends && !project_tel.backends.is_empty() {
+            let proj_is_default = project_tel.backends.len() == 1
+                && project_tel.backends[0].kind == BackendKind::JsonFile
+                && project_tel.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
+            if !proj_is_default {
+                merged.backends = project_tel.backends;
+            }
+        }
+        Ok(merged)
     }
 }
 
@@ -320,5 +375,79 @@ mod tests {
         mc.insert("sampling-rate".to_owned(), "-1.0".to_owned());
         let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert!((cfg.sampling_rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_backend_fails() {
+        let mut mc = HashMap::new();
+        mc.insert("backend".to_owned(), "bogus-sink".to_owned());
+        let result = TelemetryConfig::from_module_config(&mc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid"));
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_sampling_rate_fails() {
+        let mut mc = HashMap::new();
+        mc.insert("sampling-rate".to_owned(), "not-a-number".to_owned());
+        let result = TelemetryConfig::from_module_config(&mc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sampling-rate"));
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_sampling_strategy_fails() {
+        let mut mc = HashMap::new();
+        mc.insert("sampling-strategy".to_owned(), "bogus".to_owned());
+        let result = TelemetryConfig::from_module_config(&mc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sampling-strategy"));
+    }
+
+    #[test]
+    fn test_merge_project_config_propagates_audience() {
+        let base = TelemetryConfig::default();
+        let mut mc = HashMap::new();
+        mc.insert("audience".to_owned(), "on".to_owned());
+        let merged = base.merge_project_config(&mc, false).unwrap();
+        assert_eq!(merged.audience, TelemetryAudience::On);
+    }
+
+    #[test]
+    fn test_merge_project_config_explicit_base_wins() {
+        let base = TelemetryConfig::default();
+        let mut mc = HashMap::new();
+        mc.insert("audience".to_owned(), "on".to_owned());
+        let merged = base.merge_project_config(&mc, true).unwrap();
+        assert_eq!(merged.audience, TelemetryAudience::UserOnly);
+    }
+
+    #[test]
+    fn test_merge_project_config_fails_on_invalid() {
+        let base = TelemetryConfig::default();
+        let mut mc = HashMap::new();
+        mc.insert("audience".to_owned(), "bogus".to_owned());
+        assert!(base.merge_project_config(&mc, false).is_err());
+    }
+
+    #[test]
+    fn test_merge_project_config_merges_backends() {
+        let base = TelemetryConfig::default();
+        let mut mc = HashMap::new();
+        mc.insert("backend".to_owned(), "otlp".to_owned());
+        mc.insert("endpoint".to_owned(), "http://localhost:4317".to_owned());
+        let merged = base.merge_project_config(&mc, false).unwrap();
+        assert_eq!(merged.backends[0].kind, BackendKind::Otlp);
+    }
+
+    #[test]
+    fn test_merge_project_config_merges_sampling() {
+        let base = TelemetryConfig::default();
+        let mut mc = HashMap::new();
+        mc.insert("sampling-rate".to_owned(), "0.25".to_owned());
+        mc.insert("sampling-strategy".to_owned(), "on-change".to_owned());
+        let merged = base.merge_project_config(&mc, false).unwrap();
+        assert!((merged.sampling_rate - 0.25).abs() < f64::EPSILON);
+        assert_eq!(merged.sampling_strategy, SamplingStrategy::OnChange);
     }
 }

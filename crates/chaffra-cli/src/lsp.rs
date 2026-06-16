@@ -99,26 +99,16 @@ pub fn finding_to_diagnostic(finding: &Finding) -> Diagnostic {
 pub(crate) fn merge_lsp_telemetry_config(
     server_config: &chaffra_telemetry::TelemetryConfig,
     workspace_config: &chaffra_core::config::ChaffraConfig,
-) -> Option<chaffra_telemetry::TelemetryConfig> {
+) -> Result<Option<chaffra_telemetry::TelemetryConfig>, String> {
     let module_cfg = workspace_config.module_config("telemetry");
     if module_cfg.is_empty() {
-        return Some(server_config.clone());
+        return Ok(Some(server_config.clone()));
     }
-    match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
-        Ok(project_tel) => {
-            if matches!(
-                project_tel.audience,
-                chaffra_telemetry::TelemetryAudience::Off
-            ) {
-                return None;
-            }
-            let mut merged = server_config.clone();
-            merged.sampling_rate = project_tel.sampling_rate;
-            merged.sampling_strategy = project_tel.sampling_strategy;
-            Some(merged)
-        }
-        Err(_) => Some(server_config.clone()),
+    let merged = server_config.merge_project_config(&module_cfg, false)?;
+    if matches!(merged.audience, chaffra_telemetry::TelemetryAudience::Off) {
+        return Ok(None);
     }
+    Ok(Some(merged))
 }
 
 /// Run analysis on a file and return diagnostics grouped by file URI.
@@ -167,8 +157,12 @@ pub fn analyze_file_for_diagnostics(
         .unwrap_or_default();
 
     let effective_tel = match merge_lsp_telemetry_config(tel_config, &workspace_config) {
-        Some(merged) => merged,
-        None => return analyze_file_no_telemetry(file_path, content),
+        Ok(Some(merged)) => merged,
+        Ok(None) => return analyze_file_no_telemetry(file_path, content),
+        Err(e) => {
+            eprintln!("Invalid workspace telemetry config: {e}");
+            return analyze_file_no_telemetry(file_path, content);
+        }
     };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
@@ -218,7 +212,7 @@ pub fn analyze_file_for_diagnostics(
     let fingerprints = crate::fingerprints_from_findings(&all_findings);
     collector.set_finding_fingerprints(fingerprints);
 
-    chaffra_telemetry::finalize_and_flush(&collector, live_state, &effective_tel);
+    chaffra_telemetry::finalize_and_flush_sampled(&collector, live_state, &effective_tel);
 
     diagnostics
 }
@@ -726,7 +720,7 @@ mod tests {
     fn test_merge_lsp_config_off_returns_none() {
         let server = test_tel_config();
         let workspace = make_workspace_config_with_telemetry(vec![("audience", "off")]);
-        let result = merge_lsp_telemetry_config(&server, &workspace);
+        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
         assert!(result.is_none(), "audience=off should return None");
     }
 
@@ -737,7 +731,7 @@ mod tests {
             ("audience", "on"),
             ("sampling-rate", "0.5"),
         ]);
-        let result = merge_lsp_telemetry_config(&server, &workspace);
+        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
         assert!(result.is_some());
         let merged = result.unwrap();
         assert!(
@@ -751,7 +745,7 @@ mod tests {
     fn test_merge_lsp_config_empty_passthrough() {
         let server = test_tel_config();
         let workspace = chaffra_core::config::ChaffraConfig::default();
-        let result = merge_lsp_telemetry_config(&server, &workspace);
+        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
         assert!(result.is_some());
         let merged = result.unwrap();
         // With no project overrides, sampling rate should match server config.
@@ -762,19 +756,33 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_lsp_config_invalid_falls_back() {
+    fn test_merge_lsp_config_invalid_fails_closed() {
         let server = test_tel_config();
-        // "bogus" is not a valid audience value, so from_module_config returns Err.
         let workspace = make_workspace_config_with_telemetry(vec![("audience", "bogus")]);
         let result = merge_lsp_telemetry_config(&server, &workspace);
-        assert!(
-            result.is_some(),
-            "invalid audience should fall back to server config"
-        );
+        assert!(result.is_err(), "invalid audience should fail closed");
+    }
+
+    #[test]
+    fn test_merge_lsp_config_operator_opt_in() {
+        let server = test_tel_config();
+        let workspace = make_workspace_config_with_telemetry(vec![("audience", "on")]);
+        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        assert!(result.is_some());
         let merged = result.unwrap();
-        assert!(
-            (merged.sampling_rate - server.sampling_rate).abs() < f64::EPSILON,
-            "fallback should preserve server sampling rate"
+        assert_eq!(merged.audience, chaffra_telemetry::TelemetryAudience::On);
+    }
+
+    #[test]
+    fn test_merge_lsp_config_operator_only() {
+        let server = test_tel_config();
+        let workspace = make_workspace_config_with_telemetry(vec![("audience", "operator-only")]);
+        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        assert!(result.is_some());
+        let merged = result.unwrap();
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly
         );
     }
 

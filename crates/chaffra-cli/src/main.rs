@@ -359,31 +359,13 @@ fn merge_telemetry_config(
     project_config: &ChaffraConfig,
     explicit_cli_audience: bool,
 ) -> Result<chaffra_telemetry::TelemetryConfig> {
-    let mut config = cli_config.clone();
     let module_cfg = project_config.module_config("telemetry");
-    if !module_cfg.is_empty() {
-        let project_tel = chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        config.sampling_rate = project_tel.sampling_rate;
-        config.sampling_strategy = project_tel.sampling_strategy;
-
-        if !explicit_cli_audience {
-            config.audience = project_tel.audience;
-        }
-
-        let cli_is_default_backends = config.backends.len() == 1
-            && config.backends[0].kind == chaffra_telemetry::BackendKind::JsonFile
-            && config.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
-        if cli_is_default_backends && !project_tel.backends.is_empty() {
-            let proj_is_default = project_tel.backends.len() == 1
-                && project_tel.backends[0].kind == chaffra_telemetry::BackendKind::JsonFile
-                && project_tel.backends[0].path.as_deref() == Some("chaffra-telemetry.json");
-            if !proj_is_default {
-                config.backends = project_tel.backends;
-            }
-        }
+    if module_cfg.is_empty() {
+        return Ok(cli_config.clone());
     }
-    Ok(config)
+    cli_config
+        .merge_project_config(&module_cfg, explicit_cli_audience)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn discover_and_read_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo> {

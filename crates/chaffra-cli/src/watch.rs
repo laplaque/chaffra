@@ -204,7 +204,7 @@ pub(crate) fn run_watch_iteration(
 
             collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
 
-            chaffra_telemetry::finalize_and_flush(
+            chaffra_telemetry::finalize_and_flush_sampled(
                 &collector,
                 &watch_config.live_state,
                 &watch_config.tel_config,

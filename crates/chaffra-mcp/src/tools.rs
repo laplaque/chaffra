@@ -19,28 +19,12 @@ pub fn build_module_host() -> GrpcModuleHost {
 fn merge_project_telemetry_config(
     server_config: &chaffra_telemetry::TelemetryConfig,
     project_config: &ChaffraConfig,
-) -> chaffra_telemetry::TelemetryConfig {
+) -> Result<chaffra_telemetry::TelemetryConfig, String> {
     let module_cfg = project_config.module_config("telemetry");
     if module_cfg.is_empty() {
-        return server_config.clone();
+        return Ok(server_config.clone());
     }
-    let project_tel = match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
-        Ok(cfg) => cfg,
-        Err(_) => return server_config.clone(),
-    };
-
-    let mut merged = server_config.clone();
-    merged.sampling_rate = project_tel.sampling_rate;
-    merged.sampling_strategy = project_tel.sampling_strategy;
-
-    if matches!(
-        project_tel.audience,
-        chaffra_telemetry::TelemetryAudience::Off
-    ) {
-        merged.audience = chaffra_telemetry::TelemetryAudience::Off;
-    }
-
-    merged
+    server_config.merge_project_config(&module_cfg, false)
 }
 
 fn record_analysis_and_push(
@@ -92,7 +76,7 @@ fn record_analysis_and_push(
                 .collect();
             collector.set_finding_fingerprints(fingerprints);
 
-            chaffra_telemetry::finalize_and_flush(&collector, live_state, tel_config);
+            chaffra_telemetry::finalize_and_flush_sampled(&collector, live_state, tel_config);
 
             Ok(result)
         }
@@ -197,7 +181,10 @@ pub fn execute_health(
     };
 
     let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
-    let effective_tel = merge_project_telemetry_config(tel_config, &config);
+    let effective_tel = match merge_project_telemetry_config(tel_config, &config) {
+        Ok(cfg) => cfg,
+        Err(e) => return ToolCallResult::error(format!("Invalid telemetry config: {e}")),
+    };
     let files = discover_and_read_files(&root, &config);
 
     if files.is_empty() {
@@ -241,7 +228,10 @@ pub fn execute_dead_code(
     };
 
     let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
-    let effective_tel = merge_project_telemetry_config(tel_config, &config);
+    let effective_tel = match merge_project_telemetry_config(tel_config, &config) {
+        Ok(cfg) => cfg,
+        Err(e) => return ToolCallResult::error(format!("Invalid telemetry config: {e}")),
+    };
     let files = discover_and_read_files(&root, &config);
 
     if files.is_empty() {
@@ -531,7 +521,7 @@ mod tests {
     fn test_merge_project_telemetry_config_no_module_section() {
         let server = tc();
         let project = ChaffraConfig::default();
-        let merged = merge_project_telemetry_config(&server, &project);
+        let merged = merge_project_telemetry_config(&server, &project).unwrap();
         assert_eq!(merged.audience, server.audience);
     }
 
@@ -542,7 +532,7 @@ mod tests {
         let mut tel_section = std::collections::HashMap::new();
         tel_section.insert("audience".to_owned(), toml::Value::String("off".to_owned()));
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project);
+        let merged = merge_project_telemetry_config(&server, &project).unwrap();
         assert!(matches!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::Off
@@ -550,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_project_telemetry_config_invalid_audience_keeps_server() {
+    fn test_merge_project_telemetry_config_invalid_audience_fails_closed() {
         let server = tc();
         let mut project = ChaffraConfig::default();
         let mut tel_section = std::collections::HashMap::new();
@@ -559,8 +549,8 @@ mod tests {
             toml::Value::String("bogus".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project);
-        assert_eq!(merged.audience, server.audience);
+        let result = merge_project_telemetry_config(&server, &project);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -577,19 +567,78 @@ mod tests {
             toml::Value::String("on-change".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project);
+        let merged = merge_project_telemetry_config(&server, &project).unwrap();
         assert!((merged.sampling_rate - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_merge_project_telemetry_config_non_off_audience_preserves_server() {
+    fn test_merge_project_telemetry_config_operator_opt_in() {
         let server = tc();
         let mut project = ChaffraConfig::default();
         let mut tel_section = std::collections::HashMap::new();
         tel_section.insert("audience".to_owned(), toml::Value::String("on".to_owned()));
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project);
-        assert_eq!(merged.audience, server.audience);
+        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        assert_eq!(merged.audience, chaffra_telemetry::TelemetryAudience::On);
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_operator_only() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert(
+            "audience".to_owned(),
+            toml::Value::String("operator-only".to_owned()),
+        );
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly
+        );
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_invalid_backend_fails_closed() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert(
+            "backend".to_owned(),
+            toml::Value::String("bogus-sink".to_owned()),
+        );
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let result = merge_project_telemetry_config(&server, &project);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_invalid_sampling_rate_fails_closed() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert(
+            "sampling-rate".to_owned(),
+            toml::Value::String("not-a-number".to_owned()),
+        );
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let result = merge_project_telemetry_config(&server, &project);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_invalid_sampling_strategy_fails_closed() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert(
+            "sampling-strategy".to_owned(),
+            toml::Value::String("bogus-strategy".to_owned()),
+        );
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let result = merge_project_telemetry_config(&server, &project);
+        assert!(result.is_err());
     }
 
     #[test]

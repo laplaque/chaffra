@@ -167,28 +167,39 @@ pub async fn get_metrics_history(
         }
     };
 
-    let snapshots = if let Some(ref module) = query.module {
-        state.live_state.history_by_module(module, &query.window)
-    } else if let Some(ref severity) = query.severity {
-        state
-            .live_state
-            .history_by_severity(severity, &query.window)
-    } else if let Some(ref metric) = query.metric {
-        state.live_state.history_by_metric(metric, &query.window)
-    } else {
-        state.live_state.history_window(&query.window)
-    };
     let include_operator = state.audience.operator_enabled();
+    let raw_snapshots = state.live_state.history_window(&query.window);
+    let scoped: Vec<_> = raw_snapshots
+        .into_iter()
+        .map(|s| if include_operator { s } else { s.user_scoped() })
+        .collect();
+
+    let snapshots: Vec<_> = if let Some(ref module) = query.module {
+        scoped
+            .into_iter()
+            .filter(|s| s.user_summary.module_summaries.contains_key(module))
+            .collect()
+    } else if let Some(ref severity) = query.severity {
+        scoped
+            .into_iter()
+            .filter(|s| {
+                s.user_summary
+                    .findings_by_severity
+                    .get(severity)
+                    .is_some_and(|&c| c > 0)
+            })
+            .collect()
+    } else if let Some(ref metric) = query.metric {
+        scoped
+            .into_iter()
+            .filter(|s| s.data_points.iter().any(|dp| dp.name.starts_with(metric)))
+            .collect()
+    } else {
+        scoped
+    };
     let snapshot_values: Vec<serde_json::Value> = snapshots
         .iter()
-        .map(|s| {
-            if include_operator {
-                s.clone()
-            } else {
-                s.user_scoped()
-            }
-        })
-        .filter_map(|s| serde_json::to_value(&s).ok())
+        .filter_map(|s| serde_json::to_value(s).ok())
         .collect();
 
     Json(MetricsHistoryResponse {
