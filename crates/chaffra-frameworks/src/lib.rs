@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_module_default() {
-        let module = FrameworksModule::default();
+        let module = FrameworksModule;
         assert_eq!(module.describe().id, "frameworks");
     }
 

@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = CicdSecurityModule::default();
+        let module = CicdSecurityModule;
         let info = module.describe();
         assert_eq!(info.id, "cicd-security");
     }

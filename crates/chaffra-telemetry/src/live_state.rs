@@ -524,6 +524,27 @@ mod tests {
     }
 
     #[test]
+    fn test_default_trait() {
+        let state = LiveTelemetryState::default();
+        assert_eq!(state.source(), StateSource::Empty);
+        assert!(state.current().is_none());
+        assert_eq!(state.snapshot_count(), 0);
+    }
+
+    #[test]
+    fn test_push_seeded_capacity_bounds() {
+        let state = LiveTelemetryState::with_capacity(2);
+        state.push_seeded(make_snapshot(1000, &["a"]));
+        state.push_seeded(make_snapshot(2000, &["b"]));
+        state.push_seeded(make_snapshot(3000, &["c"]));
+
+        assert_eq!(state.snapshot_count(), 2);
+        let history = state.history_window("7d");
+        assert_eq!(history[0].timestamp_ms, 2000);
+        assert_eq!(history[1].timestamp_ms, 3000);
+    }
+
+    #[test]
     fn test_history_by_metric() {
         let state = LiveTelemetryState::new();
         let base = 1_000_000_000_000u64;

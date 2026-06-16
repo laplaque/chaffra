@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_default_module() {
-        let module = AuditModule::default();
+        let module = AuditModule;
         assert_eq!(module.describe().id, "audit");
     }
 

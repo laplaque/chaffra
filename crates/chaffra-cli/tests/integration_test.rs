@@ -324,7 +324,7 @@ fn test_gin_framework_detection() {
     assert!(
         entry_points
             .iter()
-            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "gin")),
+            .all(|f| f.metadata.get("framework").is_some_and(|v| v == "gin")),
         "all entries should be gin framework"
     );
 
@@ -360,7 +360,7 @@ fn test_echo_framework_detection() {
     assert!(
         entry_points
             .iter()
-            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "echo")),
+            .all(|f| f.metadata.get("framework").is_some_and(|v| v == "echo")),
         "all entries should be echo framework"
     );
 }
@@ -385,7 +385,7 @@ fn test_cobra_framework_detection() {
     assert!(
         entry_points
             .iter()
-            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "cobra")),
+            .all(|f| f.metadata.get("framework").is_some_and(|v| v == "cobra")),
         "all entries should be cobra framework"
     );
 }
@@ -408,10 +408,9 @@ fn test_fastapi_framework_detection() {
         "should detect FastAPI routes: {entry_points:?}"
     );
     assert!(
-        entry_points.iter().all(|f| f
-            .metadata
-            .get("framework")
-            .map_or(false, |v| v == "fastapi")),
+        entry_points
+            .iter()
+            .all(|f| f.metadata.get("framework").is_some_and(|v| v == "fastapi")),
         "all entries should be fastapi framework"
     );
 }
@@ -437,7 +436,7 @@ fn test_django_framework_detection() {
     assert!(
         entry_points
             .iter()
-            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "django")),
+            .all(|f| f.metadata.get("framework").is_some_and(|v| v == "django")),
         "all entries should be django framework"
     );
 }
@@ -462,7 +461,7 @@ fn test_flask_framework_detection() {
     assert!(
         entry_points
             .iter()
-            .all(|f| f.metadata.get("framework").map_or(false, |v| v == "flask")),
+            .all(|f| f.metadata.get("framework").is_some_and(|v| v == "flask")),
         "all entries should be flask framework"
     );
 }
@@ -1017,7 +1016,7 @@ fn test_wire_compat_finding_core_to_types() {
         core_finding.location.start_line
     );
     assert_eq!(types_finding.actions.len(), 1);
-    assert_eq!(types_finding.actions[0].auto_fixable, true);
+    assert!(types_finding.actions[0].auto_fixable);
     assert_eq!(types_finding.metadata.get("scope").unwrap(), "package");
 }
 

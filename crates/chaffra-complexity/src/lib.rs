@@ -785,7 +785,7 @@ mod tests {
 
     #[test]
     fn test_default_module() {
-        let module = ComplexityModule::default();
+        let module = ComplexityModule;
         assert_eq!(module.describe().id, "complexity");
     }
 

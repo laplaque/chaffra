@@ -3381,8 +3381,10 @@ mod tests {
 
     #[test]
     fn test_run_with_telemetry_off_skips_lifecycle() {
-        let mut config = chaffra_telemetry::TelemetryConfig::default();
-        config.audience = chaffra_telemetry::TelemetryAudience::Off;
+        let config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::Off,
+            ..Default::default()
+        };
         let project_config = ChaffraConfig::default();
         let result = run_with_telemetry(
             &config,

@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = AiQualityModule::default();
+        let module = AiQualityModule;
         let info = module.describe();
         assert_eq!(info.id, "ai-quality");
     }

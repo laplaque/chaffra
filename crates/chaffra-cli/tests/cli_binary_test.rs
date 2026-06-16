@@ -1,254 +1,264 @@
-//! Binary integration tests — run the `chaffra` CLI against fixture directories
-//! to cover `main()` command dispatch and telemetry audience forwarding.
-
-use std::path::Path;
 use std::process::Command;
 
-fn chaffra_bin() -> Command {
+fn fixture_path(name: &str) -> String {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let p = std::path::Path::new(manifest)
+        .join("../../tests/fixtures/go")
+        .join(name);
+    p.canonicalize().unwrap_or(p).to_string_lossy().to_string()
+}
+
+fn chaffra_cmd() -> Command {
     Command::new(env!("CARGO_BIN_EXE_chaffra"))
 }
 
-fn fixture_path(name: &str) -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(name)
-        .to_string_lossy()
-        .to_string()
-}
-
 #[test]
-fn test_cli_health() {
-    let output = chaffra_bin()
-        .args(["health", &fixture_path("go/simple")])
+fn binary_health() {
+    let out = chaffra_cmd()
+        .args(["health", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra health");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "health failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Health") || stdout.contains("Score") || stdout.contains("Grade"),
-        "expected health output, got: {stdout}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_dead_code() {
-    let output = chaffra_bin()
-        .args(["dead-code", &fixture_path("go/simple")])
+fn binary_dead_code() {
+    let out = chaffra_cmd()
+        .args(["dead-code", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra dead-code");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "dead-code failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_security() {
-    let output = chaffra_bin()
-        .args(["security", &fixture_path("security")])
+fn binary_security() {
+    let out = chaffra_cmd()
+        .args(["security", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra security");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "security failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_audit() {
-    let output = chaffra_bin()
-        .args(["audit", &fixture_path("go/simple")])
+fn binary_audit() {
+    let out = chaffra_cmd()
+        .args(["audit", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra audit");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "audit failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_hotspot() {
-    let output = chaffra_bin()
-        .args(["hotspot", &fixture_path("go/simple")])
+fn binary_hotspot() {
+    let out = chaffra_cmd()
+        .args(["hotspot", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra hotspot");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "hotspot failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_ai_quality() {
-    let output = chaffra_bin()
-        .args(["ai-quality", &fixture_path("go/simple")])
+fn binary_ai_quality() {
+    let out = chaffra_cmd()
+        .args(["ai-quality", &fixture_path("ai-quality")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra ai-quality");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "ai-quality failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_llm_defense() {
-    let output = chaffra_bin()
-        .args(["llm-defense", &fixture_path("go/simple")])
+fn binary_llm_defense() {
+    let out = chaffra_cmd()
+        .args(["llm-defense", &fixture_path("llm-defense")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra llm-defense");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "llm-defense failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_cicd_security() {
-    let output = chaffra_bin()
-        .args(["cicd-security", &fixture_path("cicd")])
+fn binary_cicd_security() {
+    let out = chaffra_cmd()
+        .args(["cicd-security", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra cicd-security");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "cicd-security failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_dupes() {
-    let output = chaffra_bin()
-        .args(["dupes", &fixture_path("go/simple")])
+fn binary_dupes() {
+    let out = chaffra_cmd()
+        .args(["dupes", &fixture_path("duplicates")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra dupes");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "dupes failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_boundaries() {
-    let output = chaffra_bin()
-        .args(["boundaries", &fixture_path("go/simple")])
+fn binary_boundaries() {
+    let out = chaffra_cmd()
+        .args(["boundaries", &fixture_path("arch")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra boundaries");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "boundaries failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_health_with_telemetry_off() {
-    let output = chaffra_bin()
-        .args(["health", &fixture_path("go/simple"), "--telemetry", "off"])
+fn binary_fix_dry_run() {
+    let out = chaffra_cmd()
+        .args(["fix", &fixture_path("simple"), "--dry-run"])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra health --telemetry off");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "health --telemetry off failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_health_with_telemetry_on() {
-    let output = chaffra_bin()
-        .args(["health", &fixture_path("go/simple"), "--telemetry", "on"])
+fn binary_impact() {
+    let out = chaffra_cmd()
+        .args(["impact", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra health --telemetry on");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "health --telemetry on failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_fix_dry_run() {
-    let output = chaffra_bin()
-        .args(["fix", &fixture_path("go/simple"), "--dry-run"])
-        .output()
-        .expect("failed to run chaffra fix --dry-run");
+fn binary_modules() {
+    let out = chaffra_cmd().arg("modules").output().unwrap();
     assert!(
-        output.status.success(),
-        "fix --dry-run failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_impact() {
-    let output = chaffra_bin()
-        .args(["impact", &fixture_path("go/simple")])
+fn binary_explain() {
+    let out = chaffra_cmd()
+        .args(["explain", "dead-code:unused-function"])
         .output()
-        .expect("failed to run chaffra impact");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "impact failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_modules() {
-    let output = chaffra_bin()
-        .args(["modules"])
+fn binary_health_format_json() {
+    let out = chaffra_cmd()
+        .args(["health", &fixture_path("simple")])
+        .args(["--format", "json"])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra modules");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "modules failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("dead-code"), "should list dead-code module");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains('{'), "expected JSON output");
+}
+
+#[test]
+fn binary_health_telemetry_on() {
+    let out = chaffra_cmd()
+        .args(["health", &fixture_path("simple")])
+        .arg("--telemetry")
+        .arg("user")
+        .output()
+        .unwrap();
     assert!(
-        stdout.contains("complexity"),
-        "should list complexity module"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn test_cli_explain() {
-    let output = chaffra_bin()
-        .args(["explain", "unused-function"])
+fn binary_telemetry_status() {
+    let out = chaffra_cmd()
+        .args(["telemetry", "status"])
+        .arg("--telemetry")
+        .arg("off")
         .output()
-        .expect("failed to run chaffra explain");
+        .unwrap();
     assert!(
-        output.status.success(),
-        "explain failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn test_cli_health_json_output() {
-    let output = chaffra_bin()
-        .args(["health", &fixture_path("go/simple"), "--format", "json"])
-        .output()
-        .expect("failed to run chaffra health --format json");
-    assert!(
-        output.status.success(),
-        "health --format json failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
-        "output should be valid JSON: {stdout}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

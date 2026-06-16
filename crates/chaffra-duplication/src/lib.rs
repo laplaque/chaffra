@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = DuplicationModule::default();
+        let module = DuplicationModule;
         assert_eq!(module.describe().id, "duplication");
     }
 

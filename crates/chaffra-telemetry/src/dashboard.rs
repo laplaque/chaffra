@@ -669,7 +669,7 @@ mod tests {
         ];
         for name in &must_be_emitted {
             assert!(
-                emitted_dp_names.contains(&name.to_string()),
+                emitted_dp_names.contains(*name),
                 "collector should emit data point {name}, but emitted: {emitted_dp_names:?}"
             );
         }

@@ -859,7 +859,7 @@ mod tests {
             serde_json::from_str(user_text).expect("should be valid JSON");
         let op_durations = &parsed["operator_summary"]["module_call_durations"];
         assert!(
-            op_durations.as_object().map_or(true, |m| m.is_empty()),
+            op_durations.as_object().is_none_or(|m| m.is_empty()),
             "user-scoped snapshot should have empty module_call_durations"
         );
     }

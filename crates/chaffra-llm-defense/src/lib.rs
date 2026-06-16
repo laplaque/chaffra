@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = LlmDefenseModule::default();
+        let module = LlmDefenseModule;
         let info = module.describe();
         assert_eq!(info.id, "llm-defense");
     }

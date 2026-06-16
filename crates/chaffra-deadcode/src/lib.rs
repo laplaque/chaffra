@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = DeadCodeModule::default();
+        let module = DeadCodeModule;
         let info = module.describe();
         assert_eq!(info.id, "dead-code");
     }

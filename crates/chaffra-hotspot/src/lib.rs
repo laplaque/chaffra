@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_default_module() {
-        let module = HotspotModule::default();
+        let module = HotspotModule;
         assert_eq!(module.describe().id, "hotspot");
     }
 

@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = ArchModule::default();
+        let module = ArchModule;
         assert_eq!(module.describe().id, "architecture");
     }
 

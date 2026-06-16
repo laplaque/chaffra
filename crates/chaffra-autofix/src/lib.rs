@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = AutofixModule::default();
+        let module = AutofixModule;
         let info = module.describe();
         assert_eq!(info.id, "autofix");
     }

@@ -481,8 +481,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut tel_config = chaffra_telemetry::TelemetryConfig::default();
-        tel_config.audience = chaffra_telemetry::TelemetryAudience::Off;
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::Off,
+            ..Default::default()
+        };
 
         let watch_cfg = WatchConfig::new(
             dir.clone(),

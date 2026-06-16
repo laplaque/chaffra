@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let module = SecurityModule::default();
+        let module = SecurityModule;
         let info = module.describe();
         assert_eq!(info.id, "security");
     }
