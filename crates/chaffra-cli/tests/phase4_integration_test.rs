@@ -27,7 +27,7 @@ fn load_fixture_files(fixture_dir: &str) -> Vec<FileInfo> {
 
 #[test]
 fn test_mcp_full_session() {
-    let mut server = McpServer::new();
+    let mut server = McpServer::default();
 
     // Initialize.
     let resp = server
@@ -76,7 +76,7 @@ fn test_mcp_full_session() {
 
 #[test]
 fn test_mcp_health_on_fixture() {
-    let mut server = McpServer::new();
+    let mut server = McpServer::default();
 
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/go/simple")
@@ -98,7 +98,7 @@ fn test_mcp_health_on_fixture() {
 
 #[test]
 fn test_mcp_dead_code_on_fixture() {
-    let mut server = McpServer::new();
+    let mut server = McpServer::default();
 
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/go/simple")
@@ -223,7 +223,7 @@ fn test_types_health_grade_boundary_values() {
 
 #[test]
 fn test_mcp_protocol_error_handling() {
-    let mut server = McpServer::new();
+    let mut server = McpServer::default();
 
     // Invalid JSON.
     let resp = server.handle_message("not json at all").unwrap();

@@ -288,7 +288,7 @@ pub(crate) fn build_module_host() -> GrpcModuleHost {
     build_module_host_with_telemetry(None)
 }
 
-fn build_module_host_with_telemetry(
+pub(crate) fn build_module_host_with_telemetry(
     collector: Option<&chaffra_telemetry::TelemetryCollector>,
 ) -> GrpcModuleHost {
     let total_start = std::time::Instant::now();
@@ -1351,12 +1351,6 @@ where
     let failed = result.is_err();
     collector.record_module_call(command_name, duration_ms, failed);
 
-    let snapshot = collector.snapshot();
-
-    if let Some(ls) = live_state {
-        ls.push_snapshot(snapshot.clone());
-    }
-
     if !failed {
         let current_fingerprints = collector.finding_fingerprints();
         let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
@@ -1367,6 +1361,12 @@ where
         if let Some(ref prev) = previous_state {
             let churn = chaffra_telemetry::churn::compute_churn(&current_fingerprints, prev);
             collector.record_finding_churn(&churn);
+        }
+
+        let snapshot = collector.snapshot();
+
+        if let Some(ls) = live_state {
+            ls.push_snapshot(snapshot.clone());
         }
 
         let decision = chaffra_telemetry::sampling::should_sample(
@@ -1399,6 +1399,12 @@ where
         };
         let _ = chaffra_telemetry::churn::save_state(&new_state, state_path);
     } else {
+        let snapshot = collector.snapshot();
+
+        if let Some(ls) = live_state {
+            ls.push_snapshot(snapshot.clone());
+        }
+
         let (backends, _) =
             chaffra_telemetry::backends::create_backends(&effective_config.backends);
         let flushed = if effective_config.audience.operator_enabled() {
@@ -1420,6 +1426,7 @@ async fn main() -> Result<()> {
     let format = OutputFormat::from_str_loose(&cli.format).unwrap_or(OutputFormat::Terminal);
     let formatter = create_formatter(format);
     let (tel_config, explicit_cli_audience) = build_telemetry_config(&cli);
+    let live_state = chaffra_telemetry::LiveTelemetryState::new();
 
     match cli.command {
         Command::Health { path } => {
@@ -1432,7 +1439,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "health",
-                    None,
+                    Some(&live_state),
                     |_collector| { cmd_health(&root, &config, formatter.as_ref()) }
                 )?
             );
@@ -1448,7 +1455,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "dead-code",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_dead_code(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1464,7 +1471,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "security",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_security(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1480,7 +1487,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "audit",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_audit(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1496,7 +1503,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "hotspot",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_hotspot(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1512,7 +1519,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "ai-quality",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_ai_quality(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1528,7 +1535,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "llm-defense",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_llm_defense(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1544,7 +1551,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "cicd-security",
-                    None,
+                    Some(&live_state),
                     |collector| {
                         cmd_cicd_security(&root, &config, formatter.as_ref(), collector)
                     }
@@ -1566,7 +1573,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "duplication",
-                    None,
+                    Some(&live_state),
                     |collector| {
                         cmd_dupes(
                             &root,
@@ -1591,7 +1598,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "architecture",
-                    None,
+                    Some(&live_state),
                     |collector| {
                         cmd_boundaries(
                             &root,
@@ -1608,12 +1615,14 @@ async fn main() -> Result<()> {
         Command::Watch { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            let watch_config = watch::WatchConfig::new(root, format, config);
+            let effective_tel = merge_telemetry_config(&tel_config, &config, explicit_cli_audience);
+            let watch_config =
+                watch::WatchConfig::new(root, format, config, effective_tel, live_state.clone());
             watch::run_watch(watch_config)?;
         }
 
         Command::Mcp => {
-            let mut server = chaffra_mcp::McpServer::new();
+            let mut server = chaffra_mcp::McpServer::new(live_state.clone());
             server
                 .run()
                 .await
@@ -1621,7 +1630,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Lsp => {
-            lsp::run_lsp_server().await?;
+            lsp::run_lsp_server(live_state.clone()).await?;
         }
 
         Command::Fix {
@@ -1638,7 +1647,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "fix",
-                    None,
+                    Some(&live_state),
                     |collector| { cmd_fix(&root, &config, dry_run, rule.as_deref(), collector) }
                 )?
             );
@@ -1714,7 +1723,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "impact",
-                    None,
+                    Some(&live_state),
                     |collector| {
                         cmd_impact(
                             &root,
@@ -1784,7 +1793,9 @@ async fn main() -> Result<()> {
             let audience = effective_tel.audience;
             let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
             collector.register_core_metrics();
-            let live_state = if let Some(ref analysis_path) = path {
+            let mgmt_live_state = if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
+                chaffra_telemetry::LiveTelemetryState::new()
+            } else if let Some(ref analysis_path) = path {
                 let root = Path::new(analysis_path)
                     .canonicalize()
                     .context("invalid path")?;
@@ -1795,20 +1806,54 @@ async fn main() -> Result<()> {
                 let files = discover_and_read_files(&root, &analysis_config);
                 analysis_collector.set_files_total(files.len() as u64);
                 for module_info in host.list() {
-                    let _ = host.analyze(&module_info.id, &files, &analysis_config);
+                    let start = std::time::Instant::now();
+                    match host.analyze(&module_info.id, &files, &analysis_config) {
+                        Ok(result) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            analysis_collector.record_module_call(
+                                &module_info.id,
+                                duration_ms,
+                                false,
+                            );
+                            let mut sev_counts = HashMap::new();
+                            for finding in &result.findings {
+                                let sev = match finding.severity {
+                                    chaffra_core::diagnostic::Severity::Error => "error",
+                                    chaffra_core::diagnostic::Severity::Warning => "warning",
+                                    chaffra_core::diagnostic::Severity::Info => "info",
+                                };
+                                *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+                            }
+                            analysis_collector.record_module_findings(
+                                &module_info.id,
+                                result.findings.len() as u64,
+                                &sev_counts,
+                            );
+                        }
+                        Err(_) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            analysis_collector.record_module_call(
+                                &module_info.id,
+                                duration_ms,
+                                true,
+                            );
+                        }
+                    }
                 }
                 let snapshot = analysis_collector.snapshot();
                 let state = chaffra_telemetry::LiveTelemetryState::new();
                 state.push_snapshot(snapshot);
                 state
-            } else if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
-                chaffra_telemetry::LiveTelemetryState::new()
             } else {
                 chaffra_telemetry::seed::seed_live_state()
             };
             let config = chaffra_management::ManagementConfig { port };
-            let server =
-                chaffra_management::ManagementServer::new(config, collector, live_state, audience);
+            let server = chaffra_management::ManagementServer::new(
+                config,
+                collector,
+                mgmt_live_state,
+                audience,
+            );
             server.run().await?;
         }
     }

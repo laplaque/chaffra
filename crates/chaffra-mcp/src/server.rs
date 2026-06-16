@@ -9,12 +9,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// MCP server that reads JSON-RPC requests from stdin and writes responses to stdout.
 pub struct McpServer {
     initialized: bool,
+    _live_state: chaffra_telemetry::LiveTelemetryState,
 }
 
 impl McpServer {
     /// Create a new MCP server.
-    pub fn new() -> Self {
-        Self { initialized: false }
+    pub fn new(live_state: chaffra_telemetry::LiveTelemetryState) -> Self {
+        Self {
+            initialized: false,
+            _live_state: live_state,
+        }
     }
 
     /// Run the server loop, reading from stdin and writing to stdout.
@@ -146,7 +150,7 @@ impl McpServer {
 
 impl Default for McpServer {
     fn default() -> Self {
-        Self::new()
+        Self::new(chaffra_telemetry::LiveTelemetryState::new())
     }
 }
 
@@ -156,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_initialize() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
         let resp = server.handle_message(msg).unwrap();
         assert!(resp.result.is_some());
@@ -173,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_initialized_notification_no_response() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let resp = server.handle_message(msg);
         assert!(resp.is_none());
@@ -181,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_tools_list() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = server.handle_message(msg).unwrap();
         let result = resp.result.unwrap();
@@ -191,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_tools_call_explain() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chaffra/explain","arguments":{"rule_id":"dead-code:unused-function"}}}"#;
         let resp = server.handle_message(msg).unwrap();
         let result = resp.result.unwrap();
@@ -202,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_tools_call_missing_name() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{}}"#;
         let resp = server.handle_message(msg).unwrap();
         assert!(resp.error.is_some());
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_unknown_method() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":5,"method":"unknown/method"}"#;
         let resp = server.handle_message(msg).unwrap();
         assert!(resp.error.is_some());
@@ -219,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_unknown_notification_no_response() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","method":"unknown/notification"}"#;
         let resp = server.handle_message(msg);
         assert!(resp.is_none());
@@ -227,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_parse_error() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let resp = server.handle_message("not json").unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, PARSE_ERROR);
@@ -235,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_shutdown() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":6,"method":"shutdown"}"#;
         let resp = server.handle_message(msg).unwrap();
         assert!(resp.error.is_none());
@@ -246,7 +250,7 @@ mod tests {
     fn test_tools_call_health_empty_dir() {
         let dir = std::env::temp_dir().join("chaffra_mcp_server_health");
         let _ = std::fs::create_dir_all(&dir);
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = format!(
             r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"chaffra/health","arguments":{{"path":"{}"}}}}}}"#,
             dir.display()
@@ -258,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_tools_call_unknown_tool() {
-        let mut server = McpServer::new();
+        let mut server = McpServer::default();
         let msg = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"unknown/tool","arguments":{}}}"#;
         let resp = server.handle_message(msg).unwrap();
         let result = resp.result.unwrap();

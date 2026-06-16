@@ -22,15 +22,27 @@ pub struct WatchConfig {
     pub format: OutputFormat,
     /// Chaffra config.
     pub config: ChaffraConfig,
+    /// Telemetry config for watch iterations.
+    pub tel_config: chaffra_telemetry::TelemetryConfig,
+    /// Shared live telemetry state.
+    pub live_state: chaffra_telemetry::LiveTelemetryState,
 }
 
 impl WatchConfig {
-    pub fn new(root: PathBuf, format: OutputFormat, config: ChaffraConfig) -> Self {
+    pub fn new(
+        root: PathBuf,
+        format: OutputFormat,
+        config: ChaffraConfig,
+        tel_config: chaffra_telemetry::TelemetryConfig,
+        live_state: chaffra_telemetry::LiveTelemetryState,
+    ) -> Self {
         Self {
             root,
             debounce: Duration::from_millis(200),
             format,
             config,
+            tel_config,
+            live_state,
         }
     }
 }
@@ -66,6 +78,7 @@ pub fn run_analysis_on_changes(
     root: &Path,
     config: &ChaffraConfig,
     format: OutputFormat,
+    collector: Option<&chaffra_telemetry::TelemetryCollector>,
 ) -> Result<String> {
     let source_files: Vec<&PathBuf> = changed_paths.iter().filter(|p| is_source_file(p)).collect();
 
@@ -93,7 +106,7 @@ pub fn run_analysis_on_changes(
         return Ok(String::new());
     }
 
-    let host = crate::build_module_host();
+    let host = crate::build_module_host_with_telemetry(collector);
     let formatter = create_formatter(format);
     let mut output = String::new();
 
@@ -168,13 +181,27 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
 
         eprintln!("\n--- Change detected: {} file(s) ---", changed.len());
 
-        match run_analysis_on_changes(&changed, &root, &config, format) {
+        let collector = chaffra_telemetry::TelemetryCollector::new(watch_config.tel_config.clone());
+        collector.register_core_metrics();
+        let start = std::time::Instant::now();
+
+        match run_analysis_on_changes(&changed, &root, &config, format, Some(&collector)) {
             Ok(output) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                collector.record_module_call("watch", duration_ms, false);
+                let snapshot = collector.snapshot();
+                watch_config.live_state.push_snapshot(snapshot);
                 if !output.is_empty() {
                     print!("{output}");
                 }
             }
-            Err(e) => eprintln!("Analysis error: {e}"),
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                collector.record_module_call("watch", duration_ms, true);
+                let snapshot = collector.snapshot();
+                watch_config.live_state.push_snapshot(snapshot);
+                eprintln!("Analysis error: {e}");
+            }
         }
     }
 
@@ -211,6 +238,8 @@ mod tests {
             PathBuf::from("/tmp"),
             OutputFormat::Terminal,
             ChaffraConfig::default(),
+            chaffra_telemetry::TelemetryConfig::default(),
+            chaffra_telemetry::LiveTelemetryState::new(),
         );
         assert_eq!(config.root, PathBuf::from("/tmp"));
         assert_eq!(config.debounce, Duration::from_millis(200));
@@ -229,6 +258,7 @@ mod tests {
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
+            None,
         )
         .unwrap();
         assert!(result.is_empty());
@@ -253,6 +283,7 @@ mod tests {
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
+            None,
         )
         .unwrap();
         // Should produce some output (either findings or "no issues").
@@ -274,6 +305,7 @@ mod tests {
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
+            None,
         )
         .unwrap();
         assert!(result.contains("No issues") || !result.is_empty());
@@ -298,6 +330,7 @@ mod tests {
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Json,
+            None,
         )
         .unwrap();
         assert!(!result.is_empty());
@@ -315,6 +348,7 @@ mod tests {
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
+            None,
         )
         .unwrap();
         // Nonexistent file should produce empty result.
@@ -336,6 +370,7 @@ mod tests {
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
+            None,
         )
         .unwrap();
         assert!(!result.is_empty());

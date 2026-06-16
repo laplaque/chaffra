@@ -191,7 +191,7 @@ async fn read_content_length(reader: &mut BufReader<tokio::io::Stdin>) -> Result
 /// Implements proper Content-Length-based message framing per the LSP spec:
 /// reads `Content-Length: N\r\n...\r\n` headers, then reads exactly N bytes
 /// of JSON payload.
-pub async fn run_lsp_server() -> Result<()> {
+pub async fn run_lsp_server(_live_state: chaffra_telemetry::LiveTelemetryState) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
