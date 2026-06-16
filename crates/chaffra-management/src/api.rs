@@ -181,18 +181,20 @@ pub async fn get_metrics_history(
 
 pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<ModulesResponse> {
     let snapshot = state.collector.snapshot();
+    let include_operator = state.audience.operator_enabled();
     let modules = snapshot
         .user_summary
         .module_summaries
         .iter()
         .map(|(id, summary)| {
-            let has_error = snapshot
-                .operator_summary
-                .module_error_counts
-                .get(id)
-                .copied()
-                .unwrap_or(0)
-                > 0;
+            let has_error = include_operator
+                && snapshot
+                    .operator_summary
+                    .module_error_counts
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0;
             ModuleEntry {
                 id: id.clone(),
                 status: if has_error {
@@ -297,14 +299,28 @@ pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<H
 pub async fn get_config(state: axum::extract::State<Arc<SharedState>>) -> Json<ConfigResponse> {
     let config = state.collector.config();
 
+    let audience = serde_json::to_value(config.audience)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| format!("{:?}", config.audience));
+    let sampling_strategy = serde_json::to_value(config.sampling_strategy)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| format!("{:?}", config.sampling_strategy));
+
     Json(ConfigResponse {
-        audience: format!("{:?}", config.audience),
+        audience,
         sampling_rate: config.sampling_rate,
-        sampling_strategy: format!("{:?}", config.sampling_strategy),
+        sampling_strategy,
         backends: config
             .backends
             .iter()
-            .map(|b| format!("{:?}", b.kind))
+            .map(|b| {
+                serde_json::to_value(&b.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| format!("{:?}", b.kind))
+            })
             .collect(),
     })
 }

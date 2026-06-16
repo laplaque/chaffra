@@ -471,4 +471,174 @@ mod tests {
             "operator audience should include call_duration datapoints"
         );
     }
+
+    #[tokio::test]
+    async fn test_modules_user_only_hides_operator_error_status() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 150, true);
+        collector.set_files_total(1);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let modules = parsed["modules"].as_array().unwrap();
+        for m in modules {
+            assert_eq!(
+                m["status"].as_str().unwrap(),
+                "healthy",
+                "UserOnly should not expose operator error status"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_modules_operator_shows_error_status() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 150, true);
+        collector.set_files_total(1);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::On,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let modules = parsed["modules"].as_array().unwrap();
+        let dc = modules.iter().find(|m| m["id"] == "dead-code").unwrap();
+        assert_eq!(
+            dc["status"].as_str().unwrap(),
+            "error",
+            "Operator audience should expose error status from module_error_counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_returns_kebab_case_values() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["audience"].as_str().unwrap(),
+            "user-only",
+            "audience should be kebab-case"
+        );
+        assert_eq!(
+            parsed["sampling_strategy"].as_str().unwrap(),
+            "rate",
+            "sampling_strategy should be kebab-case"
+        );
+        let backends = parsed["backends"].as_array().unwrap();
+        assert!(
+            backends.iter().all(|b| b.as_str().unwrap() == "json-file"),
+            "backend kinds should be kebab-case"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seeded_management_populates_all_endpoints() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        chaffra_telemetry::seed::seed_collector(&collector);
+        let live_state = chaffra_telemetry::seed::seed_live_state();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/metrics/history?window=7d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(history["status"].as_str().unwrap(), "seeded");
+        assert!(
+            !history["snapshots"].as_array().unwrap().is_empty(),
+            "history should have seeded snapshots"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            metrics["files_total"].as_u64().unwrap() > 0,
+            "seeded metrics should have populated files_total"
+        );
+        assert!(
+            !metrics["data_points"].as_array().unwrap().is_empty(),
+            "seeded metrics should have data_points"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let modules: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !modules["modules"].as_array().unwrap().is_empty(),
+            "seeded modules should be populated"
+        );
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/findings/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let findings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            findings["total"].as_u64().unwrap() > 0,
+            "seeded findings summary should have non-zero total"
+        );
+    }
 }

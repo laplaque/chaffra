@@ -1750,8 +1750,7 @@ async fn main() -> Result<()> {
         },
 
         Command::Management { port } => {
-            let project_config =
-                ChaffraConfig::load_from_dir(&std::env::current_dir()?).unwrap_or_default();
+            let project_config = load_config(cli.config.as_deref(), &std::env::current_dir()?)?;
             let effective_tel =
                 merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience);
             let audience = effective_tel.audience;
@@ -1760,6 +1759,7 @@ async fn main() -> Result<()> {
             let live_state = if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
                 chaffra_telemetry::LiveTelemetryState::new()
             } else {
+                chaffra_telemetry::seed::seed_collector(&collector);
                 chaffra_telemetry::seed::seed_live_state()
             };
             let config = chaffra_management::ManagementConfig { port };
