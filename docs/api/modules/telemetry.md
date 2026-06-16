@@ -244,11 +244,17 @@ Queryable by dimension: `history_by_module(module, window)` filters snapshots th
 - Snapshots spaced ~16 hours apart over a simulated 7-day window
 - Deterministic timestamps (base: `1_718_000_000_000`)
 
-The standalone `management` command starts with seeded data automatically.
+The `management` command behavior depends on the mode:
 
-### Management API History
+- **Default** (no `--path`): starts with seeded demo data for dashboard verification.
+- **Live** (`--path .`): runs analysis on the given directory and serves real telemetry data through all API endpoints.
+- **Off** (`--telemetry off`): starts with an empty state; all data endpoints return zero/empty defaults.
 
-The `/api/v1/metrics/history` endpoint now returns real data from the live state:
+All data endpoints (`/metrics`, `/modules`, `/findings/*`, `/health`) read from the same `LiveTelemetryState`, ensuring consistency between current values and history.
+
+### Management API
+
+All data endpoints read from `LiveTelemetryState.current()` for current values and `history_window()` for historical data. The `/api/v1/metrics/history` endpoint includes a `status` field indicating the data source:
 
 ```
 GET /api/v1/metrics/history?window=7d

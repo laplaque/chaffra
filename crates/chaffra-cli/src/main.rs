@@ -224,15 +224,25 @@ enum Command {
         #[command(subcommand)]
         action: TelemetryAction,
     },
-    /// Start a standalone management HTTP server for telemetry inspection.
+    /// Start the management HTTP server for telemetry dashboard and REST API.
     ///
-    /// Serves an empty collector with core metric definitions registered.
-    /// Useful for verifying the dashboard UI, API shape, and backend connectivity.
-    /// Co-located mode (sharing a live collector from watch/MCP/LSP) is planned.
+    /// Without --path: starts with deterministic seeded demo data for
+    /// verifying the dashboard UI, API shape, and backend connectivity.
+    ///
+    /// With --path: runs a live analysis on the given directory and serves
+    /// real telemetry data through all API endpoints.
+    ///
+    /// With --telemetry off: starts with an empty state (all endpoints
+    /// return zero/empty defaults).
     Management {
         /// Port to bind the management server to.
         #[arg(long, default_value = "9100")]
         port: u16,
+        /// Path to a project directory to analyze. When provided, runs a
+        /// live analysis and serves real telemetry data instead of seeded
+        /// demo data.
+        #[arg(long)]
+        path: Option<String>,
     },
 }
 
@@ -1314,6 +1324,7 @@ fn run_with_telemetry<F>(
     project_config: &ChaffraConfig,
     explicit_cli_audience: bool,
     command_name: &str,
+    live_state: Option<&chaffra_telemetry::LiveTelemetryState>,
     f: F,
 ) -> Result<String>
 where
@@ -1340,6 +1351,12 @@ where
     let failed = result.is_err();
     collector.record_module_call(command_name, duration_ms, failed);
 
+    let snapshot = collector.snapshot();
+
+    if let Some(ls) = live_state {
+        ls.push_snapshot(snapshot.clone());
+    }
+
     if !failed {
         let current_fingerprints = collector.finding_fingerprints();
         let state_path = std::path::Path::new(chaffra_telemetry::churn::STATE_FILE);
@@ -1362,7 +1379,6 @@ where
         if decision == chaffra_telemetry::SamplingDecision::Emit {
             let (backends, _) =
                 chaffra_telemetry::backends::create_backends(&effective_config.backends);
-            let snapshot = collector.snapshot();
             let flushed = if effective_config.audience.operator_enabled() {
                 snapshot
             } else {
@@ -1385,7 +1401,6 @@ where
     } else {
         let (backends, _) =
             chaffra_telemetry::backends::create_backends(&effective_config.backends);
-        let snapshot = collector.snapshot();
         let flushed = if effective_config.audience.operator_enabled() {
             snapshot
         } else {
@@ -1417,6 +1432,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "health",
+                    None,
                     |_collector| { cmd_health(&root, &config, formatter.as_ref()) }
                 )?
             );
@@ -1432,6 +1448,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "dead-code",
+                    None,
                     |collector| { cmd_dead_code(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1447,6 +1464,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "security",
+                    None,
                     |collector| { cmd_security(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1462,6 +1480,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "audit",
+                    None,
                     |collector| { cmd_audit(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1477,6 +1496,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "hotspot",
+                    None,
                     |collector| { cmd_hotspot(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1492,6 +1512,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "ai-quality",
+                    None,
                     |collector| { cmd_ai_quality(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1507,6 +1528,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "llm-defense",
+                    None,
                     |collector| { cmd_llm_defense(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1522,6 +1544,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "cicd-security",
+                    None,
                     |collector| {
                         cmd_cicd_security(&root, &config, formatter.as_ref(), collector)
                     }
@@ -1543,6 +1566,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "duplication",
+                    None,
                     |collector| {
                         cmd_dupes(
                             &root,
@@ -1567,6 +1591,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "architecture",
+                    None,
                     |collector| {
                         cmd_boundaries(
                             &root,
@@ -1613,6 +1638,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "fix",
+                    None,
                     |collector| { cmd_fix(&root, &config, dry_run, rule.as_deref(), collector) }
                 )?
             );
@@ -1688,6 +1714,7 @@ async fn main() -> Result<()> {
                     &config,
                     explicit_cli_audience,
                     "impact",
+                    None,
                     |collector| {
                         cmd_impact(
                             &root,
@@ -1749,17 +1776,34 @@ async fn main() -> Result<()> {
             }
         },
 
-        Command::Management { port } => {
-            let project_config = load_config(cli.config.as_deref(), &std::env::current_dir()?)?;
+        Command::Management { port, path } => {
+            let cwd = std::env::current_dir()?;
+            let project_config = load_config(cli.config.as_deref(), &cwd)?;
             let effective_tel =
                 merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience);
             let audience = effective_tel.audience;
-            let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel);
+            let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
             collector.register_core_metrics();
-            let live_state = if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
+            let live_state = if let Some(ref analysis_path) = path {
+                let root = Path::new(analysis_path)
+                    .canonicalize()
+                    .context("invalid path")?;
+                let analysis_config = load_config(cli.config.as_deref(), &root)?;
+                let analysis_collector = chaffra_telemetry::TelemetryCollector::new(effective_tel);
+                analysis_collector.register_core_metrics();
+                let host = build_module_host_with_telemetry(Some(&analysis_collector));
+                let files = discover_and_read_files(&root, &analysis_config);
+                analysis_collector.set_files_total(files.len() as u64);
+                for module_info in host.list() {
+                    let _ = host.analyze(&module_info.id, &files, &analysis_config);
+                }
+                let snapshot = analysis_collector.snapshot();
+                let state = chaffra_telemetry::LiveTelemetryState::new();
+                state.push_snapshot(snapshot);
+                state
+            } else if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
                 chaffra_telemetry::LiveTelemetryState::new()
             } else {
-                chaffra_telemetry::seed::seed_collector(&collector);
                 chaffra_telemetry::seed::seed_live_state()
             };
             let config = chaffra_management::ManagementConfig { port };
@@ -2850,9 +2894,14 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
 
         let formatter = create_formatter(OutputFormat::Terminal);
-        let output = run_with_telemetry(&tel_config, &config, false, "dead-code", |collector| {
-            cmd_dead_code(&root, &config, formatter.as_ref(), collector)
-        })
+        let output = run_with_telemetry(
+            &tel_config,
+            &config,
+            false,
+            "dead-code",
+            None,
+            |collector| cmd_dead_code(&root, &config, formatter.as_ref(), collector),
+        )
         .unwrap();
 
         std::env::set_current_dir(&original_dir).unwrap();
@@ -2897,9 +2946,14 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
-        let result = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
-            anyhow::bail!("simulated analysis failure")
-        });
+        let result = run_with_telemetry(
+            &tel_config,
+            &config,
+            false,
+            "failing-cmd",
+            None,
+            |_collector| anyhow::bail!("simulated analysis failure"),
+        );
 
         std::env::set_current_dir(&original_dir).unwrap();
 
@@ -2944,9 +2998,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
-            anyhow::bail!("simulated analysis failure")
-        });
+        let result = run_with_telemetry(
+            &tel_config,
+            &config,
+            false,
+            "failing-cmd",
+            None,
+            |_collector| anyhow::bail!("simulated analysis failure"),
+        );
 
         assert!(result.is_err());
 
@@ -3015,9 +3074,14 @@ mod tests {
             ..Default::default()
         };
 
-        let _ = run_with_telemetry(&tel_config, &config, false, "failing-cmd", |_collector| {
-            anyhow::bail!("simulated failure to trigger error flush")
-        });
+        let _ = run_with_telemetry(
+            &tel_config,
+            &config,
+            false,
+            "failing-cmd",
+            None,
+            |_collector| anyhow::bail!("simulated failure to trigger error flush"),
+        );
 
         assert!(
             telemetry_path.exists(),
@@ -3063,9 +3127,14 @@ mod tests {
         };
 
         let formatter = create_formatter(OutputFormat::Terminal);
-        let _ = run_with_telemetry(&tel_config, &config, false, "dead-code", |collector| {
-            cmd_dead_code(&root, &config, formatter.as_ref(), collector)
-        });
+        let _ = run_with_telemetry(
+            &tel_config,
+            &config,
+            false,
+            "dead-code",
+            None,
+            |collector| cmd_dead_code(&root, &config, formatter.as_ref(), collector),
+        );
 
         assert!(
             telemetry_path.exists(),

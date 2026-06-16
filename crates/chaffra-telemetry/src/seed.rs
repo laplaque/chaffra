@@ -39,39 +39,6 @@ pub fn seed_live_state() -> LiveTelemetryState {
     state
 }
 
-/// Populate a `TelemetryCollector` with the latest seeded snapshot data.
-///
-/// This ensures primary management endpoints (`/metrics`, `/modules`,
-/// `/findings/summary`, etc.) return populated data in demo/seeded mode,
-/// consistent with the history endpoint.
-pub fn seed_collector(collector: &crate::TelemetryCollector) {
-    let snapshot = build_seeded_snapshot(BASE_TS + 11 * SNAPSHOT_INTERVAL, 11);
-
-    collector.set_files_total(snapshot.user_summary.files_total);
-
-    for (module_id, summary) in &snapshot.user_summary.module_summaries {
-        let had_error = snapshot
-            .operator_summary
-            .module_error_counts
-            .get(module_id)
-            .copied()
-            .unwrap_or(0)
-            > 0;
-        collector.record_module_call(module_id, summary.duration_ms, had_error);
-
-        let severities: HashMap<String, u64> = snapshot
-            .user_summary
-            .findings_by_severity
-            .iter()
-            .filter(|(_, count)| **count > 0)
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        collector.record_module_findings(module_id, summary.finding_count, &severities);
-    }
-
-    collector.record_data_points(snapshot.data_points);
-}
-
 fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     // --- Module summaries ---
     let mut module_summaries = HashMap::new();

@@ -96,6 +96,7 @@ mod tests {
                 .collect(),
         );
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         Arc::new(SharedState {
             collector,
             live_state,
@@ -194,6 +195,7 @@ mod tests {
         collector.record_finding_churn(&churn);
 
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         let state = Arc::new(SharedState {
             collector,
             live_state,
@@ -235,6 +237,7 @@ mod tests {
         collector.record_module_summary_metric("complexity", "health_score", 85.0);
 
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         let state = Arc::new(SharedState {
             collector,
             live_state,
@@ -271,7 +274,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_history_endpoint_empty() {
-        let app = build_router(test_state());
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
         let resp = app
             .oneshot(
                 Request::get("/api/v1/metrics/history?window=7d")
@@ -412,6 +422,7 @@ mod tests {
         collector.record_module_call("dead-code", 150, false);
         collector.set_files_total(10);
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         let state = Arc::new(SharedState {
             collector,
             live_state,
@@ -447,6 +458,7 @@ mod tests {
         collector.record_module_call("dead-code", 150, false);
         collector.set_files_total(10);
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         let state = Arc::new(SharedState {
             collector,
             live_state,
@@ -478,6 +490,7 @@ mod tests {
         collector.record_module_call("dead-code", 150, true);
         collector.set_files_total(1);
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         let state = Arc::new(SharedState {
             collector,
             live_state,
@@ -509,6 +522,7 @@ mod tests {
         collector.record_module_call("dead-code", 150, true);
         collector.set_files_total(1);
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
         let state = Arc::new(SharedState {
             collector,
             live_state,
@@ -564,7 +578,6 @@ mod tests {
     #[tokio::test]
     async fn test_seeded_management_populates_all_endpoints() {
         let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
-        chaffra_telemetry::seed::seed_collector(&collector);
         let live_state = chaffra_telemetry::seed::seed_live_state();
         let state = Arc::new(SharedState {
             collector,
@@ -640,5 +653,177 @@ mod tests {
             findings["total"].as_u64().unwrap() > 0,
             "seeded findings summary should have non-zero total"
         );
+    }
+
+    #[tokio::test]
+    async fn test_empty_live_state_returns_defaults() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics["files_total"], 0);
+        assert!(metrics["data_points"].as_array().unwrap().is_empty());
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let modules: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(modules["modules"].as_array().unwrap().is_empty());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/findings/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let findings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(findings["total"], 0);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/findings/churn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let churn: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(churn["new_count"], 0);
+        assert_eq!(churn["churn_rate"], 0.0);
+
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(health["score"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_live_snapshot_feeds_all_endpoints() {
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        collector.set_files_total(50);
+        collector.record_module_call("complexity", 200, false);
+        collector.record_module_findings(
+            "complexity",
+            7,
+            &[("warning".to_owned(), 4), ("info".to_owned(), 3)]
+                .into_iter()
+                .collect(),
+        );
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        let churn = chaffra_telemetry::churn::ChurnResult {
+            new_count: 2,
+            resolved_count: 1,
+            unchanged_count: 4,
+            churn_rate: 0.33,
+        };
+        collector.record_finding_churn(&churn);
+
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
+        });
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics["files_total"], 50);
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let modules: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mods = modules["modules"].as_array().unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0]["id"], "complexity");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/findings/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let findings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(findings["total"], 7);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/findings/churn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let churn_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(churn_resp["new_count"], 2);
+
+        let resp = app
+            .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["score"], 88.0);
+        assert_eq!(health["grade"], "B");
     }
 }

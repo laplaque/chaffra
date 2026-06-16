@@ -97,7 +97,26 @@ fn default_window() -> String {
 }
 
 pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<MetricsResponse> {
-    let raw_snapshot = state.collector.snapshot();
+    let (_, statuses) =
+        chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
+    let backends = statuses
+        .into_iter()
+        .map(|s| BackendStatusEntry {
+            name: s.name,
+            kind: s.kind,
+            connected: s.connected,
+            message: s.message,
+        })
+        .collect();
+
+    let Some(raw_snapshot) = state.live_state.current() else {
+        return Json(MetricsResponse {
+            files_total: 0,
+            analysis_duration_ms: 0,
+            data_points: Vec::new(),
+            backends,
+        });
+    };
     let snapshot = if state.audience.operator_enabled() {
         raw_snapshot
     } else {
@@ -110,18 +129,6 @@ pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<
             name: dp.name.clone(),
             value: dp.value,
             labels: dp.labels.clone(),
-        })
-        .collect();
-
-    let (_, statuses) =
-        chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
-    let backends = statuses
-        .into_iter()
-        .map(|s| BackendStatusEntry {
-            name: s.name,
-            kind: s.kind,
-            connected: s.connected,
-            message: s.message,
         })
         .collect();
 
@@ -180,7 +187,11 @@ pub async fn get_metrics_history(
 }
 
 pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<ModulesResponse> {
-    let snapshot = state.collector.snapshot();
+    let Some(snapshot) = state.live_state.current() else {
+        return Json(ModulesResponse {
+            modules: Vec::new(),
+        });
+    };
     let include_operator = state.audience.operator_enabled();
     let modules = snapshot
         .user_summary
@@ -215,7 +226,13 @@ pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<
 pub async fn get_findings_summary(
     state: axum::extract::State<Arc<SharedState>>,
 ) -> Json<FindingsSummaryResponse> {
-    let snapshot = state.collector.snapshot();
+    let Some(snapshot) = state.live_state.current() else {
+        return Json(FindingsSummaryResponse {
+            total: 0,
+            by_module: HashMap::new(),
+            by_severity: HashMap::new(),
+        });
+    };
     let total = snapshot
         .user_summary
         .findings_by_module
@@ -232,7 +249,14 @@ pub async fn get_findings_summary(
 pub async fn get_findings_churn(
     state: axum::extract::State<Arc<SharedState>>,
 ) -> Json<FindingsChurnResponse> {
-    let snapshot = state.collector.snapshot();
+    let Some(snapshot) = state.live_state.current() else {
+        return Json(FindingsChurnResponse {
+            new_count: 0,
+            resolved_count: 0,
+            unchanged_count: 0,
+            churn_rate: 0.0,
+        });
+    };
     let churn_new = snapshot
         .data_points
         .iter()
@@ -267,7 +291,13 @@ pub async fn get_findings_churn(
 }
 
 pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<HealthResponse> {
-    let snapshot = state.collector.snapshot();
+    let Some(snapshot) = state.live_state.current() else {
+        return Json(HealthResponse {
+            score: None,
+            grade: "\u{2014}".to_owned(),
+            files: Vec::new(),
+        });
+    };
     let health_scores: Vec<f64> = snapshot
         .data_points
         .iter()
