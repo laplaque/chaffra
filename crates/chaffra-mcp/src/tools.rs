@@ -569,4 +569,118 @@ mod tests {
             chaffra_telemetry::TelemetryAudience::Off
         ));
     }
+
+    #[test]
+    fn test_merge_project_telemetry_config_invalid_audience_keeps_server() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert(
+            "audience".to_owned(),
+            toml::Value::String("bogus".to_owned()),
+        );
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let merged = merge_project_telemetry_config(&server, &project);
+        assert_eq!(merged.audience, server.audience);
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_sampling() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert(
+            "sampling-rate".to_owned(),
+            toml::Value::String("0.5".to_owned()),
+        );
+        tel_section.insert(
+            "sampling-strategy".to_owned(),
+            toml::Value::String("on-change".to_owned()),
+        );
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let merged = merge_project_telemetry_config(&server, &project);
+        assert!((merged.sampling_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_non_off_audience_preserves_server() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert("audience".to_owned(), toml::Value::String("on".to_owned()));
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let merged = merge_project_telemetry_config(&server, &project);
+        assert_eq!(merged.audience, server.audience);
+    }
+
+    #[test]
+    fn test_record_analysis_and_push_off_mode() {
+        let host = build_module_host();
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let mut off_config = tc();
+        off_config.audience = chaffra_telemetry::TelemetryAudience::Off;
+        let config = ChaffraConfig::default();
+        let result = record_analysis_and_push(&host, "dead-code", &[], &config, &ls, &off_config);
+        assert!(result.is_ok());
+        assert!(ls.current().is_none());
+    }
+
+    #[test]
+    fn test_record_analysis_and_push_populates_live_state() {
+        let host = build_module_host();
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let config = ChaffraConfig::default();
+        let result = record_analysis_and_push(&host, "dead-code", &[], &config, &ls, &tc());
+        assert!(result.is_ok());
+        assert!(ls.current().is_some());
+    }
+
+    #[test]
+    fn test_dispatch_telemetry_status() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = dispatch_tool(
+            "chaffra/telemetry",
+            &serde_json::json!({"action": "status"}),
+            &ls,
+            &tc(),
+        );
+        assert!(result.is_error.is_none());
+    }
+
+    #[test]
+    fn test_dispatch_telemetry_snapshot_empty() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = dispatch_tool(
+            "chaffra/telemetry",
+            &serde_json::json!({"action": "snapshot"}),
+            &ls,
+            &tc(),
+        );
+        assert!(result.is_error.is_none());
+        assert!(result.content[0].text.contains("No telemetry"));
+    }
+
+    #[test]
+    fn test_dispatch_telemetry_backends() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = dispatch_tool(
+            "chaffra/telemetry",
+            &serde_json::json!({"action": "backends"}),
+            &ls,
+            &tc(),
+        );
+        assert!(result.is_error.is_none());
+    }
+
+    #[test]
+    fn test_dispatch_telemetry_unknown_action() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = dispatch_tool(
+            "chaffra/telemetry",
+            &serde_json::json!({"action": "invalid"}),
+            &ls,
+            &tc(),
+        );
+        assert_eq!(result.is_error, Some(true));
+    }
 }
