@@ -335,7 +335,16 @@ fn load_config(config_path: Option<&str>, analysis_path: &Path) -> Result<Chaffr
     if let Some(path) = config_path {
         ChaffraConfig::load(Path::new(path)).context("failed to load configuration file")
     } else {
-        Ok(ChaffraConfig::load_from_dir(analysis_path).unwrap_or_default())
+        match ChaffraConfig::load_from_dir(analysis_path) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                if analysis_path.join(".chaffra.toml").exists() {
+                    Err(e).context("malformed .chaffra.toml")
+                } else {
+                    Ok(ChaffraConfig::default())
+                }
+            }
+        }
     }
 }
 

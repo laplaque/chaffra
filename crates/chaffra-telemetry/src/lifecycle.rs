@@ -69,7 +69,12 @@ fn finalize_inner(
             .unwrap_or_default()
             .as_millis() as u64,
     };
-    let _ = churn::save_state(&new_state, state_path);
+    if let Err(e) = churn::save_state(&new_state, state_path) {
+        eprintln!(
+            "Warning: failed to persist telemetry churn state to {}: {e}",
+            state_path.display()
+        );
+    }
 
     FinalizeResult {
         snapshot,

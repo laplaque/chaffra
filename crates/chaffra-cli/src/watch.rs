@@ -76,6 +76,7 @@ fn is_source_file(path: &Path) -> bool {
 pub struct AnalysisOutput {
     pub text: String,
     pub findings: Vec<chaffra_core::diagnostic::Finding>,
+    pub had_module_error: bool,
 }
 
 /// Run analysis on changed files and print results.
@@ -92,6 +93,7 @@ pub fn run_analysis_on_changes(
         return Ok(AnalysisOutput {
             text: String::new(),
             findings: Vec::new(),
+            had_module_error: false,
         });
     }
 
@@ -115,6 +117,7 @@ pub fn run_analysis_on_changes(
         return Ok(AnalysisOutput {
             text: String::new(),
             findings: Vec::new(),
+            had_module_error: false,
         });
     }
 
@@ -122,25 +125,38 @@ pub fn run_analysis_on_changes(
     let formatter = create_formatter(format);
     let mut output = String::new();
     let mut all_findings = Vec::new();
+    let mut had_module_error = false;
 
     for module_id in &["dead-code", "complexity"] {
-        if let Ok(result) = host.analyze(module_id, &files, config) {
-            if let Some(c) = collector {
-                let mut sev_counts = std::collections::HashMap::new();
-                for finding in &result.findings {
-                    let sev = match finding.severity {
-                        chaffra_core::diagnostic::Severity::Error => "error",
-                        chaffra_core::diagnostic::Severity::Warning => "warning",
-                        chaffra_core::diagnostic::Severity::Info => "info",
-                    };
-                    *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+        let start = std::time::Instant::now();
+        match host.analyze(module_id, &files, config) {
+            Ok(result) => {
+                if let Some(c) = collector {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    c.record_module_call(module_id, duration_ms, false);
+                    let mut sev_counts = std::collections::HashMap::new();
+                    for finding in &result.findings {
+                        let sev = match finding.severity {
+                            chaffra_core::diagnostic::Severity::Error => "error",
+                            chaffra_core::diagnostic::Severity::Warning => "warning",
+                            chaffra_core::diagnostic::Severity::Info => "info",
+                        };
+                        *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+                    }
+                    c.record_module_findings(module_id, result.findings.len() as u64, &sev_counts);
                 }
-                c.record_module_findings(module_id, result.findings.len() as u64, &sev_counts);
+                if !result.findings.is_empty() {
+                    output.push_str(&formatter.format_findings(&result.findings));
+                }
+                all_findings.extend(result.findings);
             }
-            if !result.findings.is_empty() {
-                output.push_str(&formatter.format_findings(&result.findings));
+            Err(_) => {
+                if let Some(c) = collector {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    c.record_module_call(module_id, duration_ms, true);
+                }
+                had_module_error = true;
             }
-            all_findings.extend(result.findings);
         }
     }
 
@@ -155,6 +171,7 @@ pub fn run_analysis_on_changes(
     Ok(AnalysisOutput {
         text: output,
         findings: all_findings,
+        had_module_error,
     })
 }
 
@@ -200,7 +217,7 @@ pub(crate) fn run_watch_iteration(
     match run_analysis_on_changes(changed, root, config, format, Some(&collector)) {
         Ok(ao) => {
             let duration_ms = start.elapsed().as_millis() as u64;
-            collector.record_module_call("watch", duration_ms, false);
+            collector.record_module_call("watch", duration_ms, ao.had_module_error);
 
             collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
 
