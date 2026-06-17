@@ -11,6 +11,7 @@ pub struct McpServer {
     initialized: bool,
     live_state: chaffra_telemetry::LiveTelemetryState,
     tel_config: chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 }
 
 impl McpServer {
@@ -18,11 +19,13 @@ impl McpServer {
     pub fn new(
         live_state: chaffra_telemetry::LiveTelemetryState,
         tel_config: chaffra_telemetry::TelemetryConfig,
+        explicit_cli_audience: bool,
     ) -> Self {
         Self {
             initialized: false,
             live_state,
             tel_config,
+            explicit_cli_audience,
         }
     }
 
@@ -144,8 +147,13 @@ impl McpServer {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        let result =
-            tools::dispatch_tool(&tool_name, &tool_args, &self.live_state, &self.tel_config);
+        let result = tools::dispatch_tool(
+            &tool_name,
+            &tool_args,
+            &self.live_state,
+            &self.tel_config,
+            self.explicit_cli_audience,
+        );
         JsonRpcResponse::success(request.id.clone(), serde_json::to_value(result).unwrap())
     }
 
@@ -159,6 +167,7 @@ impl Default for McpServer {
         Self::new(
             chaffra_telemetry::LiveTelemetryState::new(),
             chaffra_telemetry::TelemetryConfig::default(),
+            false,
         )
     }
 }

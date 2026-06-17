@@ -183,15 +183,21 @@ impl TelemetryConfig {
             .get("sampling-rate")
             .or_else(|| config.get("sampling_rate"))
         {
-            Some(v) => v
-                .parse::<f64>()
-                .map_err(|_| {
+            Some(v) => {
+                let rate = v.parse::<f64>().map_err(|_| {
                     format!(
                         "invalid [modules.telemetry] sampling-rate: {v:?}; \
                      expected a number between 0.0 and 1.0"
                     )
-                })?
-                .clamp(0.0, 1.0),
+                })?;
+                if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
+                    return Err(format!(
+                        "invalid [modules.telemetry] sampling-rate: {v:?}; \
+                         must be between 0.0 and 1.0"
+                    ));
+                }
+                rate
+            }
             None => 1.0,
         };
 
@@ -366,15 +372,26 @@ mod tests {
     }
 
     #[test]
-    fn test_sampling_rate_clamped() {
+    fn test_sampling_rate_out_of_range_rejected() {
         let mut mc = HashMap::new();
         mc.insert("sampling-rate".to_owned(), "5.0".to_owned());
-        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
-        assert!((cfg.sampling_rate - 1.0).abs() < f64::EPSILON);
+        let result = TelemetryConfig::from_module_config(&mc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sampling-rate"));
 
         mc.insert("sampling-rate".to_owned(), "-1.0".to_owned());
-        let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
-        assert!((cfg.sampling_rate - 0.0).abs() < f64::EPSILON);
+        let result = TelemetryConfig::from_module_config(&mc);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sampling_rate_non_finite_rejected() {
+        let mut mc = HashMap::new();
+        mc.insert("sampling-rate".to_owned(), "inf".to_owned());
+        assert!(TelemetryConfig::from_module_config(&mc).is_err());
+
+        mc.insert("sampling-rate".to_owned(), "nan".to_owned());
+        assert!(TelemetryConfig::from_module_config(&mc).is_err());
     }
 
     #[test]

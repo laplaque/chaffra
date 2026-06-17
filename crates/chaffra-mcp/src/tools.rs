@@ -19,12 +19,13 @@ pub fn build_module_host() -> GrpcModuleHost {
 fn merge_project_telemetry_config(
     server_config: &chaffra_telemetry::TelemetryConfig,
     project_config: &ChaffraConfig,
+    explicit_cli_audience: bool,
 ) -> Result<chaffra_telemetry::TelemetryConfig, String> {
     let module_cfg = project_config.module_config("telemetry");
     if module_cfg.is_empty() {
         return Ok(server_config.clone());
     }
-    server_config.merge_project_config(&module_cfg, false)
+    server_config.merge_project_config(&module_cfg, explicit_cli_audience)
 }
 
 fn record_analysis_and_push(
@@ -172,6 +173,7 @@ pub fn execute_health(
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 ) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -180,11 +182,20 @@ pub fn execute_health(
         Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
     };
 
-    let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
-    let effective_tel = match merge_project_telemetry_config(tel_config, &config) {
-        Ok(cfg) => cfg,
-        Err(e) => return ToolCallResult::error(format!("Invalid telemetry config: {e}")),
+    let config = match ChaffraConfig::load_from_dir(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            if root.join(".chaffra.toml").exists() {
+                return ToolCallResult::error(format!("Malformed project config: {e}"));
+            }
+            ChaffraConfig::default()
+        }
     };
+    let effective_tel =
+        match merge_project_telemetry_config(tel_config, &config, explicit_cli_audience) {
+            Ok(cfg) => cfg,
+            Err(e) => return ToolCallResult::error(format!("Invalid telemetry config: {e}")),
+        };
     let files = discover_and_read_files(&root, &config);
 
     if files.is_empty() {
@@ -219,6 +230,7 @@ pub fn execute_dead_code(
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 ) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -227,11 +239,20 @@ pub fn execute_dead_code(
         Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
     };
 
-    let config = ChaffraConfig::load_from_dir(&root).unwrap_or_default();
-    let effective_tel = match merge_project_telemetry_config(tel_config, &config) {
-        Ok(cfg) => cfg,
-        Err(e) => return ToolCallResult::error(format!("Invalid telemetry config: {e}")),
+    let config = match ChaffraConfig::load_from_dir(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            if root.join(".chaffra.toml").exists() {
+                return ToolCallResult::error(format!("Malformed project config: {e}"));
+            }
+            ChaffraConfig::default()
+        }
     };
+    let effective_tel =
+        match merge_project_telemetry_config(tel_config, &config, explicit_cli_audience) {
+            Ok(cfg) => cfg,
+            Err(e) => return ToolCallResult::error(format!("Invalid telemetry config: {e}")),
+        };
     let files = discover_and_read_files(&root, &config);
 
     if files.is_empty() {
@@ -341,10 +362,13 @@ pub fn dispatch_tool(
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 ) -> ToolCallResult {
     match name {
-        "chaffra/health" => execute_health(params, live_state, tel_config),
-        "chaffra/dead-code" => execute_dead_code(params, live_state, tel_config),
+        "chaffra/health" => execute_health(params, live_state, tel_config, explicit_cli_audience),
+        "chaffra/dead-code" => {
+            execute_dead_code(params, live_state, tel_config, explicit_cli_audience)
+        }
         "chaffra/explain" => execute_explain(params),
         "chaffra/telemetry" => execute_telemetry(params, live_state, tel_config),
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
@@ -389,7 +413,7 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_tool() {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
-        let result = dispatch_tool("unknown/tool", &serde_json::json!({}), &ls, &tc());
+        let result = dispatch_tool("unknown/tool", &serde_json::json!({}), &ls, &tc(), false);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Unknown tool"));
     }
@@ -421,6 +445,7 @@ mod tests {
             &serde_json::json!({"path": "/nonexistent/path/xyz"}),
             &ls,
             &tc(),
+            false,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
@@ -433,6 +458,7 @@ mod tests {
             &serde_json::json!({"path": "/nonexistent/path/xyz"}),
             &ls,
             &tc(),
+            false,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
@@ -447,6 +473,7 @@ mod tests {
             &serde_json::json!({"path": dir.to_str().unwrap()}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
@@ -462,6 +489,7 @@ mod tests {
             &serde_json::json!({"path": dir.to_str().unwrap()}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
@@ -478,6 +506,7 @@ mod tests {
             &serde_json::json!({"path": dir.to_str().unwrap()}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -493,6 +522,7 @@ mod tests {
             &serde_json::json!({"path": dir.to_str().unwrap()}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -506,6 +536,7 @@ mod tests {
             &serde_json::json!({"rule_id": "dead-code:unused-function"}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
     }
@@ -521,7 +552,7 @@ mod tests {
     fn test_merge_project_telemetry_config_no_module_section() {
         let server = tc();
         let project = ChaffraConfig::default();
-        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        let merged = merge_project_telemetry_config(&server, &project, false).unwrap();
         assert_eq!(merged.audience, server.audience);
     }
 
@@ -532,7 +563,7 @@ mod tests {
         let mut tel_section = std::collections::HashMap::new();
         tel_section.insert("audience".to_owned(), toml::Value::String("off".to_owned()));
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        let merged = merge_project_telemetry_config(&server, &project, false).unwrap();
         assert!(matches!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::Off
@@ -549,7 +580,7 @@ mod tests {
             toml::Value::String("bogus".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let result = merge_project_telemetry_config(&server, &project);
+        let result = merge_project_telemetry_config(&server, &project, false);
         assert!(result.is_err());
     }
 
@@ -567,7 +598,7 @@ mod tests {
             toml::Value::String("on-change".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        let merged = merge_project_telemetry_config(&server, &project, false).unwrap();
         assert!((merged.sampling_rate - 0.5).abs() < f64::EPSILON);
     }
 
@@ -578,7 +609,7 @@ mod tests {
         let mut tel_section = std::collections::HashMap::new();
         tel_section.insert("audience".to_owned(), toml::Value::String("on".to_owned()));
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        let merged = merge_project_telemetry_config(&server, &project, false).unwrap();
         assert_eq!(merged.audience, chaffra_telemetry::TelemetryAudience::On);
     }
 
@@ -592,7 +623,7 @@ mod tests {
             toml::Value::String("operator-only".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let merged = merge_project_telemetry_config(&server, &project).unwrap();
+        let merged = merge_project_telemetry_config(&server, &project, false).unwrap();
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly
@@ -609,7 +640,7 @@ mod tests {
             toml::Value::String("bogus-sink".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let result = merge_project_telemetry_config(&server, &project);
+        let result = merge_project_telemetry_config(&server, &project, false);
         assert!(result.is_err());
     }
 
@@ -623,7 +654,7 @@ mod tests {
             toml::Value::String("not-a-number".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let result = merge_project_telemetry_config(&server, &project);
+        let result = merge_project_telemetry_config(&server, &project, false);
         assert!(result.is_err());
     }
 
@@ -637,8 +668,23 @@ mod tests {
             toml::Value::String("bogus-strategy".to_owned()),
         );
         project.modules.insert("telemetry".to_owned(), tel_section);
-        let result = merge_project_telemetry_config(&server, &project);
+        let result = merge_project_telemetry_config(&server, &project, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_project_telemetry_config_explicit_cli_audience_wins() {
+        let server = tc();
+        let mut project = ChaffraConfig::default();
+        let mut tel_section = std::collections::HashMap::new();
+        tel_section.insert("audience".to_owned(), toml::Value::String("on".to_owned()));
+        project.modules.insert("telemetry".to_owned(), tel_section);
+        let merged = merge_project_telemetry_config(&server, &project, true).unwrap();
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+            "explicit CLI audience must override project config"
+        );
     }
 
     #[test]
@@ -671,6 +717,7 @@ mod tests {
             &serde_json::json!({"action": "status"}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
     }
@@ -683,6 +730,7 @@ mod tests {
             &serde_json::json!({"action": "snapshot"}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No telemetry"));
@@ -696,6 +744,7 @@ mod tests {
             &serde_json::json!({"action": "backends"}),
             &ls,
             &tc(),
+            false,
         );
         assert!(result.is_error.is_none());
     }
@@ -708,6 +757,7 @@ mod tests {
             &serde_json::json!({"action": "invalid"}),
             &ls,
             &tc(),
+            false,
         );
         assert_eq!(result.is_error, Some(true));
     }

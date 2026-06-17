@@ -1128,15 +1128,17 @@ fn build_telemetry_config(cli: &Cli) -> Result<(chaffra_telemetry::TelemetryConf
     };
 
     let backends = if let Some(ref backend_str) = cli.telemetry_backend {
-        if let Some(kind) = chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
-            vec![chaffra_telemetry::BackendConfig {
+        match chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
+            Some(kind) => vec![chaffra_telemetry::BackendConfig {
                 kind,
                 endpoint: cli.telemetry_endpoint.clone(),
                 path: None,
                 options: HashMap::new(),
-            }]
-        } else {
-            chaffra_telemetry::TelemetryConfig::default().backends
+            }],
+            None => anyhow::bail!(
+                "invalid --telemetry-backend value: {backend_str:?}; \
+                 valid values: json-file, stderr, prometheus, otlp, statsd, cloudwatch"
+            ),
         }
     } else if let Some(ref endpoint) = cli.telemetry_endpoint {
         vec![chaffra_telemetry::BackendConfig {
@@ -1550,7 +1552,11 @@ async fn main() -> Result<()> {
         }
 
         Command::Mcp => {
-            let mut server = chaffra_mcp::McpServer::new(live_state.clone(), tel_config.clone());
+            let mut server = chaffra_mcp::McpServer::new(
+                live_state.clone(),
+                tel_config.clone(),
+                explicit_cli_audience,
+            );
             server
                 .run()
                 .await
@@ -1558,7 +1564,12 @@ async fn main() -> Result<()> {
         }
 
         Command::Lsp => {
-            lsp::run_lsp_server(live_state.clone(), tel_config.clone()).await?;
+            lsp::run_lsp_server(
+                live_state.clone(),
+                tel_config.clone(),
+                explicit_cli_audience,
+            )
+            .await?;
         }
 
         Command::Fix {
@@ -1775,7 +1786,7 @@ async fn main() -> Result<()> {
                 analysis_collector
                     .set_finding_fingerprints(fingerprints_from_findings(&all_findings));
                 let state = chaffra_telemetry::LiveTelemetryState::new();
-                chaffra_telemetry::finalize_and_flush(
+                chaffra_telemetry::finalize_and_flush_sampled(
                     &analysis_collector,
                     &state,
                     analysis_collector.config(),

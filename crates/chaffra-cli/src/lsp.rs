@@ -99,12 +99,13 @@ pub fn finding_to_diagnostic(finding: &Finding) -> Diagnostic {
 pub(crate) fn merge_lsp_telemetry_config(
     server_config: &chaffra_telemetry::TelemetryConfig,
     workspace_config: &chaffra_core::config::ChaffraConfig,
+    explicit_cli_audience: bool,
 ) -> Result<Option<chaffra_telemetry::TelemetryConfig>, String> {
     let module_cfg = workspace_config.module_config("telemetry");
     if module_cfg.is_empty() {
         return Ok(Some(server_config.clone()));
     }
-    let merged = server_config.merge_project_config(&module_cfg, false)?;
+    let merged = server_config.merge_project_config(&module_cfg, explicit_cli_audience)?;
     if matches!(merged.audience, chaffra_telemetry::TelemetryAudience::Off) {
         return Ok(None);
     }
@@ -117,6 +118,7 @@ pub fn analyze_file_for_diagnostics(
     content: &[u8],
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 ) -> HashMap<String, Vec<Diagnostic>> {
     use chaffra_core::config::ChaffraConfig;
     use chaffra_core::diagnostic::FileInfo;
@@ -142,28 +144,35 @@ pub fn analyze_file_for_diagnostics(
         content: content.to_vec(),
     }];
 
-    let workspace_config = Path::new(file_path)
-        .parent()
-        .and_then(|dir| {
-            let mut d = dir;
-            loop {
-                let candidate = d.join(".chaffra.toml");
-                if candidate.exists() {
-                    return Some(ChaffraConfig::load_from_dir(d).unwrap_or_default());
-                }
-                d = d.parent()?;
+    let workspace_config = match Path::new(file_path).parent().and_then(|dir| {
+        let mut d = dir;
+        loop {
+            let candidate = d.join(".chaffra.toml");
+            if candidate.exists() {
+                return Some(d.to_path_buf());
             }
-        })
-        .unwrap_or_default();
-
-    let effective_tel = match merge_lsp_telemetry_config(tel_config, &workspace_config) {
-        Ok(Some(merged)) => merged,
-        Ok(None) => return analyze_file_no_telemetry(file_path, content),
-        Err(e) => {
-            eprintln!("Invalid workspace telemetry config: {e}");
-            return analyze_file_no_telemetry(file_path, content);
+            d = d.parent()?;
         }
+    }) {
+        Some(config_dir) => match ChaffraConfig::load_from_dir(&config_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Malformed workspace config, disabling telemetry: {e}");
+                return analyze_file_no_telemetry(file_path, content);
+            }
+        },
+        None => ChaffraConfig::default(),
     };
+
+    let effective_tel =
+        match merge_lsp_telemetry_config(tel_config, &workspace_config, explicit_cli_audience) {
+            Ok(Some(merged)) => merged,
+            Ok(None) => return analyze_file_no_telemetry(file_path, content),
+            Err(e) => {
+                eprintln!("Invalid workspace telemetry config: {e}");
+                return analyze_file_no_telemetry(file_path, content);
+            }
+        };
 
     let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
     collector.register_core_metrics();
@@ -304,6 +313,7 @@ async fn read_content_length(reader: &mut BufReader<tokio::io::Stdin>) -> Result
 pub async fn run_lsp_server(
     live_state: chaffra_telemetry::LiveTelemetryState,
     tel_config: chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 ) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -323,7 +333,8 @@ pub async fn run_lsp_server(
             Err(_) => continue,
         };
 
-        let responses = handle_lsp_request(&request, &live_state, &tel_config);
+        let responses =
+            handle_lsp_request(&request, &live_state, &tel_config, explicit_cli_audience);
         for resp in responses {
             let json = serde_json::to_string(&resp)?;
             stdout
@@ -341,6 +352,7 @@ fn handle_lsp_request(
     request: &LspRequest,
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
 ) -> Vec<LspResponse> {
     match request.method.as_str() {
         "initialize" => {
@@ -383,7 +395,11 @@ fn handle_lsp_request(
 
                     if let Ok(content) = std::fs::read(file_path) {
                         let diagnostics_map = analyze_file_for_diagnostics(
-                            file_path, &content, live_state, tel_config,
+                            file_path,
+                            &content,
+                            live_state,
+                            tel_config,
+                            explicit_cli_audience,
                         );
 
                         let mut responses = Vec::new();
@@ -437,8 +453,13 @@ fn handle_lsp_request(
                     let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
                     let content = open_params.text_document.text.as_bytes();
 
-                    let diagnostics_map =
-                        analyze_file_for_diagnostics(file_path, content, live_state, tel_config);
+                    let diagnostics_map = analyze_file_for_diagnostics(
+                        file_path,
+                        content,
+                        live_state,
+                        tel_config,
+                        explicit_cli_audience,
+                    );
 
                     let mut responses = Vec::new();
                     for (path, diags) in diagnostics_map {
@@ -569,7 +590,7 @@ mod tests {
             method: "initialize".to_owned(),
             params: Some(serde_json::json!({})),
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert_eq!(responses.len(), 1);
         assert!(responses[0].result.is_some());
         let result = responses[0].result.as_ref().unwrap();
@@ -585,7 +606,7 @@ mod tests {
             method: "initialized".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert!(responses.is_empty());
     }
 
@@ -598,7 +619,7 @@ mod tests {
             method: "shutdown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
@@ -612,7 +633,7 @@ mod tests {
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert_eq!(responses.len(), 1);
     }
 
@@ -625,7 +646,7 @@ mod tests {
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert!(responses.is_empty());
     }
 
@@ -638,7 +659,7 @@ mod tests {
             method: "textDocument/hover".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
@@ -652,7 +673,7 @@ mod tests {
             method: "textDocument/didSave".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config());
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
         assert!(responses.is_empty());
     }
 
@@ -661,7 +682,7 @@ mod tests {
         let ls = test_live_state();
         let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
         let diagnostics =
-            analyze_file_for_diagnostics("/tmp/test.go", content, &ls, &test_tel_config());
+            analyze_file_for_diagnostics("/tmp/test.go", content, &ls, &test_tel_config(), false);
         // Should produce at least dead-code findings for unused function.
         let all_diags: Vec<&Diagnostic> = diagnostics.values().flatten().collect();
         // The analysis should run without panicking.
@@ -673,7 +694,7 @@ mod tests {
         let ls = test_live_state();
         let content = b"some content";
         let diagnostics =
-            analyze_file_for_diagnostics("/tmp/test.txt", content, &ls, &test_tel_config());
+            analyze_file_for_diagnostics("/tmp/test.txt", content, &ls, &test_tel_config(), false);
         // Unknown extension should produce no diagnostics.
         let total: usize = diagnostics.values().map(|v| v.len()).sum();
         assert_eq!(total, 0);
@@ -720,7 +741,7 @@ mod tests {
     fn test_merge_lsp_config_off_returns_none() {
         let server = test_tel_config();
         let workspace = make_workspace_config_with_telemetry(vec![("audience", "off")]);
-        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        let result = merge_lsp_telemetry_config(&server, &workspace, false).unwrap();
         assert!(result.is_none(), "audience=off should return None");
     }
 
@@ -731,7 +752,7 @@ mod tests {
             ("audience", "on"),
             ("sampling-rate", "0.5"),
         ]);
-        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        let result = merge_lsp_telemetry_config(&server, &workspace, false).unwrap();
         assert!(result.is_some());
         let merged = result.unwrap();
         assert!(
@@ -745,7 +766,7 @@ mod tests {
     fn test_merge_lsp_config_empty_passthrough() {
         let server = test_tel_config();
         let workspace = chaffra_core::config::ChaffraConfig::default();
-        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        let result = merge_lsp_telemetry_config(&server, &workspace, false).unwrap();
         assert!(result.is_some());
         let merged = result.unwrap();
         // With no project overrides, sampling rate should match server config.
@@ -759,7 +780,7 @@ mod tests {
     fn test_merge_lsp_config_invalid_fails_closed() {
         let server = test_tel_config();
         let workspace = make_workspace_config_with_telemetry(vec![("audience", "bogus")]);
-        let result = merge_lsp_telemetry_config(&server, &workspace);
+        let result = merge_lsp_telemetry_config(&server, &workspace, false);
         assert!(result.is_err(), "invalid audience should fail closed");
     }
 
@@ -767,7 +788,7 @@ mod tests {
     fn test_merge_lsp_config_operator_opt_in() {
         let server = test_tel_config();
         let workspace = make_workspace_config_with_telemetry(vec![("audience", "on")]);
-        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        let result = merge_lsp_telemetry_config(&server, &workspace, false).unwrap();
         assert!(result.is_some());
         let merged = result.unwrap();
         assert_eq!(merged.audience, chaffra_telemetry::TelemetryAudience::On);
@@ -777,12 +798,26 @@ mod tests {
     fn test_merge_lsp_config_operator_only() {
         let server = test_tel_config();
         let workspace = make_workspace_config_with_telemetry(vec![("audience", "operator-only")]);
-        let result = merge_lsp_telemetry_config(&server, &workspace).unwrap();
+        let result = merge_lsp_telemetry_config(&server, &workspace, false).unwrap();
         assert!(result.is_some());
         let merged = result.unwrap();
         assert_eq!(
             merged.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly
+        );
+    }
+
+    #[test]
+    fn test_merge_lsp_config_explicit_cli_audience_wins() {
+        let server = test_tel_config();
+        let workspace = make_workspace_config_with_telemetry(vec![("audience", "on")]);
+        let result = merge_lsp_telemetry_config(&server, &workspace, true).unwrap();
+        assert!(result.is_some());
+        let merged = result.unwrap();
+        assert_eq!(
+            merged.audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+            "explicit CLI audience must override workspace config"
         );
     }
 
@@ -794,7 +829,7 @@ mod tests {
         let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
         // This should take the early-return path into analyze_file_no_telemetry.
         let diagnostics =
-            analyze_file_for_diagnostics("/tmp/test_off.go", content, &ls, &off_config);
+            analyze_file_for_diagnostics("/tmp/test_off.go", content, &ls, &off_config, false);
         // Should run without panicking and produce a valid map.
         let _total: usize = diagnostics.values().map(|v| v.len()).sum();
     }
