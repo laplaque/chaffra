@@ -36,6 +36,10 @@ pub struct MetricDataPoint {
     pub labels: HashMap<String, String>,
     /// Unix timestamp in milliseconds.
     pub timestamp_ms: u64,
+    /// Whether this metric is user-scoped (true) or operator-only (false).
+    /// Unknown/unclassified metrics default to operator-only (fail-closed).
+    #[serde(default)]
+    pub user_scoped: bool,
 }
 
 /// A trace span for distributed tracing.
@@ -92,6 +96,7 @@ pub fn data_point_from_proto(p: &chaffra_proto::proto::MetricDataPoint) -> Metri
         value: p.value,
         labels: p.labels.clone(),
         timestamp_ms: p.timestamp_ms,
+        user_scoped: false,
     }
 }
 
@@ -176,6 +181,7 @@ mod tests {
                 m
             },
             timestamp_ms: 1700000000000,
+            user_scoped: false,
         };
         let proto = data_point_to_proto(&dp);
         let restored = data_point_from_proto(&proto);

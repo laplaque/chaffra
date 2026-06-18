@@ -191,12 +191,19 @@ pub fn extract_changed_paths(events: &[DebouncedEvent]) -> Vec<PathBuf> {
 /// Run a single watch iteration: analyze changed files, emit output, handle
 /// telemetry. Returns `Some(text)` with the formatted output on success, or
 /// `None` on analysis error.
+///
+/// `project_fingerprints` accumulates per-file fingerprints across iterations
+/// so that churn is computed against the full project, not just the changed files.
 pub(crate) fn run_watch_iteration(
     changed: &[PathBuf],
     root: &Path,
     config: &ChaffraConfig,
     format: OutputFormat,
     watch_config: &WatchConfig,
+    project_fingerprints: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<chaffra_telemetry::churn::FindingFingerprint>,
+    >,
 ) -> Option<String> {
     let is_off = matches!(
         watch_config.tel_config.audience,
@@ -219,12 +226,35 @@ pub(crate) fn run_watch_iteration(
             let duration_ms = start.elapsed().as_millis() as u64;
             collector.record_module_call("watch", duration_ms, ao.had_module_error);
 
-            collector.set_finding_fingerprints(crate::fingerprints_from_findings(&ao.findings));
+            let analyzed_files: std::collections::HashSet<String> = changed
+                .iter()
+                .filter_map(|p| {
+                    p.strip_prefix(root)
+                        .unwrap_or(p)
+                        .to_str()
+                        .map(|s| s.to_owned())
+                })
+                .collect();
+            for file in &analyzed_files {
+                project_fingerprints.remove(file);
+            }
+            for fp in crate::fingerprints_from_findings(&ao.findings) {
+                project_fingerprints
+                    .entry(fp.file.clone())
+                    .or_default()
+                    .insert(fp);
+            }
+            let all_fingerprints: std::collections::HashSet<_> = project_fingerprints
+                .values()
+                .flat_map(|s| s.iter().cloned())
+                .collect();
+            collector.set_finding_fingerprints(all_fingerprints);
 
             chaffra_telemetry::finalize_and_flush_sampled(
                 &collector,
                 &watch_config.live_state,
                 &watch_config.tel_config,
+                &watch_config.root,
             );
 
             Some(ao.text)
@@ -248,6 +278,7 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
     let root = watch_config.root.clone();
     let config = watch_config.config.clone();
     let format = watch_config.format;
+    let mut project_fingerprints = std::collections::HashMap::new();
 
     eprintln!(
         "Watching {} for changes (debounce: {}ms)...",
@@ -276,7 +307,14 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
 
         eprintln!("\n--- Change detected: {} file(s) ---", changed.len());
 
-        match run_watch_iteration(&changed, &root, &config, format, &watch_config) {
+        match run_watch_iteration(
+            &changed,
+            &root,
+            &config,
+            format,
+            &watch_config,
+            &mut project_fingerprints,
+        ) {
             Some(text) if !text.is_empty() => print!("{text}"),
             Some(_) => {}
             None => eprintln!("Analysis error"),
@@ -511,12 +549,14 @@ mod tests {
             chaffra_telemetry::LiveTelemetryState::new(),
         );
 
+        let mut project_fps = std::collections::HashMap::new();
         let result = run_watch_iteration(
             &[go_file],
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
             &watch_cfg,
+            &mut project_fps,
         );
         assert!(result.is_some(), "telemetry-off iteration should succeed");
         assert!(!result.unwrap().is_empty());
@@ -544,12 +584,14 @@ mod tests {
             chaffra_telemetry::LiveTelemetryState::new(),
         );
 
+        let mut project_fps = std::collections::HashMap::new();
         let result = run_watch_iteration(
             &[go_file],
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
             &watch_cfg,
+            &mut project_fps,
         );
         assert!(
             result.is_some(),
@@ -576,12 +618,14 @@ mod tests {
             chaffra_telemetry::LiveTelemetryState::new(),
         );
 
+        let mut project_fps = std::collections::HashMap::new();
         let result = run_watch_iteration(
             &[readme],
             &dir,
             &ChaffraConfig::default(),
             OutputFormat::Terminal,
             &watch_cfg,
+            &mut project_fps,
         );
         // Non-source files should produce empty output (not None).
         assert!(result.is_some());

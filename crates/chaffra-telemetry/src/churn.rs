@@ -91,10 +91,15 @@ pub fn load_state(path: &Path) -> Option<ChurnState> {
     serde_json::from_str(&content).ok()
 }
 
-/// Save churn state to a file.
+/// Save churn state to a file atomically via temp-file-then-rename.
 pub fn save_state(state: &ChurnState, path: &Path) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(std::io::Error::other)?;
+    use std::io::Write;
+    tmp.write_all(json.as_bytes())?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Default state file path.

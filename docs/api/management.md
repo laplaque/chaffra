@@ -49,7 +49,7 @@ Current metric values.
 Time-series snapshot history. The response `status` indicates the data source:
 
 - `seeded` — deterministic demo data (default standalone mode)
-- `live` — real analysis data from `--path` mode or pushed by watch/MCP/LSP
+- `live` — real analysis data from `--path` mode or co-located analysis in the same process
 - `empty` — no data available (`--telemetry off` mode)
 
 Optional dimension filters (mutually exclusive, first match wins):

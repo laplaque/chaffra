@@ -50,6 +50,13 @@ fn parse_window_ms(window: &str) -> Option<u64> {
     }
 }
 
+/// Check if a window string is supported.
+///
+/// Supported windows: `"1h"`, `"24h"`, `"7d"`.
+pub fn is_valid_window(window: &str) -> bool {
+    parse_window_ms(window).is_some()
+}
+
 impl LiveTelemetryState {
     /// Create a new empty live state with default capacity (1000 snapshots).
     pub fn new() -> Self {
@@ -502,6 +509,7 @@ mod tests {
                 value: 1.0,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: false,
             })
             .collect();
         TelemetrySnapshot {

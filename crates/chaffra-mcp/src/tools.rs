@@ -35,6 +35,7 @@ fn record_analysis_and_push(
     config: &ChaffraConfig,
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    project_root: &Path,
 ) -> Result<chaffra_core::diagnostic::AnalysisResult, String> {
     if matches!(
         tel_config.audience,
@@ -77,7 +78,12 @@ fn record_analysis_and_push(
                 .collect();
             collector.set_finding_fingerprints(fingerprints);
 
-            chaffra_telemetry::finalize_and_flush_sampled(&collector, live_state, tel_config);
+            chaffra_telemetry::finalize_and_flush_sampled(
+                &collector,
+                live_state,
+                tel_config,
+                project_root,
+            );
 
             Ok(result)
         }
@@ -174,6 +180,7 @@ pub fn execute_health(
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<&str>,
 ) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -182,13 +189,27 @@ pub fn execute_health(
         Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
     };
 
-    let config = match ChaffraConfig::load_from_dir(&root) {
-        Ok(c) => c,
-        Err(e) => {
-            if root.join(".chaffra.toml").exists() {
-                return ToolCallResult::error(format!("Malformed project config: {e}"));
+    let config = if let Some(cfg_path) = config_path {
+        let p = Path::new(cfg_path);
+        if p.exists() {
+            match ChaffraConfig::load(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolCallResult::error(format!("Malformed config at {cfg_path}: {e}"));
+                }
             }
-            ChaffraConfig::default()
+        } else {
+            return ToolCallResult::error(format!("Config file not found: {cfg_path}"));
+        }
+    } else {
+        match ChaffraConfig::load_from_dir(&root) {
+            Ok(c) => c,
+            Err(e) => {
+                if root.join(".chaffra.toml").exists() {
+                    return ToolCallResult::error(format!("Malformed project config: {e}"));
+                }
+                ChaffraConfig::default()
+            }
         }
     };
     let effective_tel =
@@ -203,6 +224,11 @@ pub fn execute_health(
     }
 
     let host = build_module_host();
+    // NOTE: record_analysis_and_push runs the complexity module for telemetry,
+    // and analyze_project_health re-parses files to compute the health score.
+    // These are separate concerns (telemetry vs. health grading) but both parse
+    // the same files. Unifying them would require analyze_project_health to
+    // accept pre-computed results, which it currently does not support.
     let _ = record_analysis_and_push(
         &host,
         "complexity",
@@ -210,6 +236,7 @@ pub fn execute_health(
         &config,
         live_state,
         &effective_tel,
+        &root,
     );
 
     match chaffra_complexity::analyze_project_health(
@@ -231,6 +258,7 @@ pub fn execute_dead_code(
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<&str>,
 ) -> ToolCallResult {
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -239,13 +267,27 @@ pub fn execute_dead_code(
         Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
     };
 
-    let config = match ChaffraConfig::load_from_dir(&root) {
-        Ok(c) => c,
-        Err(e) => {
-            if root.join(".chaffra.toml").exists() {
-                return ToolCallResult::error(format!("Malformed project config: {e}"));
+    let config = if let Some(cfg_path) = config_path {
+        let p = Path::new(cfg_path);
+        if p.exists() {
+            match ChaffraConfig::load(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolCallResult::error(format!("Malformed config at {cfg_path}: {e}"));
+                }
             }
-            ChaffraConfig::default()
+        } else {
+            return ToolCallResult::error(format!("Config file not found: {cfg_path}"));
+        }
+    } else {
+        match ChaffraConfig::load_from_dir(&root) {
+            Ok(c) => c,
+            Err(e) => {
+                if root.join(".chaffra.toml").exists() {
+                    return ToolCallResult::error(format!("Malformed project config: {e}"));
+                }
+                ChaffraConfig::default()
+            }
         }
     };
     let effective_tel =
@@ -267,6 +309,7 @@ pub fn execute_dead_code(
         &config,
         live_state,
         &effective_tel,
+        &root,
     ) {
         Ok(result) => match serde_json::to_string_pretty(&result) {
             Ok(json) => ToolCallResult::text(json),
@@ -296,20 +339,51 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
 /// Execute the chaffra/telemetry tool.
 ///
 /// `snapshot` reads from the shared live state; `status` and `backends` use
-/// the effective telemetry config.
+/// the effective telemetry config (merged with project overrides when
+/// `config_path` is provided).
 pub fn execute_telemetry(
     params: &serde_json::Value,
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
+    explicit_cli_audience: bool,
+    config_path: Option<&str>,
 ) -> ToolCallResult {
     let action = params
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("status");
 
+    let effective_tel = if let Some(cfg_path) = config_path {
+        let p = Path::new(cfg_path);
+        if p.exists() {
+            match ChaffraConfig::load(p) {
+                Ok(project_config) => {
+                    match merge_project_telemetry_config(
+                        tel_config,
+                        &project_config,
+                        explicit_cli_audience,
+                    ) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            return ToolCallResult::error(format!("Invalid telemetry config: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return ToolCallResult::error(format!("Malformed config at {cfg_path}: {e}"));
+                }
+            }
+        } else {
+            tel_config.clone()
+        }
+    } else {
+        tel_config.clone()
+    };
+
     match action {
         "status" => {
-            let (_, statuses) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
+            let (_, statuses) =
+                chaffra_telemetry::backends::create_backends(&effective_tel.backends);
             match serde_json::to_string_pretty(&statuses) {
                 Ok(json) => ToolCallResult::text(json),
                 Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
@@ -318,7 +392,7 @@ pub fn execute_telemetry(
         "snapshot" => {
             let snapshot = match live_state.current() {
                 Some(s) => {
-                    if tel_config.audience.operator_enabled() {
+                    if effective_tel.audience.operator_enabled() {
                         s
                     } else {
                         s.user_scoped()
@@ -336,7 +410,7 @@ pub fn execute_telemetry(
             }
         }
         "backends" => {
-            let backends_info: Vec<serde_json::Value> = tel_config
+            let backends_info: Vec<serde_json::Value> = effective_tel
                 .backends
                 .iter()
                 .map(|b| {
@@ -363,14 +437,31 @@ pub fn dispatch_tool(
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<&str>,
 ) -> ToolCallResult {
     match name {
-        "chaffra/health" => execute_health(params, live_state, tel_config, explicit_cli_audience),
-        "chaffra/dead-code" => {
-            execute_dead_code(params, live_state, tel_config, explicit_cli_audience)
-        }
+        "chaffra/health" => execute_health(
+            params,
+            live_state,
+            tel_config,
+            explicit_cli_audience,
+            config_path,
+        ),
+        "chaffra/dead-code" => execute_dead_code(
+            params,
+            live_state,
+            tel_config,
+            explicit_cli_audience,
+            config_path,
+        ),
         "chaffra/explain" => execute_explain(params),
-        "chaffra/telemetry" => execute_telemetry(params, live_state, tel_config),
+        "chaffra/telemetry" => execute_telemetry(
+            params,
+            live_state,
+            tel_config,
+            explicit_cli_audience,
+            config_path,
+        ),
         _ => ToolCallResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -413,7 +504,14 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_tool() {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
-        let result = dispatch_tool("unknown/tool", &serde_json::json!({}), &ls, &tc(), false);
+        let result = dispatch_tool(
+            "unknown/tool",
+            &serde_json::json!({}),
+            &ls,
+            &tc(),
+            false,
+            None,
+        );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Unknown tool"));
     }
@@ -446,6 +544,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
@@ -459,6 +558,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Invalid path"));
@@ -474,6 +574,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
@@ -490,6 +591,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No source files"));
@@ -507,6 +609,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -523,6 +626,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -537,6 +641,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
     }
@@ -694,17 +799,27 @@ mod tests {
         let mut off_config = tc();
         off_config.audience = chaffra_telemetry::TelemetryAudience::Off;
         let config = ChaffraConfig::default();
-        let result = record_analysis_and_push(&host, "dead-code", &[], &config, &ls, &off_config);
+        let result = record_analysis_and_push(
+            &host,
+            "dead-code",
+            &[],
+            &config,
+            &ls,
+            &off_config,
+            Path::new("."),
+        );
         assert!(result.is_ok());
         assert!(ls.current().is_none());
     }
 
     #[test]
     fn test_record_analysis_and_push_populates_live_state() {
+        let tmp = tempfile::tempdir().unwrap();
         let host = build_module_host();
         let ls = chaffra_telemetry::LiveTelemetryState::new();
         let config = ChaffraConfig::default();
-        let result = record_analysis_and_push(&host, "dead-code", &[], &config, &ls, &tc());
+        let result =
+            record_analysis_and_push(&host, "dead-code", &[], &config, &ls, &tc(), tmp.path());
         assert!(result.is_ok());
         assert!(ls.current().is_some());
     }
@@ -718,6 +833,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
     }
@@ -731,6 +847,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No telemetry"));
@@ -745,6 +862,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert!(result.is_error.is_none());
     }
@@ -758,6 +876,7 @@ mod tests {
             &ls,
             &tc(),
             false,
+            None,
         );
         assert_eq!(result.is_error, Some(true));
     }
@@ -850,7 +969,9 @@ mod tests {
         let _ = host.register(Box::new(ErrorSeverityModule));
         let ls = chaffra_telemetry::LiveTelemetryState::new();
         let config = ChaffraConfig::default();
-        let result = record_analysis_and_push(&host, "error-mod", &[], &config, &ls, &tc());
+        let tmp = tempfile::tempdir().unwrap();
+        let result =
+            record_analysis_and_push(&host, "error-mod", &[], &config, &ls, &tc(), tmp.path());
         assert!(result.is_ok());
         let analysis = result.unwrap();
         // Verify we got findings with both Error and Warning severity.
@@ -880,8 +1001,16 @@ mod tests {
         let ls = chaffra_telemetry::LiveTelemetryState::new();
         let config = ChaffraConfig::default();
         // Pass an unknown module_id to trigger the Err branch.
-        let result =
-            record_analysis_and_push(&host, "nonexistent-module", &[], &config, &ls, &tc());
+        let tmp = tempfile::tempdir().unwrap();
+        let result = record_analysis_and_push(
+            &host,
+            "nonexistent-module",
+            &[],
+            &config,
+            &ls,
+            &tc(),
+            tmp.path(),
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
         assert!(
@@ -914,6 +1043,7 @@ mod tests {
                     m
                 },
                 timestamp_ms: 1000,
+                user_scoped: false,
             }],
             spans: vec![],
             user_summary: chaffra_telemetry::collector::UserSummary {
@@ -934,7 +1064,13 @@ mod tests {
         // so execute_telemetry should return the full (non-user-scoped) snapshot.
         let mut on_config = tc();
         on_config.audience = chaffra_telemetry::TelemetryAudience::On;
-        let result = execute_telemetry(&serde_json::json!({"action": "snapshot"}), &ls, &on_config);
+        let result = execute_telemetry(
+            &serde_json::json!({"action": "snapshot"}),
+            &ls,
+            &on_config,
+            false,
+            None,
+        );
         assert!(result.is_error.is_none());
         let text = &result.content[0].text;
         // The full snapshot includes operator data: module_call_durations with "dead-code".
@@ -950,7 +1086,13 @@ mod tests {
         // With default audience (UserOnly), operator_enabled() returns false,
         // so execute_telemetry should return the user-scoped snapshot
         // with empty operator_summary.
-        let result_user = execute_telemetry(&serde_json::json!({"action": "snapshot"}), &ls, &tc());
+        let result_user = execute_telemetry(
+            &serde_json::json!({"action": "snapshot"}),
+            &ls,
+            &tc(),
+            false,
+            None,
+        );
         assert!(result_user.is_error.is_none());
         let user_text = &result_user.content[0].text;
         // The user-scoped snapshot zeroes out operator_summary.

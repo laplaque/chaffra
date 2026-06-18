@@ -48,6 +48,7 @@ fn test_data_point_recording() {
                 m
             },
             timestamp_ms: 1000 + i,
+            user_scoped: false,
         });
     }
 
@@ -172,6 +173,7 @@ fn test_concurrent_metric_recording() {
                 value: i as f64,
                 labels: HashMap::new(),
                 timestamp_ms: 1000,
+                user_scoped: false,
             });
         }));
     }

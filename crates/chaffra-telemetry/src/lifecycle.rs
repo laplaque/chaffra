@@ -4,6 +4,7 @@ use crate::collector::TelemetrySnapshot;
 use crate::config::TelemetryConfig;
 use crate::live_state::LiveTelemetryState;
 use crate::sampling::SamplingDecision;
+use std::path::Path;
 
 pub struct FinalizeResult {
     pub snapshot: TelemetrySnapshot,
@@ -14,16 +15,18 @@ pub fn finalize_and_flush(
     collector: &TelemetryCollector,
     live_state: &LiveTelemetryState,
     config: &TelemetryConfig,
+    project_root: &Path,
 ) -> FinalizeResult {
-    finalize_inner(collector, live_state, config, false)
+    finalize_inner(collector, live_state, config, false, project_root)
 }
 
 pub fn finalize_and_flush_sampled(
     collector: &TelemetryCollector,
     live_state: &LiveTelemetryState,
     config: &TelemetryConfig,
+    project_root: &Path,
 ) -> FinalizeResult {
-    finalize_inner(collector, live_state, config, true)
+    finalize_inner(collector, live_state, config, true, project_root)
 }
 
 fn finalize_inner(
@@ -31,10 +34,11 @@ fn finalize_inner(
     live_state: &LiveTelemetryState,
     config: &TelemetryConfig,
     use_sampling: bool,
+    project_root: &Path,
 ) -> FinalizeResult {
     let fingerprints = collector.finding_fingerprints();
-    let state_path = std::path::Path::new(churn::STATE_FILE);
-    let previous_state = churn::load_state(state_path);
+    let state_path = project_root.join(churn::STATE_FILE);
+    let previous_state = churn::load_state(&state_path);
     let current_hash = churn::hash_fingerprints(&fingerprints);
 
     if let Some(ref prev) = previous_state {
@@ -69,7 +73,7 @@ fn finalize_inner(
             .unwrap_or_default()
             .as_millis() as u64,
     };
-    if let Err(e) = churn::save_state(&new_state, state_path) {
+    if let Err(e) = churn::save_state(&new_state, &state_path) {
         eprintln!(
             "Warning: failed to persist telemetry churn state to {}: {e}",
             state_path.display()
@@ -113,6 +117,7 @@ mod tests {
 
     #[test]
     fn test_finalize_and_flush_pushes_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
         let collector = TelemetryCollector::with_defaults();
         collector.register_core_metrics();
         collector.set_files_total(5);
@@ -120,7 +125,7 @@ mod tests {
         let live_state = LiveTelemetryState::new();
         let config = TelemetryConfig::default();
 
-        let result = finalize_and_flush(&collector, &live_state, &config);
+        let result = finalize_and_flush(&collector, &live_state, &config, tmp.path());
 
         assert!(live_state.current().is_some());
         assert_eq!(result.snapshot.user_summary.files_total, 5);
@@ -128,12 +133,13 @@ mod tests {
 
     #[test]
     fn test_finalize_returns_deterministic_hash() {
+        let tmp = tempfile::tempdir().unwrap();
         let collector = TelemetryCollector::with_defaults();
         let live_state = LiveTelemetryState::new();
         let config = TelemetryConfig::default();
 
-        let r1 = finalize_and_flush(&collector, &live_state, &config);
-        let r2 = finalize_and_flush(&collector, &live_state, &config);
+        let r1 = finalize_and_flush(&collector, &live_state, &config, tmp.path());
+        let r2 = finalize_and_flush(&collector, &live_state, &config, tmp.path());
         assert_eq!(r1.findings_hash, r2.findings_hash);
     }
 
@@ -152,6 +158,7 @@ mod tests {
 
     #[test]
     fn test_finalize_with_fingerprints_produces_nonzero_hash() {
+        let tmp = tempfile::tempdir().unwrap();
         let collector = TelemetryCollector::with_defaults();
         let mut fps = HashSet::new();
         fps.insert(churn::FindingFingerprint::new("rule1", "file.rs", 10));
@@ -160,18 +167,19 @@ mod tests {
         let live_state = LiveTelemetryState::new();
         let config = TelemetryConfig::default();
 
-        let result = finalize_and_flush(&collector, &live_state, &config);
+        let result = finalize_and_flush(&collector, &live_state, &config, tmp.path());
         assert_ne!(result.findings_hash, 0);
     }
 
     #[test]
     fn test_finalize_sampled_pushes_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
         let collector = TelemetryCollector::with_defaults();
         collector.set_files_total(7);
         let live_state = LiveTelemetryState::new();
         let config = TelemetryConfig::default();
 
-        let result = finalize_and_flush_sampled(&collector, &live_state, &config);
+        let result = finalize_and_flush_sampled(&collector, &live_state, &config, tmp.path());
 
         assert!(live_state.current().is_some());
         assert_eq!(result.snapshot.user_summary.files_total, 7);

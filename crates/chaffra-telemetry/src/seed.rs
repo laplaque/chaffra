@@ -152,6 +152,24 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     // --- Data points ---
     let mut data_points = Vec::new();
 
+    // Emit chaffra.module.error_total data points for any module errors
+    let mut sorted_error_modules: Vec<_> = module_error_counts.keys().cloned().collect();
+    sorted_error_modules.sort();
+    for module in &sorted_error_modules {
+        let count = module_error_counts[module];
+        data_points.push(MetricDataPoint {
+            name: "chaffra.module.error_total".to_owned(),
+            value: count as f64,
+            labels: {
+                let mut m = HashMap::new();
+                m.insert("module".to_owned(), module.clone());
+                m
+            },
+            timestamp_ms: ts,
+            user_scoped: false,
+        });
+    }
+
     // Per-module call durations (sorted for deterministic order)
     let mut sorted_modules: Vec<_> = module_call_durations.keys().cloned().collect();
     sorted_modules.sort();
@@ -166,6 +184,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -181,6 +200,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: true,
         });
     }
 
@@ -203,6 +223,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
                         m
                     },
                     timestamp_ms: ts,
+                    user_scoped: true,
                 });
             }
         }
@@ -223,24 +244,28 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
         value: new_findings as f64,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.findings.resolved".to_owned(),
         value: resolved_findings as f64,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.findings.unchanged".to_owned(),
         value: unchanged_findings as f64,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.findings.churn_rate".to_owned(),
         value: churn_rate,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
 
     // Health scores as data points (for the /health endpoint)
@@ -253,6 +278,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
             m
         },
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.module.complexity.health_score".to_owned(),
@@ -263,6 +289,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
             m
         },
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.module.security.health_score".to_owned(),
@@ -273,6 +300,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
             m
         },
         timestamp_ms: ts,
+        user_scoped: true,
     });
 
     // Cache metrics
@@ -283,18 +311,21 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
         value: cache_hits as f64,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.parse.cache_misses".to_owned(),
         value: cache_misses as f64,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
     data_points.push(MetricDataPoint {
         name: "chaffra.parse.cache_hit_rate".to_owned(),
         value: cache_hits as f64 / (cache_hits + cache_misses) as f64,
         labels: HashMap::new(),
         timestamp_ms: ts,
+        user_scoped: true,
     });
 
     // Backend connectivity warning (on iteration 3)
@@ -308,6 +339,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -323,6 +355,7 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 

@@ -71,14 +71,7 @@ impl TelemetrySnapshot {
         let user_data_points = self
             .data_points
             .iter()
-            .filter(|dp| {
-                !dp.name.starts_with("chaffra.module.call_duration")
-                    && !dp.name.starts_with("chaffra.module.error_total")
-                    && !dp.name.starts_with("chaffra.module.load_error")
-                    && !dp.name.starts_with("chaffra.plugin.connect_error")
-                    && !dp.name.starts_with("chaffra.module.startup_duration")
-                    && !dp.name.starts_with("chaffra.startup.total_duration")
-            })
+            .filter(|dp| dp.user_scoped)
             .cloned()
             .collect();
 
@@ -204,6 +197,7 @@ impl TelemetryCollector {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
 
         if had_error {
@@ -217,6 +211,7 @@ impl TelemetryCollector {
                     m
                 },
                 timestamp_ms: ts,
+                user_scoped: false,
             });
         }
     }
@@ -249,6 +244,7 @@ impl TelemetryCollector {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: true,
         });
 
         for (severity, count) in severity_counts {
@@ -262,6 +258,7 @@ impl TelemetryCollector {
                     m
                 },
                 timestamp_ms: ts,
+                user_scoped: true,
             });
         }
     }
@@ -284,6 +281,7 @@ impl TelemetryCollector {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: true,
         });
     }
 
@@ -358,6 +356,7 @@ impl TelemetryCollector {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -369,6 +368,7 @@ impl TelemetryCollector {
             value: 1.0,
             labels: HashMap::new(),
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -384,6 +384,7 @@ impl TelemetryCollector {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -399,6 +400,7 @@ impl TelemetryCollector {
                 m
             },
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -410,6 +412,7 @@ impl TelemetryCollector {
             value: duration_ms as f64,
             labels: HashMap::new(),
             timestamp_ms: ts,
+            user_scoped: false,
         });
     }
 
@@ -422,24 +425,28 @@ impl TelemetryCollector {
                 value: churn.new_count as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.findings.resolved".to_owned(),
                 value: churn.resolved_count as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.findings.unchanged".to_owned(),
                 value: churn.unchanged_count as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.findings.churn_rate".to_owned(),
                 value: churn.churn_rate,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
         ];
         self.record_data_points(points);
@@ -601,6 +608,7 @@ mod tests {
             value: 1.0,
             labels: HashMap::new(),
             timestamp_ms: 100,
+            user_scoped: false,
         });
         collector.record_data_points(vec![
             MetricDataPoint {
@@ -608,12 +616,14 @@ mod tests {
                 value: 2.0,
                 labels: HashMap::new(),
                 timestamp_ms: 200,
+                user_scoped: false,
             },
             MetricDataPoint {
                 name: "test.metric".to_owned(),
                 value: 3.0,
                 labels: HashMap::new(),
                 timestamp_ms: 300,
+                user_scoped: false,
             },
         ]);
 
@@ -820,5 +830,154 @@ mod tests {
 
         let snapshot = collector.snapshot();
         assert_eq!(snapshot.operator_summary.module_call_durations.len(), 2);
+    }
+
+    #[test]
+    fn test_user_scoped_snapshot_strips_operator() {
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+
+        // Record operator metrics (user_scoped: false).
+        collector.record_module_call("dead-code", 42, true);
+        collector.record_module_load_error("security", "missing_dep");
+        collector.record_config_parse_error();
+        collector.record_plugin_connect_error("fastapi");
+        collector.record_module_startup("dead-code", 15);
+        collector.record_startup_total(250);
+
+        // Record user metrics (user_scoped: true).
+        let mut severity_counts = HashMap::new();
+        severity_counts.insert("warning".to_owned(), 3);
+        collector.record_module_findings("dead-code", 3, &severity_counts);
+        collector.record_module_summary_metric("dead-code", "health_score", 85.0);
+
+        let churn = crate::churn::ChurnResult {
+            new_count: 2,
+            resolved_count: 1,
+            unchanged_count: 4,
+            churn_rate: 0.333,
+        };
+        collector.record_finding_churn(&churn);
+
+        let full = collector.snapshot();
+        let scoped = full.user_scoped();
+
+        // Full snapshot should contain both operator and user data points.
+        assert!(
+            full.data_points.iter().any(|dp| !dp.user_scoped),
+            "full snapshot should contain operator data points"
+        );
+        assert!(
+            full.data_points.iter().any(|dp| dp.user_scoped),
+            "full snapshot should contain user data points"
+        );
+
+        // User-scoped snapshot must contain zero operator data points.
+        assert!(
+            scoped.data_points.iter().all(|dp| dp.user_scoped),
+            "user_scoped snapshot must not contain any operator data points"
+        );
+
+        // User-scoped snapshot must retain user data points.
+        assert!(
+            !scoped.data_points.is_empty(),
+            "user_scoped snapshot must retain user data points"
+        );
+
+        // Verify specific user metrics survived.
+        assert!(
+            scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.analysis.findings_total"),
+            "findings_total should survive user_scoped filter"
+        );
+        assert!(
+            scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.findings.new"),
+            "findings.new should survive user_scoped filter"
+        );
+        assert!(
+            scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name.starts_with("chaffra.module.dead-code.")),
+            "module summary metrics should survive user_scoped filter"
+        );
+
+        // Verify specific operator metrics were stripped.
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.module.call_duration_ms"),
+            "call_duration_ms should be stripped by user_scoped filter"
+        );
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.module.error_total"),
+            "error_total should be stripped by user_scoped filter"
+        );
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.module.load_error_total"),
+            "load_error_total should be stripped by user_scoped filter"
+        );
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.config.parse_error_total"),
+            "config.parse_error_total should be stripped by user_scoped filter"
+        );
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.plugin.connect_error_total"),
+            "plugin.connect_error_total should be stripped by user_scoped filter"
+        );
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.module.startup_duration_ms"),
+            "startup_duration_ms should be stripped by user_scoped filter"
+        );
+        assert!(
+            !scoped
+                .data_points
+                .iter()
+                .any(|dp| dp.name == "chaffra.startup.total_duration_ms"),
+            "startup.total_duration_ms should be stripped by user_scoped filter"
+        );
+
+        // Operator summary and spans should be empty in the user-scoped snapshot.
+        assert!(
+            scoped.spans.is_empty(),
+            "user_scoped snapshot must strip spans"
+        );
+        assert_eq!(
+            scoped.operator_summary.module_call_durations.len(),
+            0,
+            "user_scoped snapshot must strip operator_summary call durations"
+        );
+        assert_eq!(
+            scoped.operator_summary.module_error_counts.len(),
+            0,
+            "user_scoped snapshot must strip operator_summary error counts"
+        );
+
+        // User summary should be preserved.
+        assert_eq!(
+            scoped.user_summary.findings_by_module.get("dead-code"),
+            Some(&3)
+        );
     }
 }

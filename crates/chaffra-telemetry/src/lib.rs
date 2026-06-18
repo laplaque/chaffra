@@ -30,7 +30,7 @@ pub use error::TelemetryError;
 pub use lifecycle::{
     FinalizeResult, finalize_and_flush, finalize_and_flush_sampled, flush_snapshot,
 };
-pub use live_state::{LiveTelemetryState, StateSource};
+pub use live_state::{LiveTelemetryState, StateSource, is_valid_window};
 pub use metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 pub use module::TelemetryModule;
 pub use sampling::{SamplingDecision, SamplingStrategy};

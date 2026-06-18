@@ -112,6 +112,55 @@ pub(crate) fn merge_lsp_telemetry_config(
     Ok(Some(merged))
 }
 
+/// Discover workspace config, either from an explicit path or by walking
+/// up from the file's parent directory looking for `.chaffra.toml`.
+///
+/// Returns `(workspace_config, project_root)`.
+fn discover_workspace_config(
+    file_path: &str,
+    config_path: Option<&str>,
+) -> (chaffra_core::config::ChaffraConfig, std::path::PathBuf) {
+    use chaffra_core::config::ChaffraConfig;
+    use std::path::{Path, PathBuf};
+
+    if let Some(cp) = config_path {
+        let p = Path::new(cp);
+        let project_root = p
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        match ChaffraConfig::load(p) {
+            Ok(c) => return (c, project_root),
+            Err(e) => {
+                eprintln!("Failed to load explicit config {cp}: {e}");
+                // Fall through to auto-discovery.
+            }
+        }
+    }
+
+    let config_dir = Path::new(file_path).parent().and_then(|dir| {
+        let mut d = dir;
+        loop {
+            let candidate = d.join(".chaffra.toml");
+            if candidate.exists() {
+                return Some(d.to_path_buf());
+            }
+            d = d.parent()?;
+        }
+    });
+
+    let project_root = config_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let workspace_config = match config_dir {
+        Some(ref dir) => ChaffraConfig::load_from_dir(dir).unwrap_or_default(),
+        None => ChaffraConfig::default(),
+    };
+
+    (workspace_config, project_root)
+}
+
 /// Run analysis on a file and return diagnostics grouped by file URI.
 pub fn analyze_file_for_diagnostics(
     file_path: &str,
@@ -119,16 +168,18 @@ pub fn analyze_file_for_diagnostics(
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<&str>,
 ) -> HashMap<String, Vec<Diagnostic>> {
-    use chaffra_core::config::ChaffraConfig;
     use chaffra_core::diagnostic::FileInfo;
     use std::path::Path;
+
+    let (workspace_config, project_root) = discover_workspace_config(file_path, config_path);
 
     if matches!(
         tel_config.audience,
         chaffra_telemetry::TelemetryAudience::Off
     ) {
-        return analyze_file_no_telemetry(file_path, content);
+        return analyze_file_no_telemetry(file_path, content, &workspace_config);
     }
 
     let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
@@ -144,33 +195,13 @@ pub fn analyze_file_for_diagnostics(
         content: content.to_vec(),
     }];
 
-    let workspace_config = match Path::new(file_path).parent().and_then(|dir| {
-        let mut d = dir;
-        loop {
-            let candidate = d.join(".chaffra.toml");
-            if candidate.exists() {
-                return Some(d.to_path_buf());
-            }
-            d = d.parent()?;
-        }
-    }) {
-        Some(config_dir) => match ChaffraConfig::load_from_dir(&config_dir) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Malformed workspace config, disabling telemetry: {e}");
-                return analyze_file_no_telemetry(file_path, content);
-            }
-        },
-        None => ChaffraConfig::default(),
-    };
-
     let effective_tel =
         match merge_lsp_telemetry_config(tel_config, &workspace_config, explicit_cli_audience) {
             Ok(Some(merged)) => merged,
-            Ok(None) => return analyze_file_no_telemetry(file_path, content),
+            Ok(None) => return analyze_file_no_telemetry(file_path, content, &workspace_config),
             Err(e) => {
                 eprintln!("Invalid workspace telemetry config: {e}");
-                return analyze_file_no_telemetry(file_path, content);
+                return analyze_file_no_telemetry(file_path, content, &workspace_config);
             }
         };
 
@@ -179,11 +210,12 @@ pub fn analyze_file_for_diagnostics(
     collector.set_files_total(1);
     let host = crate::build_module_host_with_telemetry(Some(&collector));
     let config = workspace_config;
-    let start = std::time::Instant::now();
+    let lsp_start = std::time::Instant::now();
     let mut had_error = false;
     let mut all_findings = Vec::new();
 
     for module_id in &["dead-code", "complexity"] {
+        let start = std::time::Instant::now();
         match host.analyze(module_id, &files, &config) {
             Ok(result) => {
                 let dur = start.elapsed().as_millis() as u64;
@@ -216,18 +248,26 @@ pub fn analyze_file_for_diagnostics(
         }
     }
 
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = lsp_start.elapsed().as_millis() as u64;
     collector.record_module_call("lsp", duration_ms, had_error);
     let fingerprints = crate::fingerprints_from_findings(&all_findings);
     collector.set_finding_fingerprints(fingerprints);
 
-    chaffra_telemetry::finalize_and_flush_sampled(&collector, live_state, &effective_tel);
+    chaffra_telemetry::finalize_and_flush_sampled(
+        &collector,
+        live_state,
+        &effective_tel,
+        &project_root,
+    );
 
     diagnostics
 }
 
-fn analyze_file_no_telemetry(file_path: &str, content: &[u8]) -> HashMap<String, Vec<Diagnostic>> {
-    use chaffra_core::config::ChaffraConfig;
+fn analyze_file_no_telemetry(
+    file_path: &str,
+    content: &[u8],
+    config: &chaffra_core::config::ChaffraConfig,
+) -> HashMap<String, Vec<Diagnostic>> {
     use chaffra_core::diagnostic::FileInfo;
     use std::path::Path;
 
@@ -242,10 +282,9 @@ fn analyze_file_no_telemetry(file_path: &str, content: &[u8]) -> HashMap<String,
         content: content.to_vec(),
     }];
     let host = crate::build_module_host_with_telemetry(None);
-    let config = ChaffraConfig::default();
 
     for module_id in &["dead-code", "complexity"] {
-        if let Ok(result) = host.analyze(module_id, &files, &config) {
+        if let Ok(result) = host.analyze(module_id, &files, config) {
             for finding in &result.findings {
                 diagnostics
                     .entry(file_path.to_owned())
@@ -314,6 +353,7 @@ pub async fn run_lsp_server(
     live_state: chaffra_telemetry::LiveTelemetryState,
     tel_config: chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<String>,
 ) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -333,8 +373,13 @@ pub async fn run_lsp_server(
             Err(_) => continue,
         };
 
-        let responses =
-            handle_lsp_request(&request, &live_state, &tel_config, explicit_cli_audience);
+        let responses = handle_lsp_request(
+            &request,
+            &live_state,
+            &tel_config,
+            explicit_cli_audience,
+            config_path.as_deref(),
+        );
         for resp in responses {
             let json = serde_json::to_string(&resp)?;
             stdout
@@ -353,6 +398,7 @@ fn handle_lsp_request(
     live_state: &chaffra_telemetry::LiveTelemetryState,
     tel_config: &chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<&str>,
 ) -> Vec<LspResponse> {
     match request.method.as_str() {
         "initialize" => {
@@ -400,6 +446,7 @@ fn handle_lsp_request(
                             live_state,
                             tel_config,
                             explicit_cli_audience,
+                            config_path,
                         );
 
                         let mut responses = Vec::new();
@@ -459,6 +506,7 @@ fn handle_lsp_request(
                         live_state,
                         tel_config,
                         explicit_cli_audience,
+                        config_path,
                     );
 
                     let mut responses = Vec::new();
@@ -590,7 +638,7 @@ mod tests {
             method: "initialize".to_owned(),
             params: Some(serde_json::json!({})),
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert_eq!(responses.len(), 1);
         assert!(responses[0].result.is_some());
         let result = responses[0].result.as_ref().unwrap();
@@ -606,7 +654,7 @@ mod tests {
             method: "initialized".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert!(responses.is_empty());
     }
 
@@ -619,7 +667,7 @@ mod tests {
             method: "shutdown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
@@ -633,7 +681,7 @@ mod tests {
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert_eq!(responses.len(), 1);
     }
 
@@ -646,7 +694,7 @@ mod tests {
             method: "custom/unknown".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert!(responses.is_empty());
     }
 
@@ -659,7 +707,7 @@ mod tests {
             method: "textDocument/hover".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].result, Some(serde_json::Value::Null));
     }
@@ -673,7 +721,7 @@ mod tests {
             method: "textDocument/didSave".to_owned(),
             params: None,
         };
-        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false);
+        let responses = handle_lsp_request(&request, &ls, &test_tel_config(), false, None);
         assert!(responses.is_empty());
     }
 
@@ -681,8 +729,14 @@ mod tests {
     fn test_analyze_file_go_content() {
         let ls = test_live_state();
         let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
-        let diagnostics =
-            analyze_file_for_diagnostics("/tmp/test.go", content, &ls, &test_tel_config(), false);
+        let diagnostics = analyze_file_for_diagnostics(
+            "/tmp/test.go",
+            content,
+            &ls,
+            &test_tel_config(),
+            false,
+            None,
+        );
         // Should produce at least dead-code findings for unused function.
         let all_diags: Vec<&Diagnostic> = diagnostics.values().flatten().collect();
         // The analysis should run without panicking.
@@ -693,8 +747,14 @@ mod tests {
     fn test_analyze_file_unknown_extension() {
         let ls = test_live_state();
         let content = b"some content";
-        let diagnostics =
-            analyze_file_for_diagnostics("/tmp/test.txt", content, &ls, &test_tel_config(), false);
+        let diagnostics = analyze_file_for_diagnostics(
+            "/tmp/test.txt",
+            content,
+            &ls,
+            &test_tel_config(),
+            false,
+            None,
+        );
         // Unknown extension should produce no diagnostics.
         let total: usize = diagnostics.values().map(|v| v.len()).sum();
         assert_eq!(total, 0);
@@ -828,8 +888,14 @@ mod tests {
         off_config.audience = chaffra_telemetry::TelemetryAudience::Off;
         let content = b"package main\n\nfunc main() {}\n\nfunc unused() {}\n";
         // This should take the early-return path into analyze_file_no_telemetry.
-        let diagnostics =
-            analyze_file_for_diagnostics("/tmp/test_off.go", content, &ls, &off_config, false);
+        let diagnostics = analyze_file_for_diagnostics(
+            "/tmp/test_off.go",
+            content,
+            &ls,
+            &off_config,
+            false,
+            None,
+        );
         // Should run without panicking and produce a valid map.
         let _total: usize = diagnostics.values().map(|v| v.len()).sum();
     }

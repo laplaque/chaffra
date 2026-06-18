@@ -100,17 +100,21 @@ fn default_window() -> String {
 }
 
 pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<MetricsResponse> {
-    let (_, statuses) =
-        chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
-    let backends = statuses
-        .into_iter()
-        .map(|s| BackendStatusEntry {
-            name: s.name,
-            kind: s.kind,
-            connected: s.connected,
-            message: s.message,
-        })
-        .collect();
+    let backends = if state.audience.operator_enabled() {
+        let (_, statuses) =
+            chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
+        statuses
+            .into_iter()
+            .map(|s| BackendStatusEntry {
+                name: s.name,
+                kind: s.kind,
+                connected: s.connected,
+                message: s.message,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let Some(raw_snapshot) = state.live_state.current() else {
         return Json(MetricsResponse {
@@ -147,6 +151,19 @@ pub async fn get_metrics_history(
     state: axum::extract::State<Arc<SharedState>>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
 ) -> Json<MetricsHistoryResponse> {
+    if !chaffra_telemetry::is_valid_window(&query.window) {
+        let msg = format!(
+            "Unsupported window '{}'. Supported: 1h, 24h, 7d",
+            query.window
+        );
+        return Json(MetricsHistoryResponse {
+            window: query.window,
+            snapshots: Vec::new(),
+            status: "error".to_owned(),
+            message: msg,
+        });
+    }
+
     let source = state.live_state.source();
     let (status, message) = match source {
         chaffra_telemetry::StateSource::Live => (
@@ -168,45 +185,62 @@ pub async fn get_metrics_history(
     };
 
     let include_operator = state.audience.operator_enabled();
-    let raw_snapshots = state.live_state.history_window(&query.window);
-    let scoped: Vec<_> = raw_snapshots
-        .into_iter()
-        .map(|s| if include_operator { s } else { s.user_scoped() })
-        .collect();
-
-    let snapshots: Vec<_> = if let Some(ref module) = query.module {
-        scoped
-            .into_iter()
-            .filter(|s| s.user_summary.module_summaries.contains_key(module))
-            .collect()
+    let scoped: Vec<_> = if let Some(ref module) = query.module {
+        let raw = state.live_state.history_by_module(module, &query.window);
+        if include_operator {
+            raw
+        } else {
+            raw.into_iter().map(|s| s.user_scoped()).collect()
+        }
     } else if let Some(ref severity) = query.severity {
-        scoped
-            .into_iter()
-            .filter(|s| {
-                s.user_summary
-                    .findings_by_severity
-                    .get(severity)
-                    .is_some_and(|&c| c > 0)
-            })
-            .collect()
+        let raw = state
+            .live_state
+            .history_by_severity(severity, &query.window);
+        if include_operator {
+            raw
+        } else {
+            raw.into_iter().map(|s| s.user_scoped()).collect()
+        }
     } else if let Some(ref metric) = query.metric {
-        scoped
-            .into_iter()
-            .filter(|s| s.data_points.iter().any(|dp| dp.name.starts_with(metric)))
-            .collect()
+        let raw = state.live_state.history_by_metric(metric, &query.window);
+        if include_operator {
+            raw
+        } else {
+            raw.into_iter().map(|s| s.user_scoped()).collect()
+        }
     } else {
-        scoped
+        let raw = state.live_state.history_window(&query.window);
+        if include_operator {
+            raw
+        } else {
+            raw.into_iter().map(|s| s.user_scoped()).collect()
+        }
     };
-    let snapshot_values: Vec<serde_json::Value> = snapshots
+
+    let snapshot_values: Vec<serde_json::Value> = scoped
         .iter()
         .filter_map(|s| serde_json::to_value(s).ok())
         .collect();
 
+    let (final_status, final_message) = if snapshot_values.is_empty()
+        && (query.module.is_some() || query.severity.is_some() || query.metric.is_some())
+    {
+        (
+            status,
+            format!(
+                "No snapshots match the applied filter within the {} window.",
+                query.window
+            ),
+        )
+    } else {
+        (status, message)
+    };
+
     Json(MetricsHistoryResponse {
         window: query.window,
         snapshots: snapshot_values,
-        status,
-        message,
+        status: final_status,
+        message: final_message,
     })
 }
 
@@ -250,12 +284,17 @@ pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<
 pub async fn get_findings_summary(
     state: axum::extract::State<Arc<SharedState>>,
 ) -> Json<FindingsSummaryResponse> {
-    let Some(snapshot) = state.live_state.current() else {
+    let Some(raw_snapshot) = state.live_state.current() else {
         return Json(FindingsSummaryResponse {
             total: 0,
             by_module: HashMap::new(),
             by_severity: HashMap::new(),
         });
+    };
+    let snapshot = if state.audience.operator_enabled() {
+        raw_snapshot
+    } else {
+        raw_snapshot.user_scoped()
     };
     let total = snapshot
         .user_summary
@@ -315,12 +354,17 @@ pub async fn get_findings_churn(
 }
 
 pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<HealthResponse> {
-    let Some(snapshot) = state.live_state.current() else {
+    let Some(raw_snapshot) = state.live_state.current() else {
         return Json(HealthResponse {
             score: None,
             grade: "\u{2014}".to_owned(),
             files: Vec::new(),
         });
+    };
+    let snapshot = if state.audience.operator_enabled() {
+        raw_snapshot
+    } else {
+        raw_snapshot.user_scoped()
     };
     let health_scores: Vec<f64> = snapshot
         .data_points

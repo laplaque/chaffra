@@ -1204,6 +1204,7 @@ fn cmd_telemetry_test(tel_config: &chaffra_telemetry::TelemetryConfig) -> Result
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64,
+        user_scoped: false,
     });
 
     let snapshot = collector.snapshot();
@@ -1320,6 +1321,7 @@ fn run_with_telemetry<F>(
     explicit_cli_audience: bool,
     command_name: &str,
     live_state: Option<&chaffra_telemetry::LiveTelemetryState>,
+    project_root: &std::path::Path,
     f: F,
 ) -> Result<String>
 where
@@ -1350,7 +1352,12 @@ where
     let ls = live_state.unwrap_or(&fallback_state);
 
     if !failed {
-        chaffra_telemetry::finalize_and_flush_sampled(&collector, ls, &effective_config);
+        chaffra_telemetry::finalize_and_flush_sampled(
+            &collector,
+            ls,
+            &effective_config,
+            project_root,
+        );
     } else {
         chaffra_telemetry::flush_snapshot(&collector, ls, &effective_config);
     }
@@ -1378,6 +1385,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "health",
                     Some(&live_state),
+                    &root,
                     |_collector| { cmd_health(&root, &config, formatter.as_ref()) }
                 )?
             );
@@ -1394,6 +1402,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "dead-code",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_dead_code(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1410,6 +1419,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "security",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_security(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1426,6 +1436,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "audit",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_audit(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1442,6 +1453,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "hotspot",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_hotspot(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1458,6 +1470,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "ai-quality",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_ai_quality(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1474,6 +1487,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "llm-defense",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_llm_defense(&root, &config, formatter.as_ref(), collector) }
                 )?
             );
@@ -1490,6 +1504,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "cicd-security",
                     Some(&live_state),
+                    &root,
                     |collector| {
                         cmd_cicd_security(&root, &config, formatter.as_ref(), collector)
                     }
@@ -1512,6 +1527,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "duplication",
                     Some(&live_state),
+                    &root,
                     |collector| {
                         cmd_dupes(
                             &root,
@@ -1537,6 +1553,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "architecture",
                     Some(&live_state),
+                    &root,
                     |collector| {
                         cmd_boundaries(
                             &root,
@@ -1565,6 +1582,7 @@ async fn main() -> Result<()> {
                 live_state.clone(),
                 tel_config.clone(),
                 explicit_cli_audience,
+                cli.config.clone(),
             );
             server
                 .run()
@@ -1577,6 +1595,7 @@ async fn main() -> Result<()> {
                 live_state.clone(),
                 tel_config.clone(),
                 explicit_cli_audience,
+                cli.config.clone(),
             )
             .await?;
         }
@@ -1596,6 +1615,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "fix",
                     Some(&live_state),
+                    &root,
                     |collector| { cmd_fix(&root, &config, dry_run, rule.as_deref(), collector) }
                 )?
             );
@@ -1627,7 +1647,15 @@ async fn main() -> Result<()> {
         Command::Tui { path } => {
             let root = Path::new(&path).canonicalize().context("invalid path")?;
             let config = load_config(cli.config.as_deref(), &root)?;
-            let output = cmd_tui(&root, &config)?;
+            let output = run_with_telemetry(
+                &tel_config,
+                &config,
+                explicit_cli_audience,
+                "tui",
+                Some(&live_state),
+                &root,
+                |_collector| cmd_tui(&root, &config),
+            )?;
             if !output.is_empty() {
                 print!("{output}");
             }
@@ -1672,6 +1700,7 @@ async fn main() -> Result<()> {
                     explicit_cli_audience,
                     "impact",
                     Some(&live_state),
+                    &root,
                     |collector| {
                         cmd_impact(
                             &root,
@@ -1799,6 +1828,7 @@ async fn main() -> Result<()> {
                     &analysis_collector,
                     &state,
                     analysis_collector.config(),
+                    &config_root,
                 );
                 state
             } else {
@@ -2902,6 +2932,7 @@ mod tests {
             false,
             "dead-code",
             None,
+            std::path::Path::new("."),
             |collector| cmd_dead_code(&root, &config, formatter.as_ref(), collector),
         )
         .unwrap();
@@ -2954,6 +2985,7 @@ mod tests {
             false,
             "failing-cmd",
             None,
+            std::path::Path::new("."),
             |_collector| anyhow::bail!("simulated analysis failure"),
         );
 
@@ -3006,6 +3038,7 @@ mod tests {
             false,
             "failing-cmd",
             None,
+            std::path::Path::new("."),
             |_collector| anyhow::bail!("simulated analysis failure"),
         );
 
@@ -3082,6 +3115,7 @@ mod tests {
             false,
             "failing-cmd",
             None,
+            std::path::Path::new("."),
             |_collector| anyhow::bail!("simulated failure to trigger error flush"),
         );
 
@@ -3135,6 +3169,7 @@ mod tests {
             false,
             "dead-code",
             None,
+            std::path::Path::new("."),
             |collector| cmd_dead_code(&root, &config, formatter.as_ref(), collector),
         );
 
@@ -3360,6 +3395,7 @@ mod tests {
             false,
             "test",
             None,
+            std::path::Path::new("."),
             |_collector| Ok("success".to_owned()),
         );
         assert!(result.is_ok());
@@ -3376,6 +3412,7 @@ mod tests {
             false,
             "test",
             None,
+            std::path::Path::new("."),
             |_collector| anyhow::bail!("test error"),
         );
         assert!(result.is_err());
@@ -3394,6 +3431,7 @@ mod tests {
             false,
             "test",
             None,
+            std::path::Path::new("."),
             |_collector| Ok("done".to_owned()),
         );
         assert_eq!(result.unwrap(), "done");
@@ -3410,6 +3448,7 @@ mod tests {
             false,
             "test",
             Some(&live_state),
+            std::path::Path::new("."),
             |collector| {
                 collector.set_files_total(5);
                 Ok("with-live".to_owned())
@@ -3429,9 +3468,17 @@ mod tests {
         let config = chaffra_telemetry::TelemetryConfig::default();
         let project_config =
             ChaffraConfig::parse("[modules.telemetry]\naudience = \"bogus\"\n").unwrap();
-        let result = run_with_telemetry(&config, &project_config, false, "test", None, |_| {
-            panic!("closure should never be called when config is invalid");
-        });
+        let result = run_with_telemetry(
+            &config,
+            &project_config,
+            false,
+            "test",
+            None,
+            std::path::Path::new("."),
+            |_| {
+                panic!("closure should never be called when config is invalid");
+            },
+        );
         assert!(result.is_err(), "invalid config should propagate as error");
         assert!(
             result.unwrap_err().to_string().contains("bogus"),

@@ -12,6 +12,7 @@ pub struct McpServer {
     live_state: chaffra_telemetry::LiveTelemetryState,
     tel_config: chaffra_telemetry::TelemetryConfig,
     explicit_cli_audience: bool,
+    config_path: Option<String>,
 }
 
 impl McpServer {
@@ -20,12 +21,14 @@ impl McpServer {
         live_state: chaffra_telemetry::LiveTelemetryState,
         tel_config: chaffra_telemetry::TelemetryConfig,
         explicit_cli_audience: bool,
+        config_path: Option<String>,
     ) -> Self {
         Self {
             initialized: false,
             live_state,
             tel_config,
             explicit_cli_audience,
+            config_path,
         }
     }
 
@@ -153,6 +156,7 @@ impl McpServer {
             &self.live_state,
             &self.tel_config,
             self.explicit_cli_audience,
+            self.config_path.as_deref(),
         );
         JsonRpcResponse::success(request.id.clone(), serde_json::to_value(result).unwrap())
     }
@@ -168,6 +172,7 @@ impl Default for McpServer {
             chaffra_telemetry::LiveTelemetryState::new(),
             chaffra_telemetry::TelemetryConfig::default(),
             false,
+            None,
         )
     }
 }

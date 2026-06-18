@@ -75,30 +75,35 @@ impl ParseCacheMetrics {
                 value: self.hits() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.parse.cache_misses".to_owned(),
                 value: self.misses() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.parse.cache_hit_rate".to_owned(),
                 value: self.hit_rate(),
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.parse.cache_size_bytes".to_owned(),
                 value: self.size_bytes() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
             MetricDataPoint {
                 name: "chaffra.parse.cache_evictions".to_owned(),
                 value: self.evictions() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
+                user_scoped: true,
             },
         ];
 
