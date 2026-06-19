@@ -251,7 +251,7 @@ The management API exposes these as query params on `GET /api/v1/metrics/history
 - One intentionally slow module (security=850ms)
 - Module errors and backend connectivity warnings
 - Cache hit/miss metrics
-- Snapshots spaced ~16 hours apart over a simulated 7-day window
+- Snapshots spaced 15 hours apart over a simulated 7-day window
 - Deterministic timestamps (base: `1_718_000_000_000`)
 
 The `management` command behavior depends on the mode:

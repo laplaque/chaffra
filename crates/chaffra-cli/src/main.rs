@@ -1385,6 +1385,32 @@ fn run_with_telemetry<F>(
 where
     F: FnOnce(&chaffra_telemetry::TelemetryCollector) -> Result<String>,
 {
+    run_with_telemetry_opts(
+        tel_config,
+        project_config,
+        explicit_cli_audience,
+        command_name,
+        live_state,
+        project_root,
+        false,
+        f,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_telemetry_opts<F>(
+    tel_config: &chaffra_telemetry::TelemetryConfig,
+    project_config: &ChaffraConfig,
+    explicit_cli_audience: bool,
+    command_name: &str,
+    live_state: Option<&chaffra_telemetry::LiveTelemetryState>,
+    project_root: &std::path::Path,
+    skip_churn: bool,
+    f: F,
+) -> Result<String>
+where
+    F: FnOnce(&chaffra_telemetry::TelemetryCollector) -> Result<String>,
+{
     let effective_config =
         merge_telemetry_config(tel_config, project_config, explicit_cli_audience)?;
 
@@ -1409,7 +1435,7 @@ where
     let fallback_state = chaffra_telemetry::LiveTelemetryState::new();
     let ls = live_state.unwrap_or(&fallback_state);
 
-    if !failed {
+    if !failed && !skip_churn {
         chaffra_telemetry::finalize_and_flush_sampled(
             &collector,
             ls,
@@ -1437,13 +1463,14 @@ async fn main() -> Result<()> {
             let config = load_config(cli.config.as_deref(), &root)?;
             print!(
                 "{}",
-                run_with_telemetry(
+                run_with_telemetry_opts(
                     &tel_config,
                     &config,
                     explicit_cli_audience,
                     "health",
                     Some(&live_state),
                     &root,
+                    true, // health produces scores, not findings — skip churn persistence
                     |_collector| { cmd_health(&root, &config, formatter.as_ref()) }
                 )?
             );
@@ -2992,10 +3019,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Temporarily override the state file path by running in the temp dir.
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let formatter = create_formatter(OutputFormat::Terminal);
         let output = run_with_telemetry(
             &tel_config,
@@ -3003,12 +3026,10 @@ mod tests {
             false,
             "dead-code",
             None,
-            std::path::Path::new("."),
+            dir.path(),
             |collector| cmd_dead_code(&root, &config, formatter.as_ref(), collector),
         )
         .unwrap();
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(!output.is_empty());
 
@@ -3049,20 +3070,15 @@ mod tests {
             ..Default::default()
         };
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let result = run_with_telemetry(
             &tel_config,
             &config,
             false,
             "failing-cmd",
             None,
-            std::path::Path::new("."),
+            dir.path(),
             |_collector| anyhow::bail!("simulated analysis failure"),
         );
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(result.is_err());
 

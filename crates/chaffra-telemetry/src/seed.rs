@@ -11,8 +11,8 @@ use std::collections::HashMap;
 /// Deterministic base timestamp (fixed, not wall-clock dependent).
 const BASE_TS: u64 = 1_718_000_000_000;
 
-/// Interval between historical snapshots (~15 hours in milliseconds).
-/// 12 snapshots × 11 intervals × 54M ms = 594M ms < 604.8M ms (7 days),
+/// Interval between historical snapshots (15 hours in milliseconds).
+/// 12 snapshots x 11 intervals x 54M ms = 594M ms < 604.8M ms (7 days),
 /// so all snapshots fit within a 7-day query window.
 const SNAPSHOT_INTERVAL: u64 = 54_000_000;
 
@@ -26,7 +26,7 @@ const SNAPSHOT_INTERVAL: u64 = 54_000_000;
 /// - At least one module error (security, on odd iterations)
 /// - At least one telemetry backend connectivity warning (OTLP, on iteration 3)
 /// - Cache hit/miss metrics
-/// - 12 historical snapshots spaced ~16 hours apart over a simulated 7-day window
+/// - 12 historical snapshots spaced 15 hours apart over a simulated 7-day window
 pub fn seed_live_state() -> LiveTelemetryState {
     let state = LiveTelemetryState::new();
 

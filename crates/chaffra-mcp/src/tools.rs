@@ -259,31 +259,21 @@ pub fn execute_health(
         let duration_ms = start.elapsed().as_millis() as u64;
         collector.record_module_call("complexity", duration_ms, false);
 
-        // Only count problem files (score < 80) as findings.
-        let mut sev_counts = std::collections::HashMap::new();
-        let mut fingerprints = std::collections::HashSet::new();
-        for file_score in &health.files {
-            if file_score.score < 60 {
-                *sev_counts.entry("error".to_owned()).or_insert(0u64) += 1;
-                fingerprints.insert(chaffra_telemetry::churn::FindingFingerprint::new(
-                    "complexity:health",
-                    &file_score.file,
-                    0,
-                ));
-            } else if file_score.score < 80 {
-                *sev_counts.entry("warning".to_owned()).or_insert(0u64) += 1;
-                fingerprints.insert(chaffra_telemetry::churn::FindingFingerprint::new(
-                    "complexity:health",
-                    &file_score.file,
-                    0,
-                ));
-            }
-        }
-        let finding_count: u64 = sev_counts.values().sum();
-        collector.record_module_findings("complexity", finding_count, &sev_counts);
-        collector.set_finding_fingerprints(fingerprints);
+        // Record health scores as metrics, not findings — health does not
+        // participate in findings churn.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        collector.record_data_point(chaffra_telemetry::MetricDataPoint {
+            name: "chaffra.health.score".to_owned(),
+            value: health.score as f64,
+            labels: std::collections::HashMap::new(),
+            timestamp_ms: ts,
+            user_scoped: true,
+        });
 
-        chaffra_telemetry::finalize_and_flush_sampled(collector, live_state, &effective_tel, &root);
+        chaffra_telemetry::flush_snapshot(collector, live_state, &effective_tel);
     }
 
     match serde_json::to_string_pretty(&health) {

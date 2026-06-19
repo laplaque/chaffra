@@ -1141,8 +1141,40 @@ mod tests {
         assert_eq!(roundtrip.inline_metrics.len(), 1);
         assert_eq!(roundtrip.inline_metrics[0].name, "call_latency_ms");
         assert!((roundtrip.inline_metrics[0].value - 42.5).abs() < 0.01);
+        assert!(
+            !roundtrip.inline_metrics[0].user_scoped,
+            "user_scoped should roundtrip as false"
+        );
         assert_eq!(roundtrip.inline_spans.len(), 1);
         assert_eq!(roundtrip.inline_spans[0].name, "analyze");
         assert_eq!(roundtrip.inline_spans[0].trace_id, "abc123");
+    }
+
+    #[test]
+    fn test_module_metrics_roundtrip_user_scoped_true() {
+        use crate::diagnostic::{InlineMetric, InlineSpan};
+
+        let metrics = crate::diagnostic::ModuleMetrics {
+            files_analyzed: 5,
+            duration_ms: 20,
+            counters: HashMap::new(),
+            inline_metrics: vec![InlineMetric {
+                name: "user_metric".to_owned(),
+                value: 99.0,
+                labels: HashMap::new(),
+                timestamp_ms: 2000,
+                user_scoped: true,
+            }],
+            inline_spans: vec![],
+        };
+
+        let proto = convert::module_metrics_to_proto(&metrics);
+        let roundtrip = convert::module_metrics_from_proto(&proto);
+        assert_eq!(roundtrip.inline_metrics.len(), 1);
+        assert_eq!(roundtrip.inline_metrics[0].name, "user_metric");
+        assert!(
+            roundtrip.inline_metrics[0].user_scoped,
+            "user_scoped should roundtrip as true"
+        );
     }
 }

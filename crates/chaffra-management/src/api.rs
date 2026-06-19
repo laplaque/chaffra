@@ -163,7 +163,7 @@ pub async fn get_metrics_history(
         );
     }
 
-    let source = state.live_state.source();
+    let (source, raw_history) = state.live_state.source_and_history_window(&query.window);
     let (status, message) = match source {
         chaffra_telemetry::StateSource::Live => (
             "live".to_owned(),
@@ -196,9 +196,7 @@ pub async fn get_metrics_history(
         );
     }
 
-    let projected: Vec<_> = state
-        .live_state
-        .history_window(&query.window)
+    let projected: Vec<_> = raw_history
         .into_iter()
         .map(|s| s.project_for_audience(audience))
         .collect();

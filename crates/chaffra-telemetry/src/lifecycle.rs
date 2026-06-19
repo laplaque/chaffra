@@ -46,44 +46,57 @@ fn finalize_inner(
     let lock = churn::project_lock(&canonical_root);
     let current_hash = churn::hash_fingerprints(&fingerprints);
 
-    // Lock scope: load churn state, compute churn, save state.
-    // flush_to_backends and push_snapshot are deliberately outside the
-    // lock so backend I/O (OTLP timeouts etc.) doesn't block concurrent
-    // finalize calls for the same project.
-    {
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        match churn::load_state(&state_path) {
-            Ok(Some(prev)) => {
-                let churn_result = churn::compute_churn(&fingerprints, &prev);
-                collector.record_finding_churn(&churn_result);
+    let previous_state = match churn::load_state(&state_path) {
+        Ok(prev) => prev,
+        Err(e) => {
+            eprintln!("Warning: {e}; skipping churn and preserving existing state");
+            let snapshot = collector.snapshot();
+            live_state.push_snapshot(snapshot.clone());
+            let should_flush = !use_sampling || should_flush_sampled(config, current_hash, None);
+            drop(guard);
+            if should_flush {
+                flush_to_backends(&snapshot, config);
             }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("Warning: {e}; skipping churn and overwriting corrupted state");
-            }
+            return FinalizeResult {
+                snapshot,
+                findings_hash: current_hash,
+            };
         }
+    };
 
-        let new_state = churn::ChurnState {
-            fingerprints,
-            findings_hash: current_hash,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        };
-        if let Err(e) = churn::save_state(&new_state, &state_path) {
-            eprintln!(
-                "Warning: failed to persist telemetry churn state to {}: {e}",
-                state_path.display()
-            );
-        }
+    if let Some(ref prev) = previous_state {
+        let churn_result = churn::compute_churn(&fingerprints, prev);
+        collector.record_finding_churn(&churn_result);
     }
 
     let snapshot = collector.snapshot();
     live_state.push_snapshot(snapshot.clone());
 
-    let should_flush = !use_sampling || should_flush_sampled(config, current_hash, None);
+    let should_flush = !use_sampling
+        || should_flush_sampled(
+            config,
+            current_hash,
+            previous_state.as_ref().map(|s| s.findings_hash),
+        );
+
+    let new_state = churn::ChurnState {
+        fingerprints,
+        findings_hash: current_hash,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    if let Err(e) = churn::save_state(&new_state, &state_path) {
+        eprintln!(
+            "Warning: failed to persist telemetry churn state to {}: {e}",
+            state_path.display()
+        );
+    }
+
+    drop(guard);
 
     if should_flush {
         flush_to_backends(&snapshot, config);

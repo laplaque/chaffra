@@ -238,7 +238,7 @@ fn binary_health_telemetry_on() {
     let out = chaffra_cmd()
         .args(["health", &fixture_path("simple")])
         .arg("--telemetry")
-        .arg("user")
+        .arg("on")
         .output()
         .unwrap();
     assert!(

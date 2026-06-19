@@ -77,6 +77,10 @@ pub struct AnalysisOutput {
     pub text: String,
     pub findings: Vec<chaffra_core::diagnostic::Finding>,
     pub had_module_error: bool,
+    /// Relative paths of files that were successfully read and analyzed.
+    /// Used to distinguish "successfully analyzed (no findings)" from
+    /// "unreadable (skipped)" when updating fingerprints.
+    pub analyzed_files: std::collections::HashSet<String>,
 }
 
 /// Run analysis on changed files and print results.
@@ -94,6 +98,7 @@ pub fn run_analysis_on_changes(
             text: String::new(),
             findings: Vec::new(),
             had_module_error: false,
+            analyzed_files: std::collections::HashSet::new(),
         });
     }
 
@@ -113,11 +118,15 @@ pub fn run_analysis_on_changes(
         })
         .collect();
 
+    let analyzed_files: std::collections::HashSet<String> =
+        files.iter().map(|f| f.path.clone()).collect();
+
     if files.is_empty() {
         return Ok(AnalysisOutput {
             text: String::new(),
             findings: Vec::new(),
             had_module_error: false,
+            analyzed_files,
         });
     }
 
@@ -172,6 +181,7 @@ pub fn run_analysis_on_changes(
         text: output,
         findings: all_findings,
         had_module_error,
+        analyzed_files,
     })
 }
 
@@ -240,9 +250,18 @@ pub(crate) fn run_watch_iteration(
             let duration_ms = start.elapsed().as_millis() as u64;
             collector.record_module_call("watch", duration_ms, ao.had_module_error);
 
-            // Remove old fingerprints for all changed files (including deleted ones).
-            for file in &all_changed_relative {
-                project_fingerprints.remove(file);
+            // Remove old fingerprints only for files that are:
+            // - Actually deleted (path no longer exists on disk), or
+            // - Successfully analyzed (will be replaced with fresh fingerprints below).
+            // Preserve fingerprints for files that exist but failed to read,
+            // so unreadable files don't silently appear resolved.
+            for rel_path in &all_changed_relative {
+                let abs_path = root.join(rel_path);
+                let is_deleted = !abs_path.exists();
+                let was_analyzed = ao.analyzed_files.contains(rel_path);
+                if is_deleted || was_analyzed {
+                    project_fingerprints.remove(rel_path);
+                }
             }
             for fp in crate::fingerprints_from_findings(&ao.findings) {
                 project_fingerprints

@@ -75,27 +75,35 @@ impl LiveTelemetryState {
         }
     }
 
-    /// Push a new snapshot. Updates `current` and appends to history.
+    /// Push a new snapshot. Updates `current` (if newer) and inserts into history.
     /// If the history buffer is full, the oldest snapshot is evicted.
     /// When transitioning from `Seeded` to `Live`, clears seeded history
     /// so the buffer only contains live data.
+    ///
+    /// All snapshots are recorded in the bounded history in timestamp order,
+    /// even if their timestamp is older than `current`. This ensures concurrent
+    /// runs (both successful and failed) are preserved for Phase 15a reporting.
     pub fn push_snapshot(&self, snapshot: TelemetrySnapshot) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let dominated = inner
             .current
             .as_ref()
             .is_some_and(|c| c.timestamp_ms > snapshot.timestamp_ms);
-        if dominated {
-            return;
-        }
         if inner.source == StateSource::Seeded {
             inner.history.clear();
         }
-        inner.current = Some(snapshot.clone());
+        if !dominated {
+            inner.current = Some(snapshot.clone());
+        }
         if inner.history.len() >= inner.max_history {
             inner.history.pop_front();
         }
-        inner.history.push_back(snapshot);
+        // Insert at the correct position to maintain timestamp order.
+        let pos = inner
+            .history
+            .binary_search_by_key(&snapshot.timestamp_ms, |s| s.timestamp_ms)
+            .unwrap_or_else(|i| i);
+        inner.history.insert(pos, snapshot);
         if inner.source != StateSource::Live {
             inner.source = StateSource::Live;
         }
@@ -127,6 +135,24 @@ impl LiveTelemetryState {
     pub fn set_source(&self, source: StateSource) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.source = source;
+    }
+
+    /// Atomically read the source and history window under a single read lock.
+    ///
+    /// Returns `(StateSource, Vec<TelemetrySnapshot>)` so callers that need both
+    /// values observe a consistent snapshot of the inner state.
+    pub fn source_and_history_window(&self, window: &str) -> (StateSource, Vec<TelemetrySnapshot>) {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let window_ms = parse_window_ms(window).unwrap_or(604_800_000);
+        let latest_ts = inner.current.as_ref().map(|s| s.timestamp_ms).unwrap_or(0);
+        let cutoff = latest_ts.saturating_sub(window_ms);
+        let snapshots = inner
+            .history
+            .iter()
+            .filter(|s| s.timestamp_ms >= cutoff)
+            .cloned()
+            .collect();
+        (inner.source, snapshots)
     }
 
     /// Query history snapshots within a time window.
@@ -401,9 +427,9 @@ mod tests {
         t2.join().unwrap();
 
         let count = state.snapshot_count();
-        assert!(
-            count >= 100,
-            "at least thread t2's ascending snapshots should be accepted, got {count}"
+        assert_eq!(
+            count, 200,
+            "all snapshots (even older concurrent ones) must be recorded, got {count}"
         );
         assert!(state.current().is_some());
     }
