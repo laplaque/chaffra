@@ -9,7 +9,12 @@ use crate::dashboard_html::DASHBOARD_HTML;
 pub struct SharedState {
     pub collector: chaffra_telemetry::TelemetryCollector,
     pub live_state: chaffra_telemetry::LiveTelemetryState,
-    pub audience: chaffra_telemetry::config::TelemetryAudience,
+}
+
+impl SharedState {
+    pub fn audience(&self) -> chaffra_telemetry::config::TelemetryAudience {
+        self.collector.config().audience
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -33,14 +38,12 @@ impl ManagementServer {
         config: ManagementConfig,
         collector: chaffra_telemetry::TelemetryCollector,
         live_state: chaffra_telemetry::LiveTelemetryState,
-        audience: chaffra_telemetry::config::TelemetryAudience,
     ) -> Self {
         Self {
             config,
             state: Arc::new(SharedState {
                 collector,
                 live_state,
-                audience,
             }),
         }
     }
@@ -100,7 +103,6 @@ mod tests {
         Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         })
     }
 
@@ -199,7 +201,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -241,7 +242,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -279,7 +279,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -313,7 +312,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -348,7 +346,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -370,12 +367,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_history_operator_audience() {
-        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::On,
+                ..Default::default()
+            });
         let live_state = chaffra_telemetry::seed::seed_live_state();
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::On,
         });
         let app = build_router(state);
         let resp = app
@@ -402,12 +402,7 @@ mod tests {
         let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
         let config = ManagementConfig { port: 0 };
-        let server = ManagementServer::new(
-            config,
-            collector,
-            live_state,
-            chaffra_telemetry::config::TelemetryAudience::UserOnly,
-        );
+        let server = ManagementServer::new(config, collector, live_state);
         let app = server.router();
         let resp = app
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -426,7 +421,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -454,7 +448,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_endpoint_operator_includes_all_datapoints() {
-        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::On,
+                ..Default::default()
+            });
         collector.record_module_call("dead-code", 150, false);
         collector.set_files_total(10);
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
@@ -462,7 +460,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::On,
         });
         let app = build_router(state);
         let resp = app
@@ -494,7 +491,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -518,7 +514,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_modules_operator_shows_error_status() {
-        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::On,
+                ..Default::default()
+            });
         collector.record_module_call("dead-code", 150, true);
         collector.set_files_total(1);
         let live_state = chaffra_telemetry::LiveTelemetryState::new();
@@ -526,7 +526,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::On,
         });
         let app = build_router(state);
         let resp = app
@@ -582,7 +581,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
 
@@ -662,7 +660,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
 
@@ -733,7 +730,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_history_filter_by_module() {
-        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::On,
+                ..Default::default()
+            });
         collector.set_files_total(20);
         collector.record_module_call("dead-code", 150, false);
         collector.record_module_findings(
@@ -755,7 +756,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::On,
         });
         let app = build_router(state);
         let resp = app
@@ -803,7 +803,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
         let resp = app
@@ -840,7 +839,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_history_filter_by_metric() {
-        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::On,
+                ..Default::default()
+            });
         collector.set_files_total(10);
         collector.record_module_call("dead-code", 150, false);
 
@@ -849,7 +852,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::On,
         });
         let app = build_router(state);
         let resp = app
@@ -913,7 +915,6 @@ mod tests {
         let state = Arc::new(SharedState {
             collector,
             live_state,
-            audience: chaffra_telemetry::config::TelemetryAudience::UserOnly,
         });
         let app = build_router(state);
 

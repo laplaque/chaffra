@@ -107,6 +107,7 @@ message MetricDataPoint {
   double value = 2;
   map<string, string> labels = 3;
   uint64 timestamp_ms = 4;
+  bool user_scoped = 5;
 }
 
 message SpanData {

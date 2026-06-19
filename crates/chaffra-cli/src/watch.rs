@@ -278,7 +278,24 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
     let root = watch_config.root.clone();
     let config = watch_config.config.clone();
     let format = watch_config.format;
-    let mut project_fingerprints = std::collections::HashMap::new();
+    let mut project_fingerprints: std::collections::HashMap<
+        String,
+        std::collections::HashSet<chaffra_telemetry::churn::FindingFingerprint>,
+    > = {
+        let state_path = root.join(chaffra_telemetry::churn::STATE_FILE);
+        match chaffra_telemetry::churn::load_state(&state_path) {
+            Some(state) => {
+                let mut map = std::collections::HashMap::new();
+                for fp in state.fingerprints {
+                    map.entry(fp.file.clone())
+                        .or_insert_with(std::collections::HashSet::new)
+                        .insert(fp);
+                }
+                map
+            }
+            None => std::collections::HashMap::new(),
+        }
+    };
 
     eprintln!(
         "Watching {} for changes (debounce: {}ms)...",

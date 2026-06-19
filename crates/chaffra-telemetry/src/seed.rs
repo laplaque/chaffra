@@ -23,7 +23,8 @@ const SNAPSHOT_INTERVAL: u64 = 54_000_000;
 /// - Findings across 3+ severities and 2+ modules
 /// - New, resolved, and unchanged finding churn
 /// - Module call durations with one intentionally slow module (security=850ms)
-/// - At least one module error and one backend connectivity warning
+/// - At least one module error (security, on odd iterations)
+/// - At least one telemetry backend connectivity warning (OTLP, on iteration 3)
 /// - Cache hit/miss metrics
 /// - 12 historical snapshots spaced ~16 hours apart over a simulated 7-day window
 pub fn seed_live_state() -> LiveTelemetryState {
@@ -331,11 +332,12 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     // Backend connectivity warning (on iteration 3)
     if iteration == 3 {
         data_points.push(MetricDataPoint {
-            name: "chaffra.plugin.connect_error_total".to_owned(),
+            name: "chaffra.backend.connect_error_total".to_owned(),
             value: 1.0,
             labels: {
                 let mut m = HashMap::new();
-                m.insert("module".to_owned(), "fastapi-module".to_owned());
+                m.insert("backend".to_owned(), "otlp".to_owned());
+                m.insert("endpoint".to_owned(), "localhost:4317".to_owned());
                 m
             },
             timestamp_ms: ts,
@@ -424,6 +426,11 @@ fn core_definitions() -> HashMap<String, MetricDefinition> {
             "chaffra.plugin.connect_error_total",
             MetricKind::Counter,
             "External module gRPC connection failures",
+        ),
+        (
+            "chaffra.backend.connect_error_total",
+            MetricKind::Counter,
+            "Telemetry backend connectivity failures",
         ),
         (
             "chaffra.findings.new",
@@ -637,7 +644,7 @@ mod tests {
         let has_connect_error = history.iter().any(|s| {
             s.data_points
                 .iter()
-                .any(|p| p.name == "chaffra.plugin.connect_error_total")
+                .any(|p| p.name == "chaffra.backend.connect_error_total")
         });
         assert!(
             has_connect_error,

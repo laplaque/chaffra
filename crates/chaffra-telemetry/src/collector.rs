@@ -84,6 +84,44 @@ impl TelemetrySnapshot {
             operator_summary: OperatorSummary::default(),
         }
     }
+
+    /// Project this snapshot for a specific audience mode.
+    ///
+    /// - `Off`: empty snapshot (no data points, no summaries)
+    /// - `UserOnly`: user-scoped data points + user summary only
+    /// - `OperatorOnly`: operator data points + operator summary only
+    /// - `On`: full snapshot unchanged
+    pub fn project_for_audience(&self, audience: crate::config::TelemetryAudience) -> Self {
+        use crate::config::TelemetryAudience;
+        match audience {
+            TelemetryAudience::On => self.clone(),
+            TelemetryAudience::UserOnly => self.user_scoped(),
+            TelemetryAudience::OperatorOnly => {
+                let operator_data_points = self
+                    .data_points
+                    .iter()
+                    .filter(|dp| !dp.user_scoped)
+                    .cloned()
+                    .collect();
+                Self {
+                    timestamp_ms: self.timestamp_ms,
+                    definitions: self.definitions.clone(),
+                    data_points: operator_data_points,
+                    spans: self.spans.clone(),
+                    user_summary: UserSummary::default(),
+                    operator_summary: self.operator_summary.clone(),
+                }
+            }
+            TelemetryAudience::Off => Self {
+                timestamp_ms: self.timestamp_ms,
+                definitions: HashMap::new(),
+                data_points: Vec::new(),
+                spans: Vec::new(),
+                user_summary: UserSummary::default(),
+                operator_summary: OperatorSummary::default(),
+            },
+        }
+    }
 }
 
 /// Thread-safe telemetry collector.
@@ -979,5 +1017,77 @@ mod tests {
             scoped.user_summary.findings_by_module.get("dead-code"),
             Some(&3)
         );
+    }
+
+    #[test]
+    fn test_project_for_audience_all_modes() {
+        use crate::config::TelemetryAudience;
+
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+
+        // Record operator metrics (user_scoped: false).
+        collector.record_module_call("dead-code", 42, false);
+        collector.record_module_startup("dead-code", 15);
+
+        // Record user metrics (user_scoped: true).
+        let mut severity_counts = HashMap::new();
+        severity_counts.insert("warning".to_owned(), 3);
+        collector.record_module_findings("dead-code", 3, &severity_counts);
+
+        let full = collector.snapshot();
+
+        // --- On: identical to the full snapshot ---
+        let on = full.project_for_audience(TelemetryAudience::On);
+        assert_eq!(on.data_points.len(), full.data_points.len());
+        assert_eq!(on.definitions.len(), full.definitions.len());
+        assert_eq!(
+            on.user_summary.findings_by_module.get("dead-code"),
+            Some(&3)
+        );
+        assert!(
+            on.operator_summary
+                .module_call_durations
+                .contains_key("dead-code")
+        );
+
+        // --- UserOnly: only user-scoped data points, user summary preserved ---
+        let user = full.project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            user.data_points.iter().all(|dp| dp.user_scoped),
+            "UserOnly must contain only user-scoped data points"
+        );
+        assert!(!user.data_points.is_empty());
+        assert_eq!(
+            user.user_summary.findings_by_module.get("dead-code"),
+            Some(&3)
+        );
+        assert!(user.operator_summary.module_call_durations.is_empty());
+
+        // --- OperatorOnly: only operator data points, operator summary preserved ---
+        let operator = full.project_for_audience(TelemetryAudience::OperatorOnly);
+        assert!(
+            operator.data_points.iter().all(|dp| !dp.user_scoped),
+            "OperatorOnly must contain only operator data points"
+        );
+        assert!(!operator.data_points.is_empty());
+        assert!(operator.user_summary.findings_by_module.is_empty());
+        assert!(
+            operator
+                .operator_summary
+                .module_call_durations
+                .contains_key("dead-code")
+        );
+        assert!(!operator.spans.is_empty() || full.spans.is_empty()); // spans preserved
+
+        // --- Off: empty snapshot ---
+        let off = full.project_for_audience(TelemetryAudience::Off);
+        assert!(off.data_points.is_empty(), "Off must have no data points");
+        assert!(off.definitions.is_empty(), "Off must have no definitions");
+        assert!(off.spans.is_empty(), "Off must have no spans");
+        assert!(off.user_summary.findings_by_module.is_empty());
+        assert!(off.operator_summary.module_call_durations.is_empty());
+        // timestamp is preserved
+        assert_eq!(off.timestamp_ms, full.timestamp_ms);
     }
 }

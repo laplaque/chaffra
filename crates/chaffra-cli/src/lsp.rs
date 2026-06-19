@@ -8,7 +8,18 @@ use chaffra_core::diagnostic::{Finding, Severity};
 use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+static LSP_FINGERPRINTS: LazyLock<
+    Mutex<
+        std::collections::HashMap<
+            String,
+            std::collections::HashSet<chaffra_telemetry::churn::FindingFingerprint>,
+        >,
+    >,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// JSON-RPC request envelope for LSP.
 #[derive(Debug, Deserialize)]
@@ -119,7 +130,7 @@ pub(crate) fn merge_lsp_telemetry_config(
 fn discover_workspace_config(
     file_path: &str,
     config_path: Option<&str>,
-) -> (chaffra_core::config::ChaffraConfig, std::path::PathBuf) {
+) -> std::result::Result<(chaffra_core::config::ChaffraConfig, std::path::PathBuf), String> {
     use chaffra_core::config::ChaffraConfig;
     use std::path::{Path, PathBuf};
 
@@ -130,11 +141,8 @@ fn discover_workspace_config(
             .map(|d| d.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         match ChaffraConfig::load(p) {
-            Ok(c) => return (c, project_root),
-            Err(e) => {
-                eprintln!("Failed to load explicit config {cp}: {e}");
-                // Fall through to auto-discovery.
-            }
+            Ok(c) => return Ok((c, project_root)),
+            Err(e) => return Err(format!("Failed to load explicit config {cp}: {e}")),
         }
     }
 
@@ -154,11 +162,22 @@ fn discover_workspace_config(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let workspace_config = match config_dir {
-        Some(ref dir) => ChaffraConfig::load_from_dir(dir).unwrap_or_default(),
+        Some(ref dir) => match ChaffraConfig::load_from_dir(dir) {
+            Ok(c) => c,
+            Err(e) => {
+                if dir.join(".chaffra.toml").exists() {
+                    return Err(format!(
+                        "Malformed workspace config in {}: {e}",
+                        dir.display()
+                    ));
+                }
+                ChaffraConfig::default()
+            }
+        },
         None => ChaffraConfig::default(),
     };
 
-    (workspace_config, project_root)
+    Ok((workspace_config, project_root))
 }
 
 /// Run analysis on a file and return diagnostics grouped by file URI.
@@ -173,7 +192,15 @@ pub fn analyze_file_for_diagnostics(
     use chaffra_core::diagnostic::FileInfo;
     use std::path::Path;
 
-    let (workspace_config, project_root) = discover_workspace_config(file_path, config_path);
+    let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+
+    let (workspace_config, project_root) = match discover_workspace_config(file_path, config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Config error, skipping analysis: {e}");
+            return diagnostics;
+        }
+    };
 
     if matches!(
         tel_config.audience,
@@ -182,16 +209,14 @@ pub fn analyze_file_for_diagnostics(
         return analyze_file_no_telemetry(file_path, content, &workspace_config);
     }
 
-    let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-
     let relative = Path::new(file_path)
-        .file_name()
-        .unwrap_or_default()
+        .strip_prefix(&project_root)
+        .unwrap_or(Path::new(file_path))
         .to_string_lossy()
         .to_string();
 
     let files = vec![FileInfo {
-        path: relative,
+        path: relative.clone(),
         content: content.to_vec(),
     }];
 
@@ -250,8 +275,19 @@ pub fn analyze_file_for_diagnostics(
 
     let duration_ms = lsp_start.elapsed().as_millis() as u64;
     collector.record_module_call("lsp", duration_ms, had_error);
-    let fingerprints = crate::fingerprints_from_findings(&all_findings);
-    collector.set_finding_fingerprints(fingerprints);
+    let file_fingerprints = crate::fingerprints_from_findings(&all_findings);
+    {
+        let mut workspace_fps = LSP_FINGERPRINTS.lock().unwrap();
+        workspace_fps.insert(
+            relative.clone(),
+            file_fingerprints.iter().cloned().collect(),
+        );
+        let all_fps: std::collections::HashSet<_> = workspace_fps
+            .values()
+            .flat_map(|s| s.iter().cloned())
+            .collect();
+        collector.set_finding_fingerprints(all_fps);
+    }
 
     chaffra_telemetry::finalize_and_flush_sampled(
         &collector,
@@ -898,5 +934,46 @@ mod tests {
         );
         // Should run without panicking and produce a valid map.
         let _total: usize = diagnostics.values().map(|v| v.len()).sum();
+    }
+
+    #[test]
+    fn test_discover_workspace_config_explicit_path_fails_closed() {
+        let result =
+            discover_workspace_config("/tmp/test.go", Some("/tmp/nonexistent_chaffra_config.toml"));
+        assert!(
+            result.is_err(),
+            "explicit config path that fails to load should return Err"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Failed to load explicit config"),
+            "error message should mention explicit config: {err}"
+        );
+    }
+
+    #[test]
+    fn test_discover_workspace_config_no_config_uses_default() {
+        let result = discover_workspace_config("/tmp/test.go", None);
+        assert!(
+            result.is_ok(),
+            "no config path and no .chaffra.toml should succeed with defaults"
+        );
+    }
+
+    #[test]
+    fn test_analyze_file_bad_config_returns_empty() {
+        let ls = test_live_state();
+        let content = b"package main\n\nfunc main() {}\n";
+        // Pass a nonexistent explicit config path; should fail closed and return empty.
+        let diagnostics = analyze_file_for_diagnostics(
+            "/tmp/test.go",
+            content,
+            &ls,
+            &test_tel_config(),
+            false,
+            Some("/tmp/nonexistent_chaffra_config.toml"),
+        );
+        let total: usize = diagnostics.values().map(|v| v.len()).sum();
+        assert_eq!(total, 0, "bad config should produce no diagnostics");
     }
 }

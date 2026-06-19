@@ -38,6 +38,11 @@ fn finalize_inner(
 ) -> FinalizeResult {
     let fingerprints = collector.finding_fingerprints();
     let state_path = project_root.join(churn::STATE_FILE);
+
+    // Serialize churn load/compute/save under a per-project lock.
+    let lock = churn::project_lock(project_root);
+    let _guard = lock.lock().unwrap();
+
     let previous_state = churn::load_state(&state_path);
     let current_hash = churn::hash_fingerprints(&fingerprints);
 
@@ -80,6 +85,8 @@ fn finalize_inner(
         );
     }
 
+    drop(_guard);
+
     FinalizeResult {
         snapshot,
         findings_hash: current_hash,
@@ -97,12 +104,11 @@ pub fn flush_snapshot(
 }
 
 fn flush_to_backends(snapshot: &TelemetrySnapshot, config: &TelemetryConfig) {
+    if matches!(config.audience, crate::config::TelemetryAudience::Off) {
+        return;
+    }
     let (backends, _) = crate::backends::create_backends(&config.backends);
-    let flushed = if config.audience.operator_enabled() {
-        snapshot.clone()
-    } else {
-        snapshot.user_scoped()
-    };
+    let flushed = snapshot.project_for_audience(config.audience);
     for backend in &backends {
         if let Err(e) = backend.flush(&flushed) {
             eprintln!("Warning: telemetry backend flush failed: {e}");

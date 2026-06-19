@@ -100,7 +100,7 @@ fn default_window() -> String {
 }
 
 pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<MetricsResponse> {
-    let backends = if state.audience.operator_enabled() {
+    let backends = if state.audience().operator_enabled() {
         let (_, statuses) =
             chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
         statuses
@@ -124,11 +124,7 @@ pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<
             backends,
         });
     };
-    let snapshot = if state.audience.operator_enabled() {
-        raw_snapshot
-    } else {
-        raw_snapshot.user_scoped()
-    };
+    let snapshot = raw_snapshot.project_for_audience(state.audience());
     let data_points = snapshot
         .data_points
         .iter()
@@ -150,18 +146,21 @@ pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<
 pub async fn get_metrics_history(
     state: axum::extract::State<Arc<SharedState>>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
-) -> Json<MetricsHistoryResponse> {
+) -> (axum::http::StatusCode, Json<MetricsHistoryResponse>) {
     if !chaffra_telemetry::is_valid_window(&query.window) {
         let msg = format!(
             "Unsupported window '{}'. Supported: 1h, 24h, 7d",
             query.window
         );
-        return Json(MetricsHistoryResponse {
-            window: query.window,
-            snapshots: Vec::new(),
-            status: "error".to_owned(),
-            message: msg,
-        });
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(MetricsHistoryResponse {
+                window: query.window,
+                snapshots: Vec::new(),
+                status: "error".to_owned(),
+                message: msg,
+            }),
+        );
     }
 
     let source = state.live_state.source();
@@ -175,46 +174,45 @@ pub async fn get_metrics_history(
             "Seeded demo/test data. Run an analysis to populate live metrics.".to_owned(),
         ),
         chaffra_telemetry::StateSource::Empty => {
-            return Json(MetricsHistoryResponse {
+            return (axum::http::StatusCode::OK, Json(MetricsHistoryResponse {
                 window: query.window,
                 snapshots: Vec::new(),
                 status: "empty".to_owned(),
                 message: "No telemetry data available. Start the management server with seeded data, or run an analysis with a co-located management server.".to_owned(),
-            });
+            }));
         }
     };
 
-    let include_operator = state.audience.operator_enabled();
+    let audience = state.audience();
+    let projected: Vec<_> = state
+        .live_state
+        .history_window(&query.window)
+        .into_iter()
+        .map(|s| s.project_for_audience(audience))
+        .collect();
+
     let scoped: Vec<_> = if let Some(ref module) = query.module {
-        let raw = state.live_state.history_by_module(module, &query.window);
-        if include_operator {
-            raw
-        } else {
-            raw.into_iter().map(|s| s.user_scoped()).collect()
-        }
+        projected
+            .into_iter()
+            .filter(|s| s.user_summary.module_summaries.contains_key(module))
+            .collect()
     } else if let Some(ref severity) = query.severity {
-        let raw = state
-            .live_state
-            .history_by_severity(severity, &query.window);
-        if include_operator {
-            raw
-        } else {
-            raw.into_iter().map(|s| s.user_scoped()).collect()
-        }
+        projected
+            .into_iter()
+            .filter(|s| {
+                s.user_summary
+                    .findings_by_severity
+                    .get(severity)
+                    .is_some_and(|&c| c > 0)
+            })
+            .collect()
     } else if let Some(ref metric) = query.metric {
-        let raw = state.live_state.history_by_metric(metric, &query.window);
-        if include_operator {
-            raw
-        } else {
-            raw.into_iter().map(|s| s.user_scoped()).collect()
-        }
+        projected
+            .into_iter()
+            .filter(|s| s.data_points.iter().any(|dp| dp.name.starts_with(metric)))
+            .collect()
     } else {
-        let raw = state.live_state.history_window(&query.window);
-        if include_operator {
-            raw
-        } else {
-            raw.into_iter().map(|s| s.user_scoped()).collect()
-        }
+        projected
     };
 
     let snapshot_values: Vec<serde_json::Value> = scoped
@@ -236,12 +234,15 @@ pub async fn get_metrics_history(
         (status, message)
     };
 
-    Json(MetricsHistoryResponse {
-        window: query.window,
-        snapshots: snapshot_values,
-        status: final_status,
-        message: final_message,
-    })
+    (
+        axum::http::StatusCode::OK,
+        Json(MetricsHistoryResponse {
+            window: query.window,
+            snapshots: snapshot_values,
+            status: final_status,
+            message: final_message,
+        }),
+    )
 }
 
 pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<ModulesResponse> {
@@ -250,7 +251,7 @@ pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<
             modules: Vec::new(),
         });
     };
-    let include_operator = state.audience.operator_enabled();
+    let include_operator = state.audience().operator_enabled();
     let modules = snapshot
         .user_summary
         .module_summaries
@@ -291,11 +292,7 @@ pub async fn get_findings_summary(
             by_severity: HashMap::new(),
         });
     };
-    let snapshot = if state.audience.operator_enabled() {
-        raw_snapshot
-    } else {
-        raw_snapshot.user_scoped()
-    };
+    let snapshot = raw_snapshot.project_for_audience(state.audience());
     let total = snapshot
         .user_summary
         .findings_by_module
@@ -361,11 +358,7 @@ pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<H
             files: Vec::new(),
         });
     };
-    let snapshot = if state.audience.operator_enabled() {
-        raw_snapshot
-    } else {
-        raw_snapshot.user_scoped()
-    };
+    let snapshot = raw_snapshot.project_for_audience(state.audience());
     let health_scores: Vec<f64> = snapshot
         .data_points
         .iter()

@@ -851,20 +851,49 @@ fn cmd_hooks_uninstall(path: &Path) -> Result<String> {
     }
 }
 
-fn cmd_tui(root: &Path, config: &ChaffraConfig) -> Result<String> {
+fn cmd_tui(
+    root: &Path,
+    config: &ChaffraConfig,
+    collector: &chaffra_telemetry::TelemetryCollector,
+) -> Result<String> {
     let files = discover_and_read_files(root, config);
     if files.is_empty() {
         return Ok("No source files found.\n".to_owned());
     }
 
-    let host = build_module_host();
-    let dead_code_result = host.analyze("dead-code", &files, config)?;
+    let host = build_module_host_with_telemetry(Some(collector));
+
+    let start = std::time::Instant::now();
+    let dead_code_result = match host.analyze("dead-code", &files, config) {
+        Ok(result) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call("dead-code", duration_ms, false);
+            result
+        }
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call("dead-code", duration_ms, true);
+            return Err(e.into());
+        }
+    };
     let mut all_findings = dead_code_result.findings;
 
+    let start = std::time::Instant::now();
     match host.analyze("complexity", &files, config) {
-        Ok(result) => all_findings.extend(result.findings),
-        Err(e) => eprintln!("warning: complexity analysis failed: {e}"),
+        Ok(result) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call("complexity", duration_ms, false);
+            all_findings.extend(result.findings);
+        }
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            collector.record_module_call("complexity", duration_ms, true);
+            eprintln!("warning: complexity analysis failed: {e}");
+        }
     }
+
+    collector.set_files_total(files.len() as u64);
+    collector.set_finding_fingerprints(fingerprints_from_findings(&all_findings));
 
     if all_findings.is_empty() {
         return Ok("No findings to display.\n".to_owned());
@@ -1192,6 +1221,11 @@ fn cmd_telemetry_status(tel_config: &chaffra_telemetry::TelemetryConfig) -> Stri
 }
 
 fn cmd_telemetry_test(tel_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
+    if !tel_config.audience.operator_enabled() {
+        anyhow::bail!(
+            "telemetry test requires operator audience (use --telemetry on or --telemetry operator-only)"
+        );
+    }
     let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
 
@@ -1654,7 +1688,7 @@ async fn main() -> Result<()> {
                 "tui",
                 Some(&live_state),
                 &root,
-                |_collector| cmd_tui(&root, &config),
+                |collector| cmd_tui(&root, &config, collector),
             )?;
             if !output.is_empty() {
                 print!("{output}");
@@ -1736,13 +1770,29 @@ async fn main() -> Result<()> {
             TelemetryAction::Status => {
                 print!("{}", cmd_telemetry_status(&tel_config));
             }
-            TelemetryAction::Test => match cmd_telemetry_test(&tel_config) {
-                Ok(output) => print!("{output}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
+            TelemetryAction::Test => {
+                let effective_tel = if let Some(ref config_path) = cli.config {
+                    let project_config =
+                        load_config(Some(config_path.as_str()), &std::env::current_dir()?)?;
+                    let module_cfg = project_config.module_config("telemetry");
+                    if !module_cfg.is_empty() {
+                        tel_config
+                            .merge_project_config(&module_cfg, explicit_cli_audience)
+                            .map_err(|e| anyhow::anyhow!("invalid project telemetry config: {e}"))?
+                    } else {
+                        tel_config.clone()
+                    }
+                } else {
+                    tel_config.clone()
+                };
+                match cmd_telemetry_test(&effective_tel) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
-            },
+            }
             TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
                 Ok(output) => print!("{output}"),
                 Err(e) => {
@@ -1835,12 +1885,8 @@ async fn main() -> Result<()> {
                 chaffra_telemetry::seed::seed_live_state()
             };
             let config = chaffra_management::ManagementConfig { port };
-            let server = chaffra_management::ManagementServer::new(
-                config,
-                collector,
-                mgmt_live_state,
-                audience,
-            );
+            let server =
+                chaffra_management::ManagementServer::new(config, collector, mgmt_live_state);
             server.run().await?;
         }
     }
@@ -2790,7 +2836,8 @@ mod tests {
     fn test_cmd_tui_empty_dir() {
         let dir = TempDir::new().unwrap();
         let config = ChaffraConfig::default();
-        let output = cmd_tui(dir.path(), &config).unwrap();
+        let collector = chaffra_telemetry::TelemetryCollector::with_defaults();
+        let output = cmd_tui(dir.path(), &config, &collector).unwrap();
         assert_eq!(output, "No source files found.\n");
     }
 

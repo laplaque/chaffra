@@ -121,6 +121,7 @@ mod tests {
                 value: 42.0,
                 labels: HashMap::new(),
                 timestamp_ms: 1000,
+                user_scoped: false,
             }],
         });
 

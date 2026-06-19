@@ -223,32 +223,50 @@ pub fn execute_health(
         return ToolCallResult::text("No source files found.".to_owned());
     }
 
-    let host = build_module_host();
-    // NOTE: record_analysis_and_push runs the complexity module for telemetry,
-    // and analyze_project_health re-parses files to compute the health score.
-    // These are separate concerns (telemetry vs. health grading) but both parse
-    // the same files. Unifying them would require analyze_project_health to
-    // accept pre-computed results, which it currently does not support.
-    let _ = record_analysis_and_push(
-        &host,
-        "complexity",
-        &files,
-        &config,
-        live_state,
-        &effective_tel,
-        &root,
-    );
-
-    match chaffra_complexity::analyze_project_health(
+    // Run health analysis once; record telemetry from its result.
+    let health = match chaffra_complexity::analyze_project_health(
         &files,
         config.health.max_cyclomatic,
         config.health.max_cognitive,
     ) {
-        Ok(health) => match serde_json::to_string_pretty(&health) {
-            Ok(json) => ToolCallResult::text(json),
-            Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
-        },
-        Err(e) => ToolCallResult::error(format!("Analysis error: {e}")),
+        Ok(h) => h,
+        Err(e) => return ToolCallResult::error(format!("Analysis error: {e}")),
+    };
+
+    if !matches!(
+        effective_tel.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
+        collector.register_core_metrics();
+        collector.set_files_total(files.len() as u64);
+        collector.record_module_call("complexity", 0, false);
+
+        let mut sev_counts = std::collections::HashMap::new();
+        for file_score in &health.files {
+            let sev = if file_score.score < 60 {
+                "error"
+            } else if file_score.score < 80 {
+                "warning"
+            } else {
+                "info"
+            };
+            *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+        }
+        let finding_count: u64 = sev_counts.values().sum();
+        collector.record_module_findings("complexity", finding_count, &sev_counts);
+
+        chaffra_telemetry::finalize_and_flush_sampled(
+            &collector,
+            live_state,
+            &effective_tel,
+            &root,
+        );
+    }
+
+    match serde_json::to_string_pretty(&health) {
+        Ok(json) => ToolCallResult::text(json),
+        Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
     }
 }
 
@@ -355,26 +373,26 @@ pub fn execute_telemetry(
 
     let effective_tel = if let Some(cfg_path) = config_path {
         let p = Path::new(cfg_path);
-        if p.exists() {
-            match ChaffraConfig::load(p) {
-                Ok(project_config) => {
-                    match merge_project_telemetry_config(
-                        tel_config,
-                        &project_config,
-                        explicit_cli_audience,
-                    ) {
-                        Ok(cfg) => cfg,
+        if !p.exists() {
+            return ToolCallResult::error(format!("Explicit config not found: {cfg_path}"));
+        }
+        match ChaffraConfig::load(p) {
+            Ok(project_config) => {
+                let module_cfg = project_config.module_config("telemetry");
+                if module_cfg.is_empty() {
+                    tel_config.clone()
+                } else {
+                    match tel_config.merge_project_config(&module_cfg, explicit_cli_audience) {
+                        Ok(merged) => merged,
                         Err(e) => {
                             return ToolCallResult::error(format!("Invalid telemetry config: {e}"));
                         }
                     }
                 }
-                Err(e) => {
-                    return ToolCallResult::error(format!("Malformed config at {cfg_path}: {e}"));
-                }
             }
-        } else {
-            tel_config.clone()
+            Err(e) => {
+                return ToolCallResult::error(format!("Malformed config: {e}"));
+            }
         }
     } else {
         tel_config.clone()
@@ -879,6 +897,42 @@ mod tests {
             None,
         );
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn test_telemetry_missing_explicit_config_errors() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = execute_telemetry(
+            &serde_json::json!({"action": "status"}),
+            &ls,
+            &tc(),
+            false,
+            Some("/nonexistent/chaffra.toml"),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0].text.contains("Explicit config not found"),
+            "should error when explicit config_path doesn't exist, got: {}",
+            result.content[0].text
+        );
+    }
+
+    #[test]
+    fn test_health_missing_explicit_config_errors() {
+        let ls = chaffra_telemetry::LiveTelemetryState::new();
+        let result = execute_health(
+            &serde_json::json!({}),
+            &ls,
+            &tc(),
+            false,
+            Some("/nonexistent/chaffra.toml"),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0].text.contains("Config file not found"),
+            "should error when explicit config_path doesn't exist, got: {}",
+            result.content[0].text
+        );
     }
 
     // ---- Test module that produces Error-severity findings ----

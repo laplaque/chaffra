@@ -96,7 +96,7 @@ pub fn data_point_from_proto(p: &chaffra_proto::proto::MetricDataPoint) -> Metri
         value: p.value,
         labels: p.labels.clone(),
         timestamp_ms: p.timestamp_ms,
-        user_scoped: false,
+        user_scoped: p.user_scoped,
     }
 }
 
@@ -107,6 +107,7 @@ pub fn data_point_to_proto(p: &MetricDataPoint) -> chaffra_proto::proto::MetricD
         value: p.value,
         labels: p.labels.clone(),
         timestamp_ms: p.timestamp_ms,
+        user_scoped: p.user_scoped,
     }
 }
 

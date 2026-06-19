@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Fingerprint that uniquely identifies a finding across runs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -100,6 +101,19 @@ pub fn save_state(state: &ChurnState, path: &Path) -> std::io::Result<()> {
     tmp.write_all(json.as_bytes())?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+static CHURN_LOCKS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, Arc<Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Get or create a per-project churn lock.
+pub fn project_lock(project_root: &Path) -> Arc<Mutex<()>> {
+    let mut locks = CHURN_LOCKS.lock().unwrap();
+    locks
+        .entry(project_root.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Default state file path.
