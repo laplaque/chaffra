@@ -6,6 +6,7 @@ use crate::live_state::LiveTelemetryState;
 use crate::sampling::SamplingDecision;
 use std::path::Path;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FinalizeResult {
     pub snapshot: TelemetrySnapshot,
     pub findings_hash: u64,

@@ -983,4 +983,79 @@ mod tests {
         assert_eq!(health["score"], 88.0);
         assert_eq!(health["grade"], "B");
     }
+
+    #[tokio::test]
+    async fn test_modules_off_audience_returns_empty() {
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::Off,
+                ..Default::default()
+            });
+        collector.set_files_total(10);
+        collector.record_module_call("dead-code", 100, false);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let modules = parsed["modules"].as_array().unwrap();
+        assert!(
+            modules.is_empty(),
+            "Off audience should return empty modules list"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_findings_churn_off_audience_returns_zeros() {
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience: chaffra_telemetry::config::TelemetryAudience::Off,
+                ..Default::default()
+            });
+        let churn = chaffra_telemetry::churn::ChurnResult {
+            new_count: 5,
+            resolved_count: 2,
+            unchanged_count: 10,
+            churn_rate: 0.29,
+        };
+        collector.record_finding_churn(&churn);
+        let live_state = chaffra_telemetry::LiveTelemetryState::new();
+        live_state.push_snapshot(collector.snapshot());
+        let state = Arc::new(SharedState {
+            collector,
+            live_state,
+        });
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/findings/churn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["new_count"], 0,
+            "Off audience should zero out churn data"
+        );
+        assert_eq!(parsed["resolved_count"], 0);
+        assert_eq!(parsed["unchanged_count"], 0);
+        assert_eq!(parsed["churn_rate"], 0.0);
+    }
 }

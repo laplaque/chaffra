@@ -246,11 +246,12 @@ pub async fn get_metrics_history(
 }
 
 pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<ModulesResponse> {
-    let Some(snapshot) = state.live_state.current() else {
+    let Some(raw_snapshot) = state.live_state.current() else {
         return Json(ModulesResponse {
             modules: Vec::new(),
         });
     };
+    let snapshot = raw_snapshot.project_for_audience(state.audience());
     let include_operator = state.audience().operator_enabled();
     let modules = snapshot
         .user_summary
@@ -309,7 +310,7 @@ pub async fn get_findings_summary(
 pub async fn get_findings_churn(
     state: axum::extract::State<Arc<SharedState>>,
 ) -> Json<FindingsChurnResponse> {
-    let Some(snapshot) = state.live_state.current() else {
+    let Some(raw_snapshot) = state.live_state.current() else {
         return Json(FindingsChurnResponse {
             new_count: 0,
             resolved_count: 0,
@@ -317,6 +318,7 @@ pub async fn get_findings_churn(
             churn_rate: 0.0,
         });
     };
+    let snapshot = raw_snapshot.project_for_audience(state.audience());
     let churn_new = snapshot
         .data_points
         .iter()
