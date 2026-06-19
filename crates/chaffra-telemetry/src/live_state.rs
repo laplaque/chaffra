@@ -401,7 +401,10 @@ mod tests {
         t2.join().unwrap();
 
         let count = state.snapshot_count();
-        assert!(count >= 100, "at least thread t2's ascending snapshots should be accepted, got {count}");
+        assert!(
+            count >= 100,
+            "at least thread t2's ascending snapshots should be accepted, got {count}"
+        );
         assert!(state.current().is_some());
     }
 
