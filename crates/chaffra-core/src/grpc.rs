@@ -1117,6 +1117,7 @@ mod tests {
                     l
                 },
                 timestamp_ms: 1000,
+                user_scoped: false,
             }],
             inline_spans: vec![InlineSpan {
                 name: "analyze".to_owned(),

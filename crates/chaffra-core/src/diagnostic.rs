@@ -206,6 +206,8 @@ pub struct InlineMetric {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub timestamp_ms: u64,
+    #[serde(default)]
+    pub user_scoped: bool,
 }
 
 /// An inline span returned by a module.

@@ -137,7 +137,7 @@ pub fn inline_metric_to_proto(m: &diagnostic::InlineMetric) -> proto::MetricData
         value: m.value,
         labels: m.labels.clone(),
         timestamp_ms: m.timestamp_ms,
-        user_scoped: false,
+        user_scoped: m.user_scoped,
     }
 }
 
@@ -147,6 +147,7 @@ pub fn inline_metric_from_proto(m: &proto::MetricDataPoint) -> diagnostic::Inlin
         value: m.value,
         labels: m.labels.clone(),
         timestamp_ms: m.timestamp_ms,
+        user_scoped: m.user_scoped,
     }
 }
 
