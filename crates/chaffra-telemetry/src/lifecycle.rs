@@ -49,10 +49,21 @@ fn finalize_inner(
     let previous_state = match churn::load_state(&state_path) {
         Ok(prev) => prev,
         Err(e) => {
-            eprintln!("Warning: {e}; skipping churn and preserving existing state");
+            eprintln!("Warning: {e}; skipping churn and overwriting corrupted state");
             let snapshot = collector.snapshot();
             live_state.push_snapshot(snapshot.clone());
             let current_hash = churn::hash_fingerprints(&fingerprints);
+            let fresh = churn::ChurnState {
+                findings_hash: current_hash,
+                fingerprints: fingerprints.clone(),
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            if let Err(save_err) = churn::save_state(&fresh, &state_path) {
+                eprintln!("Warning: failed to save fresh churn state: {save_err}");
+            }
             if !use_sampling || should_flush_sampled(config, current_hash, None) {
                 flush_to_backends(&snapshot, config);
             }

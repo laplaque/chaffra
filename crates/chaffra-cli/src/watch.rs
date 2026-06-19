@@ -232,6 +232,7 @@ pub(crate) fn run_watch_iteration(
 
     let collector = chaffra_telemetry::TelemetryCollector::new(watch_config.tel_config.clone());
     collector.register_core_metrics();
+    collector.set_files_total(changed.len() as u64);
     let start = std::time::Instant::now();
 
     match run_analysis_on_changes(changed, root, config, format, Some(&collector)) {

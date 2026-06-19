@@ -226,7 +226,7 @@ pub fn analyze_file_for_diagnostics(
         tel_config.audience,
         chaffra_telemetry::TelemetryAudience::Off
     ) {
-        return analyze_file_no_telemetry(file_path, content, &workspace_config);
+        return analyze_file_no_telemetry(file_path, content, &workspace_config, &project_root);
     }
 
     let relative = Path::new(file_path)
@@ -243,10 +243,22 @@ pub fn analyze_file_for_diagnostics(
     let effective_tel =
         match merge_lsp_telemetry_config(tel_config, &workspace_config, explicit_cli_audience) {
             Ok(Some(merged)) => merged,
-            Ok(None) => return analyze_file_no_telemetry(file_path, content, &workspace_config),
+            Ok(None) => {
+                return analyze_file_no_telemetry(
+                    file_path,
+                    content,
+                    &workspace_config,
+                    &project_root,
+                );
+            }
             Err(e) => {
                 eprintln!("Invalid workspace telemetry config: {e}");
-                return analyze_file_no_telemetry(file_path, content, &workspace_config);
+                return analyze_file_no_telemetry(
+                    file_path,
+                    content,
+                    &workspace_config,
+                    &project_root,
+                );
             }
         };
 
@@ -324,14 +336,15 @@ fn analyze_file_no_telemetry(
     file_path: &str,
     content: &[u8],
     config: &chaffra_core::config::ChaffraConfig,
+    project_root: &std::path::Path,
 ) -> HashMap<String, Vec<Diagnostic>> {
     use chaffra_core::diagnostic::FileInfo;
     use std::path::Path;
 
     let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
     let relative = Path::new(file_path)
-        .file_name()
-        .unwrap_or_default()
+        .strip_prefix(project_root)
+        .unwrap_or(Path::new(file_path))
         .to_string_lossy()
         .to_string();
     let files = vec![FileInfo {

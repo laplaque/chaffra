@@ -110,36 +110,21 @@ pub fn load_state(path: &Path) -> Result<Option<ChurnState>, ChurnLoadError> {
 }
 
 /// Errors from loading persisted churn state.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ChurnLoadError {
+    #[error("failed to read churn state {}: {source}", path.display())]
     Io {
         path: std::path::PathBuf,
+        #[source]
         source: std::io::Error,
     },
+    #[error("failed to parse churn state {}: {source}", path.display())]
     Parse {
         path: std::path::PathBuf,
+        #[source]
         source: serde_json::Error,
     },
 }
-
-impl std::fmt::Display for ChurnLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io { path, source } => {
-                write!(f, "failed to read churn state {}: {source}", path.display())
-            }
-            Self::Parse { path, source } => {
-                write!(
-                    f,
-                    "failed to parse churn state {}: {source}",
-                    path.display()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ChurnLoadError {}
 
 /// Save churn state to a file atomically via temp-file-then-rename.
 pub fn save_state(state: &ChurnState, path: &Path) -> std::io::Result<()> {

@@ -379,7 +379,6 @@ mod tests {
     }
 
     fn make_result(findings: Vec<Finding>) -> AnalysisResult {
-        let _count = findings.len() as u64;
         AnalysisResult {
             findings,
             metrics: ModuleMetrics {

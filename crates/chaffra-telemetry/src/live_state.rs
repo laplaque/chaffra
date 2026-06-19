@@ -81,15 +81,15 @@ impl LiveTelemetryState {
     /// so the buffer only contains live data.
     pub fn push_snapshot(&self, snapshot: TelemetrySnapshot) {
         let mut inner = self.inner.write().unwrap();
-        if inner.source == StateSource::Seeded {
-            inner.history.clear();
-        }
         let dominated = inner
             .current
             .as_ref()
             .is_some_and(|c| c.timestamp_ms > snapshot.timestamp_ms);
         if dominated {
             return;
+        }
+        if inner.source == StateSource::Seeded {
+            inner.history.clear();
         }
         inner.current = Some(snapshot.clone());
         if inner.history.len() >= inner.max_history {
