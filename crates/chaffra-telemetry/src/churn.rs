@@ -143,7 +143,7 @@ static CHURN_LOCKS: std::sync::LazyLock<
 
 /// Get or create a per-project churn lock.
 pub fn project_lock(project_root: &Path) -> Arc<Mutex<()>> {
-    let mut locks = CHURN_LOCKS.lock().unwrap();
+    let mut locks = CHURN_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     locks
         .entry(project_root.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))

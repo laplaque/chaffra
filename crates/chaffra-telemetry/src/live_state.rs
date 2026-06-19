@@ -80,7 +80,7 @@ impl LiveTelemetryState {
     /// When transitioning from `Seeded` to `Live`, clears seeded history
     /// so the buffer only contains live data.
     pub fn push_snapshot(&self, snapshot: TelemetrySnapshot) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let dominated = inner
             .current
             .as_ref()
@@ -103,7 +103,7 @@ impl LiveTelemetryState {
 
     /// Push a snapshot without changing the source (used for seeded data).
     pub fn push_seeded(&self, snapshot: TelemetrySnapshot) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.current = Some(snapshot.clone());
         if inner.history.len() >= inner.max_history {
             inner.history.pop_front();
@@ -113,19 +113,19 @@ impl LiveTelemetryState {
 
     /// Get the latest snapshot, if any.
     pub fn current(&self) -> Option<TelemetrySnapshot> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.current.clone()
     }
 
     /// Get the current state source.
     pub fn source(&self) -> StateSource {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.source
     }
 
     /// Set the state source (e.g. to `Seeded` after loading demo data).
     pub fn set_source(&self, source: StateSource) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.source = source;
     }
 
@@ -135,7 +135,7 @@ impl LiveTelemetryState {
     /// Returns snapshots whose `timestamp_ms` falls within `[latest - window, latest]`.
     /// If the window string is unrecognized, defaults to `"7d"`.
     pub fn history_window(&self, window: &str) -> Vec<TelemetrySnapshot> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let window_ms = parse_window_ms(window).unwrap_or(604_800_000);
 
         let latest_ts = inner.current.as_ref().map(|s| s.timestamp_ms).unwrap_or(0);
@@ -193,7 +193,7 @@ impl LiveTelemetryState {
 
     /// Clear all state, resetting to `Empty`.
     pub fn clear(&self) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.source = StateSource::Empty;
         inner.current = None;
         inner.history.clear();
@@ -201,7 +201,7 @@ impl LiveTelemetryState {
 
     /// Number of snapshots in the history buffer.
     pub fn snapshot_count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.history.len()
     }
 }

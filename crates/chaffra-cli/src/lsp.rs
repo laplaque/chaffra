@@ -309,7 +309,7 @@ pub fn analyze_file_for_diagnostics(
     collector.record_module_call("lsp", duration_ms, had_error);
     let file_fingerprints = crate::fingerprints_from_findings(&all_findings);
     {
-        let mut all_roots = LSP_FINGERPRINTS.lock().unwrap();
+        let mut all_roots = LSP_FINGERPRINTS.lock().unwrap_or_else(|e| e.into_inner());
         let workspace_fps = all_roots.entry(project_root.clone()).or_default();
         workspace_fps.insert(
             relative.clone(),
