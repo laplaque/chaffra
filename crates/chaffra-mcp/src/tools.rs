@@ -425,6 +425,7 @@ pub fn execute_telemetry(
                 Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
             }
         }
+        // TODO(#44): bind audience at capture time; intersect capture/read policies
         "snapshot" => {
             let snapshot = match live_state.current() {
                 Some(s) => s.project_for_audience(effective_tel.audience),

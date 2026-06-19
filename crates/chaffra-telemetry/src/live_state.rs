@@ -20,6 +20,7 @@ pub enum StateSource {
     Empty,
 }
 
+// TODO(#46): enforce byte-budget bounded history instead of count-only
 /// Default capacity for the circular history buffer.
 const DEFAULT_MAX_HISTORY: usize = 1000;
 

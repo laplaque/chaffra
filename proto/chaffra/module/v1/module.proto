@@ -107,7 +107,7 @@ message MetricDataPoint {
   double value = 2;
   map<string, string> labels = 3;
   uint64 timestamp_ms = 4;
-  // TODO(#40): validate against trusted MetricDefinition registry; default
+  // TODO(#45): validate against trusted MetricDefinition registry; default
   // unknown/external-module points to operator-only.
   bool user_scoped = 5;
 }

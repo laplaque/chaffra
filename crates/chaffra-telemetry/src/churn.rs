@@ -141,6 +141,7 @@ static CHURN_LOCKS: std::sync::LazyLock<
     Mutex<std::collections::HashMap<std::path::PathBuf, Arc<Mutex<()>>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+// TODO(#43): add cross-process file lock and scope-partitioned state
 /// Get or create a per-project churn lock.
 pub fn project_lock(project_root: &Path) -> Arc<Mutex<()>> {
     let mut locks = CHURN_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
