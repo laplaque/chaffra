@@ -184,6 +184,18 @@ pub async fn get_metrics_history(
     };
 
     let audience = state.audience();
+    if matches!(audience, chaffra_telemetry::config::TelemetryAudience::Off) {
+        return (
+            axum::http::StatusCode::OK,
+            Json(MetricsHistoryResponse {
+                window: query.window,
+                snapshots: Vec::new(),
+                status,
+                message: "Telemetry audience is off.".to_owned(),
+            }),
+        );
+    }
+
     let projected: Vec<_> = state
         .live_state
         .history_window(&query.window)
@@ -194,7 +206,12 @@ pub async fn get_metrics_history(
     let scoped: Vec<_> = if let Some(ref module) = query.module {
         projected
             .into_iter()
-            .filter(|s| s.user_summary.module_summaries.contains_key(module))
+            .filter(|s| {
+                s.user_summary.module_summaries.contains_key(module)
+                    || s.operator_summary
+                        .module_call_durations
+                        .contains_key(module)
+            })
             .collect()
     } else if let Some(ref severity) = query.severity {
         projected

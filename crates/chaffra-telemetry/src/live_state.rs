@@ -88,9 +88,10 @@ impl LiveTelemetryState {
             .current
             .as_ref()
             .is_some_and(|c| c.timestamp_ms > snapshot.timestamp_ms);
-        if !dominated {
-            inner.current = Some(snapshot.clone());
+        if dominated {
+            return;
         }
+        inner.current = Some(snapshot.clone());
         if inner.history.len() >= inner.max_history {
             inner.history.pop_front();
         }
@@ -399,7 +400,8 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
 
-        assert_eq!(state.snapshot_count(), 200);
+        let count = state.snapshot_count();
+        assert!(count >= 100, "at least thread t2's ascending snapshots should be accepted, got {count}");
         assert!(state.current().is_some());
     }
 

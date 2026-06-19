@@ -868,6 +868,20 @@ fn cmd_tui(
         Ok(result) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             collector.record_module_call("dead-code", duration_ms, false);
+            let mut sev_counts = std::collections::HashMap::new();
+            for finding in &result.findings {
+                let sev = match finding.severity {
+                    chaffra_core::diagnostic::Severity::Error => "error",
+                    chaffra_core::diagnostic::Severity::Warning => "warning",
+                    chaffra_core::diagnostic::Severity::Info => "info",
+                };
+                *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+            }
+            collector.record_module_findings(
+                "dead-code",
+                result.findings.len() as u64,
+                &sev_counts,
+            );
             result
         }
         Err(e) => {
@@ -883,6 +897,20 @@ fn cmd_tui(
         Ok(result) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             collector.record_module_call("complexity", duration_ms, false);
+            let mut sev_counts = std::collections::HashMap::new();
+            for finding in &result.findings {
+                let sev = match finding.severity {
+                    chaffra_core::diagnostic::Severity::Error => "error",
+                    chaffra_core::diagnostic::Severity::Warning => "warning",
+                    chaffra_core::diagnostic::Severity::Info => "info",
+                };
+                *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+            }
+            collector.record_module_findings(
+                "complexity",
+                result.findings.len() as u64,
+                &sev_counts,
+            );
             all_findings.extend(result.findings);
         }
         Err(e) => {
@@ -1271,11 +1299,7 @@ fn cmd_telemetry_inspect(tel_config: &chaffra_telemetry::TelemetryConfig) -> Res
     collector.record_module_findings("example-module", 2, &sev);
 
     let raw_snapshot = collector.snapshot();
-    let snapshot = if tel_config.audience.operator_enabled() {
-        raw_snapshot
-    } else {
-        raw_snapshot.user_scoped()
-    };
+    let snapshot = raw_snapshot.project_for_audience(tel_config.audience);
     let (backends, _) = chaffra_telemetry::backends::create_backends(&tel_config.backends);
 
     let mut out = String::new();
@@ -1768,23 +1792,17 @@ async fn main() -> Result<()> {
 
         Command::Telemetry { ref action } => match action {
             TelemetryAction::Status => {
-                print!("{}", cmd_telemetry_status(&tel_config));
+                let root = std::env::current_dir().context("cannot determine working directory")?;
+                let project_config = load_config(cli.config.as_deref(), &root)?;
+                let effective_tel =
+                    merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience)?;
+                print!("{}", cmd_telemetry_status(&effective_tel));
             }
             TelemetryAction::Test => {
-                let effective_tel = if let Some(ref config_path) = cli.config {
-                    let project_config =
-                        load_config(Some(config_path.as_str()), &std::env::current_dir()?)?;
-                    let module_cfg = project_config.module_config("telemetry");
-                    if !module_cfg.is_empty() {
-                        tel_config
-                            .merge_project_config(&module_cfg, explicit_cli_audience)
-                            .map_err(|e| anyhow::anyhow!("invalid project telemetry config: {e}"))?
-                    } else {
-                        tel_config.clone()
-                    }
-                } else {
-                    tel_config.clone()
-                };
+                let root = std::env::current_dir().context("cannot determine working directory")?;
+                let project_config = load_config(cli.config.as_deref(), &root)?;
+                let effective_tel =
+                    merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience)?;
                 match cmd_telemetry_test(&effective_tel) {
                     Ok(output) => print!("{output}"),
                     Err(e) => {
@@ -1793,13 +1811,19 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
-                Ok(output) => print!("{output}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
+            TelemetryAction::Inspect => {
+                let root = std::env::current_dir().context("cannot determine working directory")?;
+                let project_config = load_config(cli.config.as_deref(), &root)?;
+                let effective_tel =
+                    merge_telemetry_config(&tel_config, &project_config, explicit_cli_audience)?;
+                match cmd_telemetry_inspect(&effective_tel) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
-            },
+            }
             TelemetryAction::Dashboard { stdout } => match cmd_telemetry_dashboard(*stdout) {
                 Ok(output) => print!("{output}"),
                 Err(e) => {
@@ -2991,7 +3015,9 @@ mod tests {
         // Verify state file was written with real fingerprints.
         let state_file = dir.path().join(chaffra_telemetry::churn::STATE_FILE);
         assert!(state_file.exists(), "churn state file should be written");
-        let state = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        let state = chaffra_telemetry::churn::load_state(&state_file)
+            .unwrap()
+            .unwrap();
         assert!(
             !state.fingerprints.is_empty(),
             "churn state should contain real fingerprints, not an empty set"
@@ -3040,7 +3066,9 @@ mod tests {
 
         assert!(result.is_err());
 
-        let loaded = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        let loaded = chaffra_telemetry::churn::load_state(&state_file)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             loaded.fingerprints, prior_state.fingerprints,
             "prior churn state should be preserved after a failed run"
@@ -3102,7 +3130,9 @@ mod tests {
             "error metric should be recorded in flushed telemetry"
         );
 
-        let loaded = chaffra_telemetry::churn::load_state(&state_file).unwrap();
+        let loaded = chaffra_telemetry::churn::load_state(&state_file)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             loaded.fingerprints, prior_state.fingerprints,
             "prior churn state should be unchanged after a failed run"

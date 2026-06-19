@@ -86,11 +86,60 @@ pub fn hash_fingerprints(fingerprints: &HashSet<FindingFingerprint>) -> u64 {
     hasher.finish()
 }
 
-/// Load churn state from a file. Returns `None` if the file doesn't exist or is invalid.
-pub fn load_state(path: &Path) -> Option<ChurnState> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+/// Load churn state from a file.
+///
+/// Returns `Ok(None)` if the file does not exist, `Ok(Some(state))` on
+/// success, and `Err` on I/O or parse failures so the caller can avoid
+/// overwriting valid state from a false empty baseline.
+pub fn load_state(path: &Path) -> Result<Option<ChurnState>, ChurnLoadError> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let state: ChurnState =
+                serde_json::from_str(&content).map_err(|e| ChurnLoadError::Parse {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            Ok(Some(state))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ChurnLoadError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
 }
+
+/// Errors from loading persisted churn state.
+#[derive(Debug)]
+pub enum ChurnLoadError {
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+impl std::fmt::Display for ChurnLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(f, "failed to read churn state {}: {source}", path.display())
+            }
+            Self::Parse { path, source } => {
+                write!(
+                    f,
+                    "failed to parse churn state {}: {source}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChurnLoadError {}
 
 /// Save churn state to a file atomically via temp-file-then-rename.
 pub fn save_state(state: &ChurnState, path: &Path) -> std::io::Result<()> {
@@ -216,7 +265,7 @@ mod tests {
         };
 
         save_state(&state, &path).unwrap();
-        let loaded = load_state(&path).unwrap();
+        let loaded = load_state(&path).unwrap().unwrap();
         assert_eq!(loaded.fingerprints, state.fingerprints);
         assert_eq!(loaded.findings_hash, 12345);
 
@@ -225,7 +274,16 @@ mod tests {
 
     #[test]
     fn test_load_state_missing_file() {
-        let result = load_state(Path::new("/nonexistent/path/state.json"));
+        let result = load_state(Path::new("/nonexistent/path/state.json")).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_state_corrupted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+        let result = load_state(&path);
+        assert!(result.is_err());
     }
 }

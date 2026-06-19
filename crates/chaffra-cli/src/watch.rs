@@ -180,7 +180,7 @@ pub fn extract_changed_paths(events: &[DebouncedEvent]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for event in events {
         for path in &event.event.paths {
-            if path.is_file() && is_source_file(path) && !paths.contains(path) {
+            if is_source_file(path) && !paths.contains(path) {
                 paths.push(path.clone());
             }
         }
@@ -217,6 +217,19 @@ pub(crate) fn run_watch_iteration(
         };
     }
 
+    // Compute all changed relative paths (including deleted/renamed files) so we
+    // can clean up stale fingerprints after analysis.
+    let all_changed_relative: std::collections::HashSet<String> = changed
+        .iter()
+        .filter(|p| is_source_file(p))
+        .filter_map(|p| {
+            p.strip_prefix(root)
+                .unwrap_or(p)
+                .to_str()
+                .map(|s| s.to_owned())
+        })
+        .collect();
+
     let collector = chaffra_telemetry::TelemetryCollector::new(watch_config.tel_config.clone());
     collector.register_core_metrics();
     let start = std::time::Instant::now();
@@ -226,16 +239,8 @@ pub(crate) fn run_watch_iteration(
             let duration_ms = start.elapsed().as_millis() as u64;
             collector.record_module_call("watch", duration_ms, ao.had_module_error);
 
-            let analyzed_files: std::collections::HashSet<String> = changed
-                .iter()
-                .filter_map(|p| {
-                    p.strip_prefix(root)
-                        .unwrap_or(p)
-                        .to_str()
-                        .map(|s| s.to_owned())
-                })
-                .collect();
-            for file in &analyzed_files {
+            // Remove old fingerprints for all changed files (including deleted ones).
+            for file in &all_changed_relative {
                 project_fingerprints.remove(file);
             }
             for fp in crate::fingerprints_from_findings(&ao.findings) {
@@ -284,7 +289,7 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
     > = {
         let state_path = root.join(chaffra_telemetry::churn::STATE_FILE);
         match chaffra_telemetry::churn::load_state(&state_path) {
-            Some(state) => {
+            Ok(Some(state)) => {
                 let mut map = std::collections::HashMap::new();
                 for fp in state.fingerprints {
                     map.entry(fp.file.clone())
@@ -293,7 +298,11 @@ pub fn run_watch(watch_config: WatchConfig) -> Result<()> {
                 }
                 map
             }
-            None => std::collections::HashMap::new(),
+            Ok(None) => std::collections::HashMap::new(),
+            Err(e) => {
+                eprintln!("Warning: {e}; starting with empty baseline");
+                std::collections::HashMap::new()
+            }
         }
     };
 

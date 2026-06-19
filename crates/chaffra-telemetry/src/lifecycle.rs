@@ -40,11 +40,29 @@ fn finalize_inner(
     let fingerprints = collector.finding_fingerprints();
     let state_path = project_root.join(churn::STATE_FILE);
 
-    // Serialize churn load/compute/save under a per-project lock.
-    let lock = churn::project_lock(project_root);
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or(project_root.to_path_buf());
+    let lock = churn::project_lock(&canonical_root);
     let _guard = lock.lock().unwrap();
 
-    let previous_state = churn::load_state(&state_path);
+    let previous_state = match churn::load_state(&state_path) {
+        Ok(prev) => prev,
+        Err(e) => {
+            eprintln!("Warning: {e}; skipping churn and preserving existing state");
+            let snapshot = collector.snapshot();
+            live_state.push_snapshot(snapshot.clone());
+            let current_hash = churn::hash_fingerprints(&fingerprints);
+            if !use_sampling || should_flush_sampled(config, current_hash, None) {
+                flush_to_backends(&snapshot, config);
+            }
+            drop(_guard);
+            return FinalizeResult {
+                snapshot,
+                findings_hash: current_hash,
+            };
+        }
+    };
     let current_hash = churn::hash_fingerprints(&fingerprints);
 
     if let Some(ref prev) = previous_state {
@@ -55,17 +73,12 @@ fn finalize_inner(
     let snapshot = collector.snapshot();
     live_state.push_snapshot(snapshot.clone());
 
-    let should_flush = if use_sampling {
-        let decision = crate::sampling::should_sample(
-            config.sampling_strategy,
-            config.sampling_rate,
+    let should_flush = !use_sampling
+        || should_flush_sampled(
+            config,
             current_hash,
             previous_state.as_ref().map(|s| s.findings_hash),
         );
-        decision == SamplingDecision::Emit
-    } else {
-        true
-    };
 
     if should_flush {
         flush_to_backends(&snapshot, config);
@@ -102,6 +115,20 @@ pub fn flush_snapshot(
     let snapshot = collector.snapshot();
     live_state.push_snapshot(snapshot.clone());
     flush_to_backends(&snapshot, config);
+}
+
+fn should_flush_sampled(
+    config: &TelemetryConfig,
+    current_hash: u64,
+    previous_hash: Option<u64>,
+) -> bool {
+    let decision = crate::sampling::should_sample(
+        config.sampling_strategy,
+        config.sampling_rate,
+        current_hash,
+        previous_hash,
+    );
+    decision == SamplingDecision::Emit
 }
 
 fn flush_to_backends(snapshot: &TelemetrySnapshot, config: &TelemetryConfig) {

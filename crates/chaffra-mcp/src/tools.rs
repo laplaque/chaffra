@@ -224,44 +224,66 @@ pub fn execute_health(
     }
 
     // Run health analysis once; record telemetry from its result.
+    let tel_active = !matches!(
+        effective_tel.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    );
+
+    let collector = if tel_active {
+        let c = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
+        c.register_core_metrics();
+        c.set_files_total(files.len() as u64);
+        Some(c)
+    } else {
+        None
+    };
+
+    let start = std::time::Instant::now();
     let health = match chaffra_complexity::analyze_project_health(
         &files,
         config.health.max_cyclomatic,
         config.health.max_cognitive,
     ) {
         Ok(h) => h,
-        Err(e) => return ToolCallResult::error(format!("Analysis error: {e}")),
+        Err(e) => {
+            if let Some(ref collector) = collector {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                collector.record_module_call("complexity", duration_ms, true);
+                chaffra_telemetry::flush_snapshot(collector, live_state, &effective_tel);
+            }
+            return ToolCallResult::error(format!("Analysis error: {e}"));
+        }
     };
 
-    if !matches!(
-        effective_tel.audience,
-        chaffra_telemetry::TelemetryAudience::Off
-    ) {
-        let collector = chaffra_telemetry::TelemetryCollector::new(effective_tel.clone());
-        collector.register_core_metrics();
-        collector.set_files_total(files.len() as u64);
-        collector.record_module_call("complexity", 0, false);
+    if let Some(ref collector) = collector {
+        let duration_ms = start.elapsed().as_millis() as u64;
+        collector.record_module_call("complexity", duration_ms, false);
 
+        // Only count problem files (score < 80) as findings.
         let mut sev_counts = std::collections::HashMap::new();
+        let mut fingerprints = std::collections::HashSet::new();
         for file_score in &health.files {
-            let sev = if file_score.score < 60 {
-                "error"
+            if file_score.score < 60 {
+                *sev_counts.entry("error".to_owned()).or_insert(0u64) += 1;
+                fingerprints.insert(chaffra_telemetry::churn::FindingFingerprint::new(
+                    "complexity:health",
+                    &file_score.file,
+                    0,
+                ));
             } else if file_score.score < 80 {
-                "warning"
-            } else {
-                "info"
-            };
-            *sev_counts.entry(sev.to_owned()).or_insert(0u64) += 1;
+                *sev_counts.entry("warning".to_owned()).or_insert(0u64) += 1;
+                fingerprints.insert(chaffra_telemetry::churn::FindingFingerprint::new(
+                    "complexity:health",
+                    &file_score.file,
+                    0,
+                ));
+            }
         }
         let finding_count: u64 = sev_counts.values().sum();
         collector.record_module_findings("complexity", finding_count, &sev_counts);
+        collector.set_finding_fingerprints(fingerprints);
 
-        chaffra_telemetry::finalize_and_flush_sampled(
-            &collector,
-            live_state,
-            &effective_tel,
-            &root,
-        );
+        chaffra_telemetry::finalize_and_flush_sampled(collector, live_state, &effective_tel, &root);
     }
 
     match serde_json::to_string_pretty(&health) {
@@ -400,6 +422,12 @@ pub fn execute_telemetry(
 
     match action {
         "status" => {
+            if matches!(
+                effective_tel.audience,
+                chaffra_telemetry::TelemetryAudience::Off
+            ) {
+                return ToolCallResult::text("[]".to_owned());
+            }
             let (_, statuses) =
                 chaffra_telemetry::backends::create_backends(&effective_tel.backends);
             match serde_json::to_string_pretty(&statuses) {
@@ -409,13 +437,7 @@ pub fn execute_telemetry(
         }
         "snapshot" => {
             let snapshot = match live_state.current() {
-                Some(s) => {
-                    if effective_tel.audience.operator_enabled() {
-                        s
-                    } else {
-                        s.user_scoped()
-                    }
-                }
+                Some(s) => s.project_for_audience(effective_tel.audience),
                 None => {
                     return ToolCallResult::text(
                         "No telemetry snapshots available yet.".to_owned(),
@@ -428,6 +450,12 @@ pub fn execute_telemetry(
             }
         }
         "backends" => {
+            if matches!(
+                effective_tel.audience,
+                chaffra_telemetry::TelemetryAudience::Off
+            ) {
+                return ToolCallResult::text("[]".to_owned());
+            }
             let backends_info: Vec<serde_json::Value> = effective_tel
                 .backends
                 .iter()
@@ -1114,8 +1142,7 @@ mod tests {
         };
         ls.push_snapshot(snapshot);
 
-        // With TelemetryAudience::On, operator_enabled() returns true,
-        // so execute_telemetry should return the full (non-user-scoped) snapshot.
+        // With TelemetryAudience::On, project_for_audience returns the full snapshot.
         let mut on_config = tc();
         on_config.audience = chaffra_telemetry::TelemetryAudience::On;
         let result = execute_telemetry(
@@ -1137,9 +1164,8 @@ mod tests {
             "operator-scoped snapshot should include module name"
         );
 
-        // With default audience (UserOnly), operator_enabled() returns false,
-        // so execute_telemetry should return the user-scoped snapshot
-        // with empty operator_summary.
+        // With default audience (UserOnly), project_for_audience strips
+        // operator data, returning a user-scoped snapshot.
         let result_user = execute_telemetry(
             &serde_json::json!({"action": "snapshot"}),
             &ls,

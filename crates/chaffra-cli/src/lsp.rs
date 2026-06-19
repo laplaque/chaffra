@@ -8,18 +8,18 @@ use chaffra_core::diagnostic::{Finding, Severity};
 use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-static LSP_FINGERPRINTS: LazyLock<
-    Mutex<
-        std::collections::HashMap<
-            String,
-            std::collections::HashSet<chaffra_telemetry::churn::FindingFingerprint>,
-        >,
-    >,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+type WorkspaceFingerprints = HashMap<
+    PathBuf,
+    HashMap<String, std::collections::HashSet<chaffra_telemetry::churn::FindingFingerprint>>,
+>;
+
+static LSP_FINGERPRINTS: LazyLock<Mutex<WorkspaceFingerprints>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// JSON-RPC request envelope for LSP.
 #[derive(Debug, Deserialize)]
@@ -123,30 +123,32 @@ pub(crate) fn merge_lsp_telemetry_config(
     Ok(Some(merged))
 }
 
-/// Discover workspace config, either from an explicit path or by walking
-/// up from the file's parent directory looking for `.chaffra.toml`.
+/// Discover workspace config and project root.
+///
+/// The **project root** is always derived from `file_path` (or
+/// `workspace_root` when the caller supplies one), never from
+/// `config_path`.  `config_path` is used only for *loading*
+/// configuration -- using its parent as the project root would be
+/// wrong for global configs like `--config /etc/chaffra.toml`.
+///
+/// Resolution order for project root:
+/// 1. Explicit `workspace_root` if provided by the caller.
+/// 2. Walk up from `file_path` looking for `.chaffra.toml`; use the
+///    directory that contains it.
+/// 3. Fall back to the file's parent directory.
 ///
 /// Returns `(workspace_config, project_root)`.
 fn discover_workspace_config(
     file_path: &str,
     config_path: Option<&str>,
+    workspace_root: Option<&std::path::Path>,
 ) -> std::result::Result<(chaffra_core::config::ChaffraConfig, std::path::PathBuf), String> {
     use chaffra_core::config::ChaffraConfig;
     use std::path::{Path, PathBuf};
 
-    if let Some(cp) = config_path {
-        let p = Path::new(cp);
-        let project_root = p
-            .parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        match ChaffraConfig::load(p) {
-            Ok(c) => return Ok((c, project_root)),
-            Err(e) => return Err(format!("Failed to load explicit config {cp}: {e}")),
-        }
-    }
-
-    let config_dir = Path::new(file_path).parent().and_then(|dir| {
+    // --- Derive project root from the file being analyzed, NOT from
+    // config_path. ---
+    let discovered_root = Path::new(file_path).parent().and_then(|dir| {
         let mut d = dir;
         loop {
             let candidate = d.join(".chaffra.toml");
@@ -157,11 +159,28 @@ fn discover_workspace_config(
         }
     });
 
-    let project_root = config_dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let project_root: PathBuf = if let Some(wr) = workspace_root {
+        wr.to_path_buf()
+    } else if let Some(ref root) = discovered_root {
+        root.clone()
+    } else {
+        // Best-effort: use the file's parent directory.
+        Path::new(file_path)
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    };
 
-    let workspace_config = match config_dir {
+    // --- Load config ---
+    if let Some(cp) = config_path {
+        let p = Path::new(cp);
+        match ChaffraConfig::load(p) {
+            Ok(c) => return Ok((c, project_root)),
+            Err(e) => return Err(format!("Failed to load explicit config {cp}: {e}")),
+        }
+    }
+
+    let workspace_config = match discovered_root {
         Some(ref dir) => match ChaffraConfig::load_from_dir(dir) {
             Ok(c) => c,
             Err(e) => {
@@ -194,13 +213,14 @@ pub fn analyze_file_for_diagnostics(
 
     let mut diagnostics: HashMap<String, Vec<Diagnostic>> = HashMap::new();
 
-    let (workspace_config, project_root) = match discover_workspace_config(file_path, config_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Config error, skipping analysis: {e}");
-            return diagnostics;
-        }
-    };
+    let (workspace_config, project_root) =
+        match discover_workspace_config(file_path, config_path, None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Config error, skipping analysis: {e}");
+                return diagnostics;
+            }
+        };
 
     if matches!(
         tel_config.audience,
@@ -277,7 +297,8 @@ pub fn analyze_file_for_diagnostics(
     collector.record_module_call("lsp", duration_ms, had_error);
     let file_fingerprints = crate::fingerprints_from_findings(&all_findings);
     {
-        let mut workspace_fps = LSP_FINGERPRINTS.lock().unwrap();
+        let mut all_roots = LSP_FINGERPRINTS.lock().unwrap();
+        let workspace_fps = all_roots.entry(project_root.clone()).or_default();
         workspace_fps.insert(
             relative.clone(),
             file_fingerprints.iter().cloned().collect(),
@@ -938,8 +959,11 @@ mod tests {
 
     #[test]
     fn test_discover_workspace_config_explicit_path_fails_closed() {
-        let result =
-            discover_workspace_config("/tmp/test.go", Some("/tmp/nonexistent_chaffra_config.toml"));
+        let result = discover_workspace_config(
+            "/tmp/test.go",
+            Some("/tmp/nonexistent_chaffra_config.toml"),
+            None,
+        );
         assert!(
             result.is_err(),
             "explicit config path that fails to load should return Err"
@@ -953,7 +977,7 @@ mod tests {
 
     #[test]
     fn test_discover_workspace_config_no_config_uses_default() {
-        let result = discover_workspace_config("/tmp/test.go", None);
+        let result = discover_workspace_config("/tmp/test.go", None, None);
         assert!(
             result.is_ok(),
             "no config path and no .chaffra.toml should succeed with defaults"

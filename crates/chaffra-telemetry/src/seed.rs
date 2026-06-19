@@ -385,6 +385,8 @@ fn build_seeded_snapshot(ts: u64, iteration: u64) -> TelemetrySnapshot {
     }
 }
 
+// TODO(#40): derive definitions from the canonical register_core_metrics() registry
+// to prevent drift when metric names or kinds change.
 fn core_definitions() -> HashMap<String, MetricDefinition> {
     let defs = vec![
         (
