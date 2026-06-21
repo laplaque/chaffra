@@ -22,11 +22,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -263,16 +265,39 @@ class TestNoExecutableLinesBlock(CheckerTestCase):
         self.assertEqual(report["overall"]["covered_lines"], 2)
 
 
-class TestSummaryConsistencyRejectsInflatedLcov(CheckerTestCase):
-    """Overall uses the standard producer summary ΣLH/ΣLF (matching what
-    `cargo llvm-cov --summary-only` reports). The reconciliation bound
-    (LH-covered_DA) ≤ (LF-unique_DA) rejects producers whose summary
-    claims more *unseen* hits than there is undeclared instrumentation
-    behind them."""
+class TestDeclaredSummaryCannotInflateOverall(CheckerTestCase):
+    """Overall is the DA-coherent metric Σ(covered DA) / Σ(unique DA): both
+    sides come from the concrete DA records, so a declared summary that
+    overstates LH cannot inflate the score past what the DA records
+    demonstrate. The structural reconciliation bound
+    (LH-covered_DA) ≤ (LF-unique_DA) still rejects malformed summaries
+    (the bound is in the parser, see TestMalformedLcovTable)."""
 
-    def test_inflated_unseen_hits_rejected(self) -> None:
+    def test_unseen_equal_pair_does_not_inflate_overall(self) -> None:
+        # The previous round's ΣLH/ΣLF metric reported 100% on this input
+        # (DA:1,1; LF:N; LH:N — unseen_hits=N-1, unseen_inst=N-1 passes the
+        # bound but the summary is inflatable to N/N=100% with one real hit).
+        # The DA-coherent metric reports 1/1=100% which IS demonstrated, and
+        # crucially adding a second tracked file with low coverage pulls the
+        # score down honestly (no fake denominator from declared LF).
+        lcov = (
+            "SF:crates/chaffra-core/src/config.rs\n"
+            "DA:1,1\nLF:1000\nLH:1000\nend_of_record\n"
+            "SF:crates/chaffra-cli/src/main.rs\n"
+            "DA:1,0\nDA:2,0\nDA:3,0\nLF:3\nLH:0\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        # Only the visible DA evidence drives arithmetic: 1 covered of 4
+        # unique DA lines = 25%. The inflated LF:1000 contributes nothing.
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertEqual(report["overall"]["instrumented_lines"], 4)
+        self.assertEqual(report["overall"]["covered_lines"], 1)
+        self.assertAlmostEqual(report["overall"]["percent"], 25.0, places=2)
+
+    def test_inflated_unseen_hits_rejected_by_parser(self) -> None:
         # LF:10/LH:10 with `DA:1,1; DA:2,0`: unseen_hits = 10-1 = 9,
-        # unseen_inst = 10-2 = 8 → 9 > 8 → MALFORMED.
+        # unseen_inst = 10-2 = 8 → 9 > 8 → parser rejects as malformed.
         lcov = (
             "SF:crates/chaffra-core/src/config.rs\n"
             "DA:1,1\nDA:2,0\nLF:10\nLH:10\nend_of_record\n"
@@ -282,22 +307,6 @@ class TestSummaryConsistencyRejectsInflatedLcov(CheckerTestCase):
         self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
         self.assertEqual(report["status"], "malformed_input")
         self.assertIn("hits unaccounted", report["detail"])
-
-    def test_consistent_summary_passes_with_standard_metric(self) -> None:
-        # LF:10/LH:7 with three covered + two uncovered DA records:
-        # unseen_hits = 7-3 = 4, unseen_inst = 10-5 = 5 → 4 ≤ 5 OK.
-        # Overall is the standard ΣLH/ΣLF = 7/10 = 70%, matching what
-        # `cargo llvm-cov --summary-only` would report for this file.
-        lcov = (
-            "SF:crates/chaffra-core/src/config.rs\n"
-            "DA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nDA:5,0\nLF:10\nLH:7\nend_of_record\n"
-        )
-        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)  # 70% < 85%
-        self.assertEqual(report["overall"]["instrumented_lines"], 10)
-        self.assertEqual(report["overall"]["covered_lines"], 7)
-        self.assertAlmostEqual(report["overall"]["percent"], 70.0, places=2)
 
 
 class TestSyntheticSfPathsAreDropped(CheckerTestCase):
@@ -998,6 +1007,101 @@ class TestExactHeadValidation(RealGitTestCase):
         # Detail must name the actual HEAD so the mismatch is auditable.
         self.assertIn(head_sha, payload["detail"])
         self.assertIn("MALFORMED INPUT", (self.tmp / "out.md").read_text(encoding="utf-8"))
+
+
+class TestPolicyAndCiInvariants(unittest.TestCase):
+    """Regression guards for the documented residual (H4).
+
+    The empty-scope inactive-target-`cfg` exception and the explicit
+    feature enumeration in CI are both documentation rules today. These
+    tests enforce them mechanically so a future PR cannot silently
+    erode the residual."""
+
+    WORKSPACE = Path(__file__).resolve().parents[2]
+
+    @staticmethod
+    def _read_policy_paths() -> set[str]:
+        policy_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "coverage-policy.toml"
+        text = policy_path.read_text(encoding="utf-8")
+        # Extract every literal path token from `patterns = [...]` blocks.
+        return set(re.findall(r'"((?:crates|docs)[^"]+\.rs)"', text))
+
+    @staticmethod
+    def _parse_non_default_features() -> dict[str, list[str]]:
+        """Return {crate_name: [non_default_feature, ...]} for the workspace.
+
+        Parses `[features]` tables in every `crates/*/Cargo.toml`. A feature
+        is non-default iff it is not in the `default = [...]` list.
+        """
+        out: dict[str, list[str]] = {}
+        crates_dir = TestPolicyAndCiInvariants.WORKSPACE / "crates"
+        for cargo_toml in sorted(crates_dir.glob("*/Cargo.toml")):
+            data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+            features = data.get("features")
+            if not isinstance(features, dict):
+                continue
+            crate_name = cargo_toml.parent.name
+            default = set(features.get("default", []))
+            non_default = [k for k in features if k != "default" and k not in default]
+            if non_default:
+                out[crate_name] = sorted(non_default)
+        return out
+
+    def test_no_trust_boundary_file_has_target_cfg(self) -> None:
+        # The residual exception in coverage-policy.toml claims the
+        # inactive-target-`cfg` scope is empty today. Pin that claim.
+        tb_paths = self._read_policy_paths()
+        self.assertTrue(tb_paths, "policy paths set is empty — parser regression")
+        target_cfg = re.compile(r"#\[cfg\(target_(?:os|arch|family|env|vendor)")
+        offenders: list[tuple[str, int, str]] = []
+        for rel in sorted(tb_paths):
+            f = self.WORKSPACE / rel
+            if not f.is_file():
+                continue
+            for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                if target_cfg.search(line):
+                    offenders.append((rel, i, line.strip()))
+        self.assertEqual(
+            offenders,
+            [],
+            "trust-boundary file added a target-`cfg` gate; update "
+            "coverage-policy.toml's exception scope or close chaffra#49 "
+            f"before merging.\nOffenders: {offenders}",
+        )
+
+    def test_ci_coverage_command_enumerates_every_non_default_feature(self) -> None:
+        # The H4 narrowing depends on `cargo llvm-cov` instrumenting
+        # every non-default feature in the workspace. CONTRIBUTING.md
+        # asks contributors to add new features to the CI command; this
+        # test enforces it.
+        non_default = self._parse_non_default_features()
+        ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
+        ci_text = ci_path.read_text(encoding="utf-8")
+        # Same check on the documented local command so docs and CI agree.
+        contrib_path = TestPolicyAndCiInvariants.WORKSPACE / "CONTRIBUTING.md"
+        contrib_text = contrib_path.read_text(encoding="utf-8")
+        missing_ci: list[str] = []
+        missing_contrib: list[str] = []
+        for crate, features in non_default.items():
+            for feat in features:
+                token = f"{crate}/{feat}"
+                if token not in ci_text:
+                    missing_ci.append(token)
+                if token not in contrib_text:
+                    missing_contrib.append(token)
+        self.assertEqual(
+            missing_ci,
+            [],
+            f"non-default features missing from CI --features: {missing_ci}. "
+            "Add them to .github/workflows/ci.yml's `cargo llvm-cov` "
+            "invocation so their executable code reaches the LCOV DA records.",
+        )
+        self.assertEqual(
+            missing_contrib,
+            [],
+            f"non-default features missing from CONTRIBUTING.md: {missing_contrib}. "
+            "Add them to the documented local command.",
+        )
 
 
 if __name__ == "__main__":

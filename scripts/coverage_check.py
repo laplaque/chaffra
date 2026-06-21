@@ -233,17 +233,24 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
       * ``LH <= LF``,
       * ``LF >= unique DA lines`` and ``LH >= unique hit DA lines`` — the DA
         detail must be a subset of the declared summary (reconciliation),
+      * ``(LH - covered_DA) <= (LF - unique_DA)`` — the *unseen* hits a
+        producer claims must not exceed the *unseen* instrumented lines.
+        This catches the strict-overrun case (e.g. ``LF:10 LH:10 DA:1,1
+        DA:2,0`` → unseen_hits=9 > unseen_inst=8). It does NOT catch the
+        equal-pair case (``DA:1,1; LF:N; LH:N`` for any N — unseen_hits =
+        unseen_inst = N-1 passes). That case is instead defanged by the
+        arithmetic choice in :func:`evaluate`, which uses the DA-coherent
+        metric ``Σ(covered DA) / Σ(unique DA)`` and so never reads ``LH``;
+        the producer's high declared LH cannot lift the score past the
+        DA records' demonstrated coverage.
       * no duplicate DA record for the same line,
-      * at least one DA record,
+      * at least one DA record per ACTIVE block,
       * ``end_of_record`` terminates the block.
 
     These bounds are the strongest that the pinned producer (cargo-llvm-cov
     0.6.21) satisfies: empirically it declares ``LF`` strictly greater than
     the number of serialised DA lines in 72 / 88 workspace blocks, so a
-    strict ``LF == DA-count`` equality would reject legitimate output. The
-    reconciliation is therefore a bound plus the arithmetic choice in
-    :func:`evaluate` (overall denominator = ``Σ LF``, numerator = covered DA
-    lines), which makes a declared summary impossible to inflate.
+    strict ``LF == DA-count`` equality would reject legitimate output.
 
     Two SF blocks that normalise to the same repository-relative path are
     rejected as a collision. SF paths that escape ``repo_root`` start a
@@ -762,26 +769,27 @@ def evaluate(
     # for every downstream gate computation in this function.
     eligible_lcov = {p: fc for p, fc in lcov.items() if p in tracked_rs_files}
     dropped_synthetic = sorted(set(lcov) - set(eligible_lcov))
-    # Overall is the producer's standard summary metric, ΣLH / ΣLF — a
-    # coherent pair from one LCOV representation (matches what
-    # `cargo llvm-cov --summary-only` reports). The summary cannot be
-    # inflated arbitrarily because parse_lcov enforces, per ACTIVE block:
-    #   * LH <= LF                                     (hits ≤ instrumented)
-    #   * LF >= unique DA lines                        (every visible DA is instrumented)
-    #   * LH >= unique hit DA lines                    (every visible hit is in LH)
-    #   * (LH - covered_DA) <= (LF - unique_DA)        (unseen hits ≤ unseen
-    #                                                   instrumented; rejects
-    #                                                   producers whose summary
-    #                                                   claims more hits behind
-    #                                                   the DA records than
-    #                                                   there is undeclared
-    #                                                   instrumentation behind
-    #                                                   them).
+    # Overall is the **DA-coherent** metric: both numerator and denominator
+    # come from the concrete DA records. Numerator = unique covered DA
+    # lines; denominator = unique instrumented DA lines. This is one of the
+    # two coherent representations the assignment accepts (the other being
+    # ΣLH/ΣLF) and is chosen for non-inflatability: the producer cannot
+    # contribute to the numerator without also emitting a visible DA line
+    # in the denominator, so a high declared LH cannot lift the score past
+    # what the DA records demonstrate. The declared LH would be inflatable
+    # at the limit `DA:1,1; LF:N; LH:N` (passes the reconciliation bound
+    # and yields N/N=100%); the DA-coherent metric pins the limit at 1/1
+    # for that input, exactly what a single covered visible line shows.
+    #
+    # parse_lcov already enforces structural reconciliation against the
+    # declared LF/LH (LH<=LF, LF>=unique DA, LH>=unique hit DA,
+    # unseen_hits<=unseen_inst), so a malformed summary is still rejected;
+    # the arithmetic just doesn't depend on the summary values.
     total_lf = 0
     total_lh = 0
     for fc in eligible_lcov.values():
-        total_lf += fc.declared_lf
-        total_lh += fc.declared_lh
+        total_lf += len(fc.lines)
+        total_lh += len(fc.covered_lines())
     if total_lf == 0:
         # Zero eligible instrumented lines means the LCOV had no SF block for
         # any tracked Rust file: every block was either out-of-repo or
