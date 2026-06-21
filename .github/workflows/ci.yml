@@ -116,11 +116,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # SHA-pinned: actions/setup-python v5.4.0 (2025-01-09). The other
-      # actions used here (`checkout`) already appear in this workflow
-      # under their existing major-tag style; keep that style for the
+      # SHA-pinned to the current commit at the v5 tag. The other actions
+      # used here (`checkout`) already appear in this workflow under the
+      # repository's existing major-tag style; keep that style for the
       # ones the repository was already trusting at the major tag.
-      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Run unit tests
@@ -190,17 +190,15 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       # SHA-pinned: actions/setup-python v5.4.0.
-      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install cargo-llvm-cov
-        # Pin: see CARGO_LLVM_COV_VERSION in the workflow env block. Bump
-        # together with that comment for reviewer visibility.
-        # SHA pin for the installer action itself: taiki-e/install-action
-        # v2.62.18 (2026-06-01). Bump alongside the tool version.
-        uses: taiki-e/install-action@b07b6c1adfd00deeb1ff3ee43afa68a2af86b9bb # v2.62.18
+        # Pin: see CARGO_LLVM_COV_VERSION in the workflow env block. The
+        # installer action is SHA-pinned to the current commit at the v2 tag.
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }}
       - name: Verify resolved head SHA matches checkout
