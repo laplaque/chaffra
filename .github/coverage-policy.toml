@@ -49,6 +49,7 @@ patterns = [
 purpose = "telemetry audience and privacy projection"
 patterns = [
   "crates/chaffra-telemetry/src/collector.rs",
+  "crates/chaffra-telemetry/src/audit_log.rs",
 ]
 
 [[trust_boundaries]]
@@ -58,7 +59,7 @@ patterns = [
 ]
 
 [[trust_boundaries]]
-purpose = "persistence boundaries (telemetry sinks)"
+purpose = "persistence boundaries (telemetry sinks and on-disk state)"
 patterns = [
   "crates/chaffra-telemetry/src/backends/mod.rs",
   "crates/chaffra-telemetry/src/backends/cloudwatch.rs",
@@ -67,6 +68,16 @@ patterns = [
   "crates/chaffra-telemetry/src/backends/statsd.rs",
   "crates/chaffra-telemetry/src/backends/stderr.rs",
   "crates/chaffra-telemetry/src/backends/json_file.rs",
+  "crates/chaffra-telemetry/src/churn.rs",
+  "crates/chaffra-audit/src/lib.rs",
+  "crates/chaffra-impact/src/lib.rs",
+]
+
+[[trust_boundaries]]
+purpose = "telemetry gRPC ingress and metric data path"
+patterns = [
+  "crates/chaffra-telemetry/src/grpc_service.rs",
+  "crates/chaffra-telemetry/src/metrics.rs",
 ]
 
 [[trust_boundaries]]
@@ -75,4 +86,13 @@ patterns = [
   "crates/chaffra-core/src/grpc.rs",
   "crates/chaffra-core/src/grpc/convert.rs",
   "crates/chaffra-plugin/src/proto.rs",
+]
+
+[[trust_boundaries]]
+purpose = "MCP / LSP request validation and dispatch"
+patterns = [
+  "crates/chaffra-mcp/src/server.rs",
+  "crates/chaffra-mcp/src/tools.rs",
+  "crates/chaffra-mcp/src/protocol.rs",
+  "crates/chaffra-cli/src/lsp.rs",
 ]

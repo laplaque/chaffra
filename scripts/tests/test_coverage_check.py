@@ -179,6 +179,8 @@ class CheckerTestCase(unittest.TestCase):
                 str(md_out),
                 "--repo-files",
                 str(self.repo_files_path),
+                "--repo-root",
+                str(self.tmp),
                 "--mode",
                 mode,
             ]
@@ -600,22 +602,80 @@ class TestTrustBoundaryDetailUsesPolicyThreshold(CheckerTestCase):
         self.assertIn("95.00%", gate["detail"])
 
 
-class TestTrustBoundaryCommentOnly(CheckerTestCase):
-    def test_comment_only_changes_to_trust_boundary_pass(self) -> None:
-        # TB file has LCOV records but the changed lines are not in them —
-        # treated as non-executable (comments, whitespace). Must pass.
+class TestTrustBoundaryExecutableClassification(CheckerTestCase):
+    """H4: distinguish comment / doc / attribute changes (compliant) from
+    executable but uninstrumented changes (gate fail) on trust-boundary files."""
+
+    def _write_tb_source(self, line_50: str, line_51: str, line_52: str) -> None:
+        # Build a 60-line file where lines 50..52 carry the test-provided
+        # content. Earlier lines are inert filler so a classifier reading the
+        # whole file does not surface unrelated executable findings.
+        lines = ["// filler" for _ in range(60)]
+        lines[49] = line_50
+        lines[50] = line_51
+        lines[51] = line_52
+        write(self.tmp / BASIC_TRUST_BOUNDARY_FILE, "\n".join(lines) + "\n")
+
+    def test_comment_only_changes_pass(self) -> None:
+        self._write_tb_source(
+            "    /// doc comment for next field",
+            "    #[serde(default)]",
+            "    // a regular line comment",
+        )
         lcov = lcov_text(
             [
                 (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)]),
                 (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
             ]
         )
-        # Changed lines 50–52 are not in the LCOV records → non-instrumented.
         diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])])
         rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
         gate_names = {g["name"]: g for g in report["gates"]}
         self.assertEqual(rc, coverage_check.EXIT_OK, gate_names)
         self.assertTrue(gate_names["trust_boundary_changed"]["passed"])
+        # File row must report the non-instrumented lines but zero of them
+        # classify as executable.
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["non_instrumented_lines"], [50, 51, 52])
+        self.assertEqual(block["non_instrumented_executable_lines"], [])
+
+    def test_executable_but_uninstrumented_changes_fail(self) -> None:
+        self._write_tb_source(
+            "    let x = some_call();",
+            "    if condition { do_thing(); }",
+            "    return Ok(x);",
+        )
+        lcov = lcov_text(
+            [
+                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)]),
+                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
+            ]
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertFalse(gate["passed"])
+        self.assertIn("executable changed lines absent from LCOV", gate["detail"])
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["non_instrumented_executable_lines"], [50, 51, 52])
+
+    def test_missing_source_fails_closed(self) -> None:
+        # No source file written → checker conservatively flags every
+        # non-instrumented changed line as executable.
+        lcov = lcov_text(
+            [
+                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1)]),
+                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
+            ]
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 2)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertFalse(gate["passed"])
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["non_instrumented_executable_lines"], [50, 51])
 
 
 class TestPushMode(CheckerTestCase):
@@ -634,6 +694,248 @@ class TestPushMode(CheckerTestCase):
         gate_names = {g["name"] for g in report["gates"]}
         self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
         self.assertEqual(gate_names, {"overall"})
+
+
+class TestExecutableClassifierEdgeCases(unittest.TestCase):
+    """Direct tests for `_classify_lines_status` covering the edge cases the
+    simple prefix heuristic mishandled: multi-line attributes, inline block
+    comments followed by code, code inside string literals containing `//`."""
+
+    def _status(self, source: str) -> list[str]:
+        return coverage_check._classify_lines_status(source)
+
+    def test_multiline_attribute_continuation_is_not_executable(self) -> None:
+        source = (
+            "#[derive(\n"
+            "    Debug,\n"
+            "    Clone,\n"
+            ")]\n"
+            "struct Foo;\n"
+        )
+        status = self._status(source)
+        # Lines 1-4 are the attribute; line 5 is executable code.
+        self.assertEqual(status[0], "attribute")
+        self.assertEqual(status[1], "attribute")
+        self.assertEqual(status[2], "attribute")
+        self.assertEqual(status[3], "attribute")
+        self.assertEqual(status[4], "executable")
+
+    def test_inline_block_comment_then_code_is_executable(self) -> None:
+        source = (
+            "    /* TODO */ let secret = decode(token)?;\n"
+            "    /* note */\n"
+            "    let x = 1;\n"
+        )
+        status = self._status(source)
+        self.assertEqual(status[0], "executable")
+        self.assertEqual(status[1], "block_comment")
+        self.assertEqual(status[2], "executable")
+
+    def test_multiline_block_comment(self) -> None:
+        source = (
+            "/* opening\n"
+            " * middle\n"
+            " * closing */\n"
+            "fn run() {}\n"
+        )
+        status = self._status(source)
+        self.assertEqual(status[0], "block_comment")
+        self.assertEqual(status[1], "block_comment")
+        self.assertEqual(status[2], "block_comment")
+        self.assertEqual(status[3], "executable")
+
+    def test_string_literal_with_slash_slash_is_executable(self) -> None:
+        source = 'let url = "https://example.com";\n'
+        status = self._status(source)
+        self.assertEqual(status[0], "executable")
+
+    def test_doc_comments_classify_as_line_comment(self) -> None:
+        source = "/// docs\n//! inner docs\n// regular\n"
+        status = self._status(source)
+        self.assertEqual(status, ["line_comment", "line_comment", "line_comment"])
+
+    def test_blank_lines_are_blank(self) -> None:
+        source = "\n   \n\nfn f() {}\n"
+        status = self._status(source)
+        self.assertEqual(status[0], "blank")
+        self.assertEqual(status[1], "blank")
+        self.assertEqual(status[2], "blank")
+        self.assertEqual(status[3], "executable")
+
+
+class TestMalformedLcovTable(CheckerTestCase):
+    """Table-driven: every reject case must surface as exit 2 with a clear stderr.
+
+    Per CONTRIBUTING.md > Style: one assertion loop, N rows for repeated
+    inputs. New malformed-LCOV cases land as rows here, not new classes.
+    """
+
+    CASES: list[tuple[str, str]] = [
+        ("non-numeric DA hits", "SF:foo.rs\nDA:1,not-a-number\nend_of_record\n"),
+        ("missing end_of_record", "SF:foo.rs\nDA:1,1\n"),
+        ("empty SF block (no DA)", "SF:foo.rs\nLF:0\nLH:0\nend_of_record\n"),
+        (
+            "LH > LF",
+            "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:5\nend_of_record\n",
+        ),
+        (
+            "unique DA lines exceed declared LF",
+            "SF:foo.rs\nDA:1,1\nDA:2,1\nDA:3,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "unique hit DA lines exceed declared LH",
+            "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:0\nend_of_record\n",
+        ),
+        ("new SF before end_of_record", "SF:a.rs\nDA:1,1\nSF:b.rs\nend_of_record\n"),
+        ("malformed LF record", "SF:foo.rs\nDA:1,1\nLF:abc\nend_of_record\n"),
+        ("malformed LH record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:abc\nend_of_record\n"),
+        ("no records at all", "TN:test\n"),
+    ]
+
+    def test_every_malformed_input_exits_2(self) -> None:
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        for name, lcov in self.CASES:
+            with self.subTest(case=name):
+                rc, _, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+                self.assertEqual(
+                    rc,
+                    coverage_check.EXIT_MALFORMED,
+                    f"case {name!r}: expected EXIT_MALFORMED, got {rc}",
+                )
+
+
+class TestMarkdownUncoveredDetail(CheckerTestCase):
+    """M2: the Markdown report (not just the JSON) must surface uncovered
+    and non-instrumented changed-line detail per file."""
+
+    def test_markdown_contains_uncovered_and_noninstrumented_lines(self) -> None:
+        # Line 10 covered, 11 uncovered, 13 changed but non-instrumented.
+        lcov = lcov_text(
+            [
+                (NON_TRUST_BOUNDARY_FILE, [(10, 1), (11, 0)]),
+                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1)]),
+            ]
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(10, 4)])])
+        rc, _report, md = self.run_check(
+            lcov=lcov, policy=basic_policy(), diff=diff
+        )
+        # Slice the Markdown to the per-file section so the assertion targets
+        # the table row, not gate-detail rows that may also mention the file.
+        section = md.split("## Per-file changed-line coverage", 1)[1].split(
+            "## Overall workspace coverage", 1
+        )[0]
+        row_line = next(
+            line for line in section.splitlines() if NON_TRUST_BOUNDARY_FILE in line
+        )
+        # Uncovered (11) and non-instrumented (12, 13) numbers must appear
+        # in the rendered per-file row.
+        self.assertIn("11", row_line, row_line)
+        self.assertIn("12", row_line, row_line)
+        self.assertIn("13", row_line, row_line)
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+
+
+import shutil
+
+
+@unittest.skipUnless(shutil.which("git"), "git binary not available")
+class TestMainGitIntegration(unittest.TestCase):
+    """M1: drive main() through the production acquisition path that uses
+    `git diff base...head` and `git ls-files`, with neither --diff nor
+    --repo-files supplied. Uses a temporary git repository so the test stays
+    deterministic and self-contained. Skipped on runners without git."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cov-git-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, *args: str) -> str:
+        import subprocess as sp
+
+        return sp.check_output(
+            ["git", *args],
+            cwd=self.tmp,
+            text=True,
+            env={
+                **{"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
+                **dict(__import__("os").environ),
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            },
+        ).strip()
+
+    def test_end_to_end_via_git_diff_and_ls_files(self) -> None:
+        # Initialize a tiny repo with one Rust file, then add coverage for
+        # the changed lines and verify main() returns 0.
+        self._git("init", "-q", "-b", "main")
+        rel = "crates/chaffra-core/src/config.rs"
+        (self.tmp / "crates/chaffra-core/src").mkdir(parents=True)
+        (self.tmp / rel).write_text(
+            "fn original() {}\n", encoding="utf-8"
+        )
+        (self.tmp / "other.txt").write_text("noise\n", encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-q", "-m", "base")
+        base_sha = self._git("rev-parse", "HEAD")
+        (self.tmp / rel).write_text(
+            "fn original() {}\nfn added() { x(); }\n", encoding="utf-8"
+        )
+        self._git("add", rel)
+        self._git("commit", "-q", "-m", "head")
+        head_sha = self._git("rev-parse", "HEAD")
+
+        # LCOV that covers BOTH lines of the new file so the gate passes.
+        lcov = lcov_file_block(rel, [(1, 1), (2, 1)])
+        lcov_path = write(self.tmp / "lcov.info", lcov)
+        policy_path = write(
+            self.tmp / "policy.toml",
+            textwrap.dedent(
+                f"""\
+                policy_version = 1
+                [thresholds]
+                overall = 85.0
+                aggregate_changed = 95.0
+                per_file_changed = 90.0
+                trust_boundary_changed = 100.0
+
+                [[trust_boundaries]]
+                purpose = "configuration parsing"
+                patterns = ["{rel}"]
+                """
+            ),
+        )
+        rc = coverage_check.main(
+            [
+                "--lcov",
+                str(lcov_path),
+                "--policy",
+                str(policy_path),
+                "--repo-root",
+                str(self.tmp),
+                "--base-sha",
+                base_sha,
+                "--head-sha",
+                head_sha,
+                "--json-out",
+                str(self.tmp / "out.json"),
+                "--markdown-out",
+                str(self.tmp / "out.md"),
+                "--mode",
+                "pr",
+            ]
+        )
+        self.assertEqual(rc, coverage_check.EXIT_OK)
+        report = json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["base_sha"], base_sha)
+        self.assertEqual(report["head_sha"], head_sha)
+        # The change set must include the .rs file but exclude other.txt.
+        paths = [f["path"] for f in report["files"]]
+        self.assertEqual(paths, [rel])
 
 
 if __name__ == "__main__":

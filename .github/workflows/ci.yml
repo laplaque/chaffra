@@ -116,7 +116,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      # SHA-pinned: actions/setup-python v5.4.0 (2025-01-09). The other
+      # actions used here (`checkout`) already appear in this workflow
+      # under their existing major-tag style; keep that style for the
+      # ones the repository was already trusting at the major tag.
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Run unit tests
@@ -124,18 +128,69 @@ jobs:
 
   coverage:
     name: coverage
+    # Run only on PRs (changed-line gates) and pushes to main (overall gate).
+    # Skipping feature-branch pushes removes the duplicate execution that
+    # would otherwise run alongside every PR with different enforcement.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      - name: Resolve head SHA and mode
+        id: prep
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            # Use the PR head SHA for both checkout and labeling. Defaulting
+            # to the synthetic merge commit (`refs/pull/N/merge`) would
+            # generate LCOV from a tree whose line numbers diverge from the
+            # head when main has moved, so the diff coordinates and the
+            # coverage records would disagree.
+            head="$PR_HEAD_SHA"
+            mode="pr"
+          else
+            head="$GITHUB_SHA"
+            mode="push"
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6
         with:
+          ref: ${{ steps.prep.outputs.head }}
           fetch-depth: 0
+      - name: Resolve base SHA
+        id: shas
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ steps.prep.outputs.head }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+            # Now that the checkout exists the fallback hits a real git
+            # repository: rev-parse can walk HEAD^ instead of silently
+            # collapsing base to head on a new-branch push.
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse --verify "${HEAD_SHA}^" 2>/dev/null || echo "$HEAD_SHA")"
+            fi
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "mode=${{ steps.prep.outputs.mode }}" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      # SHA-pinned: actions/setup-python v5.4.0.
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Install protoc
@@ -143,40 +198,20 @@ jobs:
       - name: Install cargo-llvm-cov
         # Pin: see CARGO_LLVM_COV_VERSION in the workflow env block. Bump
         # together with that comment for reviewer visibility.
-        uses: taiki-e/install-action@v2
+        # SHA pin for the installer action itself: taiki-e/install-action
+        # v2.62.18 (2026-06-01). Bump alongside the tool version.
+        uses: taiki-e/install-action@b07b6c1adfd00deeb1ff3ee43afa68a2af86b9bb # v2.62.18
         with:
           tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }}
-      - name: Resolve immutable base/head SHAs
-        id: shas
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_SHA: ${{ github.sha }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
+      - name: Verify resolved head SHA matches checkout
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE_SHA"
-            head="$PR_HEAD_SHA"
-            mode="pr"
-          else
-            head="$GITHUB_SHA"
-            # github.event.before is the previous tip on push. Mode is `push`,
-            # which enforces overall coverage only, so the changed-line range
-            # is informational. A force-push event surfaces the abandoned tip
-            # as `before`; base...head then spans back to the merge-base, which
-            # over-reports changed files for that run. The overall gate is
-            # unaffected. PR events use `pull_request.base.sha` and avoid this.
-            base="$PUSH_BEFORE_SHA"
-            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
-              base="$(git rev-parse --verify "${head}^" || echo "$head")"
-            fi
-            mode="push"
+          actual="$(git rev-parse HEAD)"
+          expected="${{ steps.shas.outputs.head }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "checkout HEAD ($actual) != resolved head ($expected)" >&2
+            exit 1
           fi
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "head=$head" >> "$GITHUB_OUTPUT"
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
       - name: Generate LCOV
         run: |
           set -euo pipefail
@@ -205,7 +240,8 @@ jobs:
           fi
       - name: Upload coverage artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        # SHA-pinned: actions/upload-artifact v4.6.2 (2025-03-19).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-${{ steps.shas.outputs.head }}
           path: |

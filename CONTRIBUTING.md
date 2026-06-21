@@ -96,5 +96,5 @@ cargo fmt -- --check           # format check
 ## Branches
 
 - Never commit directly to `main`.
-- Feature branches: `feat/<slug>`, fixes: `fix/<slug>`.
+- Feature branches: `feat/<slug>`, fixes: `fix/<slug>`, CI / build infrastructure: `ci/<slug>`.
 - PRs are squash-merged.
