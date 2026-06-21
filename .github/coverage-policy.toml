@@ -25,6 +25,9 @@
 
 policy_version = 1
 
+# Documented residual: inactive-cfg-gated executable code is not in LCOV.
+# See CONTRIBUTING.md > Coverage > Documented residual, tracker: chaffra#49.
+
 [thresholds]
 # Overall line coverage on the workspace. Enforced on pull requests and on
 # pushes to the `main` branch (see CONTRIBUTING.md for full event coverage).
@@ -49,10 +52,19 @@ patterns = [
 ]
 
 [[trust_boundaries]]
-purpose = "telemetry audience and privacy projection"
+purpose = "telemetry audience, sampling, emission, and privacy projection"
+# Every file that gates or shapes a telemetry emission decision (audience,
+# sampling, snapshot, flush) is a trust boundary. The CLI's run_with_telemetry
+# orchestration is included via crates/chaffra-cli/src/main.rs below.
+# See https://github.com/laplaque/chaffra/issues/50 for the consolidation
+# tracker that aims to fold the parallel CLI/telemetry-module flush paths
+# into a single audited routine; until that lands, all current paths remain
+# explicitly covered.
 patterns = [
   "crates/chaffra-telemetry/src/collector.rs",
   "crates/chaffra-telemetry/src/audit_log.rs",
+  "crates/chaffra-telemetry/src/module.rs",
+  "crates/chaffra-telemetry/src/sampling.rs",
 ]
 
 [[trust_boundaries]]
@@ -98,6 +110,23 @@ patterns = [
   "crates/chaffra-mcp/src/tools.rs",
   "crates/chaffra-mcp/src/protocol.rs",
   "crates/chaffra-cli/src/lsp.rs",
+]
+
+[[trust_boundaries]]
+# Trust boundary for CLI orchestration: `main.rs` is where the binary
+# applies audience overrides, sampling, and churn persistence around every
+# module dispatch (`run_with_telemetry`), and `watch.rs` does the same for
+# the watch loop. The glob intentionally covers the whole file rather than
+# specific functions because the policy patterns are fnmatch globs without
+# per-symbol granularity, and the privacy-relevant orchestration is
+# interleaved with the rest of `main.rs`. This widens the 100%-changed-line
+# requirement to unrelated CLI surface (argparse, help text), which is
+# accepted as the safer tradeoff until chaffra#50 extracts the orchestration
+# into a dedicated module.
+purpose = "CLI orchestration around telemetry and module dispatch"
+patterns = [
+  "crates/chaffra-cli/src/main.rs",
+  "crates/chaffra-cli/src/watch.rs",
 ]
 
 [[trust_boundaries]]

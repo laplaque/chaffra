@@ -23,9 +23,9 @@ Scope: this gate is Rust-only (``RUST_EXT``). It never classifies source
 text — the LCOV DA records, produced with ``--all-features``, are the sole
 authority on which changed lines are executable and must be covered. A
 changed line absent from the DA records is a line llvm did not instrument
-(brace, declaration, comment, blank) and is not a failure. The single
-residual gap is code reachable only under a non-active ``cfg`` (e.g. another
-``target_os``), which no single build can instrument.
+(brace, declaration, comment, blank) and is not a failure. The documented
+inactive-cfg residual is described in CONTRIBUTING.md (Coverage > Documented
+residual) and tracked as chaffra#49.
 """
 
 from __future__ import annotations
@@ -209,7 +209,6 @@ class Report:
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # LCOV parser
 # ---------------------------------------------------------------------------
 
@@ -222,39 +221,45 @@ _LCOV_LH = re.compile(r"^LH:(\d+)$")
 def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
     """Parse LCOV text into a map of repository-relative path -> FileCoverage.
 
-    The parser enforces a strict, unambiguous contract per SF block; any
-    violation raises ``MalformedInput`` (exit 2):
+    Per-block invariants — any violation raises ``MalformedInput`` (exit 2):
 
-      * exactly one ``LF`` record and one ``LH`` record per block,
-      * no duplicate ``DA`` records for the same line within a block,
-      * ``LH <= LF``,
-      * ``LH`` equals the number of DA records with non-zero hits,
-      * ``LF`` equals the number of DA records,
-      * at least one DA record (no empty instrumentation),
-      * end_of_record properly terminates every SF block.
+      * end_of_record terminates every SF block,
+      * no duplicate DA record for the same line within a block,
+      * at least one DA record per ACTIVE (in-repo) block,
+      * malformed DA/LF/LH records are rejected regardless of whether the
+        enclosing SF is in-repo or skipped (so a skipped block cannot
+        smuggle structural garbage past the parser).
 
     Two SF blocks that normalise to the same repository-relative path are
     rejected as a collision so an attacker cannot inflate overall coverage
-    by emitting alias paths. SF paths that escape ``repo_root`` are dropped
-    (return ``None`` from ``_normalize_path``) before arithmetic.
+    by emitting alias paths. SF paths that escape ``repo_root`` start a
+    *skipped* block: the parser keeps validating record boundaries and
+    record syntax inside the block (so a missing ``end_of_record`` or a
+    malformed ``DA`` cannot hide in a skipped block) but discards the data
+    from arithmetic.
 
-    The declared ``LF``/``LH`` values are the authoritative inputs to the
-    overall arithmetic; the DA records drive the changed-line gates.
+    LF / LH records are intentionally **not parsed**. The producer's
+    declared summary is metadata that can disagree with the DA records it
+    serialised; the checker treats DA records as the single auditable
+    source of truth for all four gates, so a contradiction with declared
+    summaries is structurally impossible. Lines beginning with ``LF:`` /
+    ``LH:`` are syntax-checked (they must be ``LF:<int>`` / ``LH:<int>``
+    or the parser rejects the file as malformed) but their values are
+    never used.
     """
 
     files: dict[str, FileCoverage] = {}
+    # Parser states: IDLE (between blocks), ACTIVE (inside an in-repo SF),
+    # SKIPPED (inside an out-of-repo SF — validate structure, discard data).
+    state = "IDLE"
     current: FileCoverage | None = None
-    block_lines: dict[int, int] = {}
-    block_lf: int | None = None
-    block_lh: int | None = None
+    block_da_lines: set[int] = set()
     seen_record_terminators = 0
     line_no = 0
 
     def reset_block() -> None:
-        nonlocal block_lines, block_lf, block_lh
-        block_lines = {}
-        block_lf = None
-        block_lh = None
+        nonlocal block_da_lines
+        block_da_lines = set()
 
     for raw in text.splitlines():
         line_no += 1
@@ -262,17 +267,21 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
         if not line:
             continue
         if line.startswith("SF:"):
-            if current is not None:
+            if state != "IDLE":
+                where = current.path if current is not None else "<skipped block>"
                 raise MalformedInput(
-                    f"line {line_no}: new SF before end_of_record for {current.path}"
+                    f"line {line_no}: new SF before end_of_record for {where}"
                 )
             sf_path = line[len("SF:") :]
+            if not sf_path.strip():
+                raise MalformedInput(f"line {line_no}: empty SF path")
             rel = _normalize_path(sf_path, repo_root)
             if rel is None:
-                # SF path escapes the repo root (e.g., vendored crate under
-                # ~/.cargo/registry/). Skip the entire block so out-of-tree
-                # coverage cannot inflate overall totals — the parser still
-                # walks the rest of the block to keep state consistent.
+                # Out-of-repo SF (e.g. vendored crate under
+                # ~/.cargo/registry/). Enter SKIPPED state so a missing
+                # end_of_record or a malformed record inside this block is
+                # still detected; the data is just not stored.
+                state = "SKIPPED"
                 current = None
                 reset_block()
                 continue
@@ -282,53 +291,24 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                 )
             current = FileCoverage(path=rel)
             files[rel] = current
+            state = "ACTIVE"
             reset_block()
             continue
         if line == "end_of_record":
-            if current is None:
-                # Skipped SF (out-of-repo). No invariants to enforce.
-                reset_block()
-                continue
-            unique_lines = len(block_lines)
-            unique_hits = sum(1 for hits in block_lines.values() if hits > 0)
-            if unique_lines == 0:
-                raise MalformedInput(
-                    f"line {line_no}: SF block for {current.path!r} has no DA records"
-                )
-            if block_lf is None or block_lh is None:
-                raise MalformedInput(
-                    f"line {line_no}: SF block for {current.path!r} missing LF/LH summary"
-                )
-            if block_lh > block_lf:
-                raise MalformedInput(
-                    f"line {line_no}: LH={block_lh} > LF={block_lf} for {current.path!r}"
-                )
-            # LF/LH are validated for structural consistency but are NOT used
-            # for coverage arithmetic. Overall and changed-line coverage are
-            # both computed from the concrete DA records (see evaluate()), so
-            # a producer that declares LF/LH far above the emitted DA records
-            # cannot inflate the reported percentage. cargo-llvm-cov 0.6.x
-            # emits LF/LH that exceed unique DA lines (LLVM tracks regions it
-            # does not serialise as DA), so the enforceable invariants are
-            # bounds, not equality:
-            #   * LH <= LF                  (hit count cannot exceed instrumented)
-            #   * LF >= unique DA lines     (every emitted DA line is instrumented)
-            #   * LH >= unique hit DA lines (every emitted hit is reflected in LH)
-            if block_lf < unique_lines:
-                raise MalformedInput(
-                    f"line {line_no}: declared LF={block_lf} below {unique_lines} unique DA "
-                    f"lines for {current.path!r}"
-                )
-            if block_lh < unique_hits:
-                raise MalformedInput(
-                    f"line {line_no}: declared LH={block_lh} below {unique_hits} unique hit "
-                    f"DA lines for {current.path!r}"
-                )
+            if state == "IDLE":
+                raise MalformedInput(f"line {line_no}: end_of_record outside SF block")
+            if state == "ACTIVE":
+                assert current is not None
+                if not block_da_lines:
+                    raise MalformedInput(
+                        f"line {line_no}: SF block for {current.path!r} has no DA records"
+                    )
             current = None
             reset_block()
+            state = "IDLE"
             seen_record_terminators += 1
             continue
-        if current is None:
+        if state == "IDLE":
             # Records outside an SF block (TN:, etc.) are ignored.
             continue
         if line.startswith("DA:"):
@@ -337,37 +317,31 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                 raise MalformedInput(f"line {line_no}: malformed DA record: {line!r}")
             ln = int(m.group(1))
             hits = int(m.group(2))
-            if ln in block_lines:
+            if ln in block_da_lines:
+                where = current.path if current is not None else "<skipped block>"
                 raise MalformedInput(
-                    f"line {line_no}: duplicate DA record for line {ln} in {current.path!r}"
+                    f"line {line_no}: duplicate DA record for line {ln} in {where}"
                 )
-            current.lines[ln] = hits
-            block_lines[ln] = hits
+            block_da_lines.add(ln)
+            if state == "ACTIVE":
+                assert current is not None
+                current.lines[ln] = hits
             continue
         if line.startswith("LF:"):
-            m_lf = _LCOV_LF.match(line)
-            if not m_lf:
+            if not _LCOV_LF.match(line):
                 raise MalformedInput(f"line {line_no}: malformed LF record: {line!r}")
-            if block_lf is not None:
-                raise MalformedInput(
-                    f"line {line_no}: duplicate LF record for {current.path!r}"
-                )
-            block_lf = int(m_lf.group(1))
+            # Value intentionally discarded — see parser docstring.
             continue
         if line.startswith("LH:"):
-            m_lh = _LCOV_LH.match(line)
-            if not m_lh:
+            if not _LCOV_LH.match(line):
                 raise MalformedInput(f"line {line_no}: malformed LH record: {line!r}")
-            if block_lh is not None:
-                raise MalformedInput(
-                    f"line {line_no}: duplicate LH record for {current.path!r}"
-                )
-            block_lh = int(m_lh.group(1))
+            # Value intentionally discarded — see parser docstring.
             continue
-        # Other records (FN/FNDA/BRDA/BRF/BRH) are ignored — this tool only
-        # gates on line coverage, matching the LCOV LF/LH semantics.
-    if current is not None:
-        raise MalformedInput("LCOV ends without end_of_record")
+        # Other records (FN/FNDA/BRDA/BRF/BRH) are ignored — this tool gates
+        # only on line coverage from DA records.
+    if state != "IDLE":
+        where = current.path if current is not None else "<skipped block>"
+        raise MalformedInput(f"LCOV ends without end_of_record (last block: {where})")
     if seen_record_terminators == 0:
         raise MalformedInput("LCOV contains no end_of_record markers")
     return files
@@ -672,28 +646,45 @@ def evaluate(
     base_sha: str,
     head_sha: str,
     trust_boundary_files: set[str],
+    tracked_rs_files: set[str],
     enforce_changed: bool,
 ) -> Report:
-    # Overall coverage is computed from the concrete DA records, never from
-    # the declared LF/LH summaries — a producer cannot inflate the reported
-    # percentage by declaring more instrumented lines than it emits.
+    # Restrict the LCOV records to TRACKED Rust files at HEAD. A producer
+    # that emits SF blocks for synthetic in-tree paths (e.g. ``SF:fake.rs``)
+    # cannot inflate the reported percentage — the unknown path is dropped
+    # before arithmetic. ``eligible_lcov`` is the authoritative LCOV view
+    # for every downstream gate computation in this function.
+    eligible_lcov = {p: fc for p, fc in lcov.items() if p in tracked_rs_files}
+    dropped_synthetic = sorted(set(lcov) - set(eligible_lcov))
     total_lf = 0
     total_lh = 0
-    for fc in lcov.values():
+    for fc in eligible_lcov.values():
         total_lf += len(fc.lines)
         total_lh += len(fc.covered_lines())
-    overall_percent = 100.0 * total_lh / total_lf if total_lf else 100.0
+    if total_lf == 0:
+        # Zero eligible DA records means the LCOV had no SF block for any
+        # tracked Rust file: every block was either out-of-repo or synthetic.
+        # A vacuous 100% would let a malicious or broken producer pass the
+        # overall gate with no real coverage — raise so the malformed-input
+        # path writes a failure artifact instead of a misleading success.
+        raise MalformedInput(
+            "no LCOV DA records match any tracked Rust file at head_sha "
+            f"(dropped synthetic/out-of-repo SF paths: "
+            f"{', '.join(dropped_synthetic) if dropped_synthetic else '<none>'})"
+        )
+    overall_percent = 100.0 * total_lh / total_lf
     overall_block = {
         "lf": total_lf,
         "lh": total_lh,
         "percent": overall_percent,
+        "dropped_synthetic_sf_paths": dropped_synthetic,
     }
 
     file_results: list[FileResult] = []
     rs_files = [f for f in diff.files() if f.endswith(RUST_EXT)]
     for path in sorted(rs_files):
         changed_lines = diff.by_file[path]
-        fc = lcov.get(path)
+        fc = eligible_lcov.get(path)
         instrumented_for_file = fc.instrumented_lines() if fc else set()
         covered_for_file = fc.covered_lines() if fc else set()
         instrumented_changed = changed_lines & instrumented_for_file
@@ -920,6 +911,60 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    def fail_malformed(detail: str) -> int:
+        """Emit failure JSON and Markdown to the configured paths and exit 2.
+
+        The artifact upload step in CI uses ``if: always()``, so the LCOV
+        upload reaches the artifact even on a malformed-input exit. Without
+        this helper, ``result.json`` and ``result.md`` would be absent from
+        that artifact, leaving reviewers no exact-SHA structured diagnostic.
+
+        The JSON payload mirrors :meth:`Report.to_json`'s top-level keys so
+        downstream consumers (badge generators, PR-comment renderers) can
+        read ``payload["overall"]``, ``payload["gates"]``, etc. without
+        ``KeyError`` on a malformed run. Success-path numeric fields are
+        ``null``; the failure-specific fields ``status`` and ``detail``
+        identify the cause.
+        """
+
+        print(f"error: {detail}", file=sys.stderr)
+        payload = {
+            "tool_version": VERSION,
+            "policy_version": None,
+            "base_sha": args.base_sha,
+            "head_sha": args.head_sha,
+            "thresholds": None,
+            "overall": None,
+            "aggregate_changed": None,
+            "files": [],
+            "gates": [],
+            "passed": False,
+            "status": "malformed_input",
+            "detail": detail,
+        }
+        md = (
+            f"# Coverage report — MALFORMED INPUT\n\n"
+            f"- tool version: `{VERSION}`\n"
+            f"- base sha: `{args.base_sha}`\n"
+            f"- head sha: `{args.head_sha}`\n\n"
+            f"Checker exited 2 before computing gates.\n\n"
+            f"**Detail:** {detail}\n"
+        )
+        try:
+            if args.json_out:
+                Path(args.json_out).write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            if args.markdown_out:
+                Path(args.markdown_out).write_text(md, encoding="utf-8")
+        except OSError as write_err:
+            print(
+                f"warning: could not write failure artifact: {write_err}",
+                file=sys.stderr,
+            )
+        return EXIT_MALFORMED
+
     repo_root = Path(args.repo_root).resolve()
     if not args.allow_head_drift:
         try:
@@ -927,54 +972,44 @@ def main(argv: list[str] | None = None) -> int:
                 ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
             ).strip()
         except (OSError, subprocess.CalledProcessError) as exc:
-            print(
-                f"error: cannot read repo HEAD ({exc}); pass --allow-head-drift to skip",
-                file=sys.stderr,
+            return fail_malformed(
+                f"cannot read repo HEAD ({exc}); pass --allow-head-drift to skip"
             )
-            return EXIT_MALFORMED
         if current_head != args.head_sha:
-            print(
-                f"error: worktree HEAD ({current_head}) != --head-sha ({args.head_sha}); "
-                "classification would read the wrong tree",
-                file=sys.stderr,
+            return fail_malformed(
+                f"worktree HEAD ({current_head}) != --head-sha ({args.head_sha}); "
+                "classification would read the wrong tree"
             )
-            return EXIT_MALFORMED
     try:
         lcov_text = Path(args.lcov).read_text(encoding="utf-8")
     except OSError as exc:
-        print(f"error: cannot read lcov: {exc}", file=sys.stderr)
-        return EXIT_MALFORMED
+        return fail_malformed(f"cannot read lcov: {exc}")
 
     try:
         policy = load_policy(Path(args.policy))
     except InvalidPolicy as exc:
-        print(f"error: invalid policy: {exc}", file=sys.stderr)
-        return EXIT_MALFORMED
+        return fail_malformed(f"invalid policy: {exc}")
 
     try:
         lcov = parse_lcov(lcov_text, repo_root)
     except MalformedInput as exc:
-        print(f"error: malformed lcov: {exc}", file=sys.stderr)
-        return EXIT_MALFORMED
+        return fail_malformed(f"malformed lcov: {exc}")
 
     if args.diff is not None:
         try:
             diff_text = Path(args.diff).read_text(encoding="utf-8")
         except OSError as exc:
-            print(f"error: cannot read diff: {exc}", file=sys.stderr)
-            return EXIT_MALFORMED
+            return fail_malformed(f"cannot read diff: {exc}")
     else:
         try:
             diff_text = get_diff_text(repo_root, args.base_sha, args.head_sha)
         except MalformedInput as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_MALFORMED
+            return fail_malformed(str(exc))
 
     try:
         diff = parse_unified_diff(diff_text)
     except MalformedInput as exc:
-        print(f"error: malformed diff: {exc}", file=sys.stderr)
-        return EXIT_MALFORMED
+        return fail_malformed(f"malformed diff: {exc}")
 
     if args.repo_files is not None:
         try:
@@ -984,34 +1019,34 @@ def main(argv: list[str] | None = None) -> int:
                 if line.strip()
             ]
         except OSError as exc:
-            print(f"error: cannot read repo-files: {exc}", file=sys.stderr)
-            return EXIT_MALFORMED
+            return fail_malformed(f"cannot read repo-files: {exc}")
     else:
         try:
             repo_files = list_tracked_rs_files(repo_root)
         except MalformedInput as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_MALFORMED
+            return fail_malformed(str(exc))
 
     matched, by_pattern = expand_trust_boundary_files(policy, repo_files)
     unmatched = sorted(p for p, hits in by_pattern.items() if not hits)
     if unmatched:
-        print(
-            "error: trust-boundary patterns matched no current files: "
-            + ", ".join(unmatched),
-            file=sys.stderr,
+        return fail_malformed(
+            "trust-boundary patterns matched no current files: " + ", ".join(unmatched)
         )
-        return EXIT_MALFORMED
 
-    report = evaluate(
-        lcov=lcov,
-        diff=diff,
-        policy=policy,
-        base_sha=args.base_sha,
-        head_sha=args.head_sha,
-        trust_boundary_files=matched,
-        enforce_changed=args.mode == "pr",
-    )
+    tracked_rs_set = {f for f in repo_files if f.endswith(RUST_EXT)}
+    try:
+        report = evaluate(
+            lcov=lcov,
+            diff=diff,
+            policy=policy,
+            base_sha=args.base_sha,
+            head_sha=args.head_sha,
+            trust_boundary_files=matched,
+            tracked_rs_files=tracked_rs_set,
+            enforce_changed=args.mode == "pr",
+        )
+    except MalformedInput as exc:
+        return fail_malformed(f"malformed lcov: {exc}")
 
     json_text = json.dumps(report.to_json(), indent=2, sort_keys=True)
     md_text = render_markdown(report)

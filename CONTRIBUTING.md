@@ -32,11 +32,22 @@ a configured glob matches no current file. Carve-outs must never lower a
 threshold; document an owner and removal issue inline if a temporary
 exclusion is unavoidable.
 
+#### Documented residual
+
+The coverage build runs with `--all-features` so feature-gated executable code
+is instrumented. Code reachable only under a non-active `cfg` — for example,
+`#[cfg(target_os = "windows")]` on a Linux runner — cannot be instrumented by
+any single build, so the trust-boundary 100% gate cannot enforce coverage on a
+change whose only added lines are gated by an inactive `cfg`. This residual is
+tracked in [chaffra#49](https://github.com/laplaque/chaffra/issues/49) and
+proposes either a multi-target coverage matrix or a tree-sitter-rust classifier.
+Reviewers must flag such changes in code review until the issue closes.
+
 #### Running coverage locally
 
 ```bash
 # 1. Generate the same LCOV file the CI job uses:
-cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+cargo llvm-cov --workspace --all-features --lcov --output-path coverage/lcov.info
 
 # 2. Reproduce a PR comparison against an explicit base/head SHA pair:
 python3 scripts/coverage_check.py \

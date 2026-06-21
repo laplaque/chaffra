@@ -215,12 +215,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p coverage
-          # --all-features so feature-gated executable code is instrumented
-          # and appears in the LCOV DA records. The checker treats DA records
-          # as the authority on which changed lines are executable, so
-          # feature-gated code must be built to be seen. Code reachable only
-          # under a non-active cfg (e.g. another target_os) cannot be
-          # instrumented by any single build — a documented residual.
+          # --all-features so feature-gated executable code appears in the
+          # LCOV DA records (the checker's executable-line authority). The
+          # inactive-cfg residual is documented in CONTRIBUTING.md (Coverage
+          # > Documented residual) and tracked as chaffra#49.
           cargo llvm-cov --workspace --all-features --lcov --output-path coverage/lcov.info
       - name: Run coverage checker
         env:
