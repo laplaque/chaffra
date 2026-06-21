@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Single source of truth for the Python version used by the coverage jobs.
+  COVERAGE_PYTHON_VERSION: "3.11"
+  # Pinned cargo-llvm-cov version installed via taiki-e/install-action. Bump
+  # together with the comment in the `coverage` job for reviewer visibility.
+  CARGO_LLVM_COV_VERSION: "0.6.21"
 
 jobs:
   check:
@@ -105,3 +110,106 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt -- --check
+
+  coverage-checker-tests:
+    name: coverage checker tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
+      - name: Run unit tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install cargo-llvm-cov
+        # Pin: see CARGO_LLVM_COV_VERSION in the workflow env block. Bump
+        # together with that comment for reviewer visibility.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }}
+      - name: Resolve immutable base/head SHAs
+        id: shas
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+            mode="pr"
+          else
+            head="$GITHUB_SHA"
+            # github.event.before is the previous tip on push. Mode is `push`,
+            # which enforces overall coverage only, so the changed-line range
+            # is informational. A force-push event surfaces the abandoned tip
+            # as `before`; base...head then spans back to the merge-base, which
+            # over-reports changed files for that run. The overall gate is
+            # unaffected. PR events use `pull_request.base.sha` and avoid this.
+            base="$PUSH_BEFORE_SHA"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse --verify "${head}^" || echo "$head")"
+            fi
+            mode="push"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - name: Generate LCOV
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+      - name: Run coverage checker
+        env:
+          BASE_SHA: ${{ steps.shas.outputs.base }}
+          HEAD_SHA: ${{ steps.shas.outputs.head }}
+          MODE: ${{ steps.shas.outputs.mode }}
+        run: |
+          set -euo pipefail
+          python3 scripts/coverage_check.py \
+            --lcov coverage/lcov.info \
+            --policy .github/coverage-policy.toml \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --json-out coverage/result.json \
+            --markdown-out coverage/result.md \
+            --mode "$MODE"
+      - name: Append Markdown to step summary
+        if: always()
+        run: |
+          if [ -f coverage/result.md ]; then
+            cat coverage/result.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ steps.shas.outputs.head }}
+          path: |
+            coverage/lcov.info
+            coverage/result.json
+            coverage/result.md
+          if-no-files-found: warn

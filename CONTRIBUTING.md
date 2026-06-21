@@ -6,11 +6,56 @@ Every PR that introduces or changes functional code must satisfy these gates bef
 
 ### Coverage
 
-Applies when the PR contains functional (non-stub) Rust code:
+Applies when the PR contains functional (non-stub) Rust code. CI enforces the
+four thresholds below via `scripts/coverage_check.py`, run by the `coverage`
+job in `.github/workflows/ci.yml`. The versioned source of truth for both the
+thresholds and the trust-boundary path list is
+[`.github/coverage-policy.toml`](.github/coverage-policy.toml).
 
-- **95%** on new or changed code (delta coverage).
-- **85%** overall.
-- **100%** on security-sensitive and validation paths (config parsing, suppression handling, trust boundaries).
+- **85%** overall line coverage (enforced on every push and PR).
+- **95%** aggregate changed-line coverage across all changed Rust files on a PR.
+- **90%** changed-line coverage in every individual changed Rust file on a PR.
+- **100%** changed-line coverage for trust-boundary paths (configuration
+  parsing, telemetry audience/privacy projection, validation, suppression
+  handling, persistence boundaries, and gRPC/proto conversion).
+
+Changed lines are obtained from `git diff --unified=0 <base>...<head>`.
+A changed line counts only when it is also represented in the LCOV report
+as an executable line. Changed lines that do not appear in LCOV are reported
+as **non-instrumented** — they are never silently counted as covered, and a
+trust-boundary file with executable changed lines but no LCOV records fails
+the trust-boundary gate.
+
+When a covered trust boundary moves or new trust-boundary code lands, update
+`.github/coverage-policy.toml` in the same PR. The checker fails the build if
+a configured glob matches no current file. Carve-outs must never lower a
+threshold; document an owner and removal issue inline if a temporary
+exclusion is unavoidable.
+
+#### Running coverage locally
+
+```bash
+# 1. Generate the same LCOV file the CI job uses:
+cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+
+# 2. Reproduce a PR comparison against an explicit base/head SHA pair:
+python3 scripts/coverage_check.py \
+    --lcov coverage/lcov.info \
+    --policy .github/coverage-policy.toml \
+    --base-sha "$(git merge-base origin/main HEAD)" \
+    --head-sha "$(git rev-parse HEAD)" \
+    --json-out coverage/result.json \
+    --markdown-out coverage/result.md \
+    --mode pr
+
+# 3. Run the checker test suite:
+python3 -m unittest discover -s scripts/tests
+```
+
+The CI job uploads `coverage/lcov.info`, `coverage/result.json`, and
+`coverage/result.md` as the `coverage-<head-sha>` artifact on every run,
+including failed runs. The Markdown summary is also appended to the
+workflow's `GITHUB_STEP_SUMMARY`.
 
 ### Style
 

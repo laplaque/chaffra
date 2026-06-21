@@ -26,3 +26,10 @@ chaffra-telemetry.json
 
 # Claude Code
 .claude/
+
+# Python bytecode (coverage checker tooling under scripts/)
+__pycache__/
+*.pyc
+
+# Local coverage artifacts produced by `cargo llvm-cov` and the checker
+coverage/

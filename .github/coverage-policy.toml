@@ -1,0 +1,78 @@
+# Coverage policy for chaffra.
+#
+# This file is the single source of truth for coverage thresholds and the
+# list of trust-boundary paths whose changed lines must be fully covered.
+# The CI `coverage` job loads it via `scripts/coverage_check.py`.
+#
+# How to add a trust-boundary path
+# --------------------------------
+# 1. Add the repository-relative glob to the appropriate `[[trust_boundaries]]`
+#    group below, or create a new group with a descriptive `purpose`.
+# 2. Globs are matched against repository-relative paths via Python's
+#    `fnmatch.fnmatchcase` (shell wildcards `*`, `?`, `[seq]`). Note that
+#    `fnmatchcase` does NOT treat `/` as a path separator — `*` matches
+#    across directories. Use a literal path whenever possible; only reach
+#    for a wildcard when an entire subtree is in scope.
+# 3. Every glob must match at least one current file. The checker fails the
+#    build if it does not — this prevents a trust boundary from silently
+#    rotting when code moves.
+#
+# Removing a path requires the same review as code: trust-boundary carve-outs
+# must never lower a threshold or be used to make a coverage failure go away.
+# Time-bound exceptions document an owner and removal issue inline.
+
+policy_version = 1
+
+[thresholds]
+# Overall line coverage on the workspace. Enforced on every push and PR.
+overall = 85.0
+# Aggregate changed-line coverage across all changed Rust files on a PR.
+aggregate_changed = 95.0
+# Changed-line coverage of every individual changed Rust file on a PR.
+per_file_changed = 90.0
+# Changed-line coverage for trust-boundary files on a PR. Must be 100%.
+trust_boundary_changed = 100.0
+
+# Trust-boundary groups. Each group documents a class of code whose changes
+# must reach the trust-boundary threshold, with the globs that select files
+# in that class. Groups are unioned to form the full trust-boundary set.
+
+[[trust_boundaries]]
+purpose = "configuration parsing"
+patterns = [
+  "crates/chaffra-core/src/config.rs",
+  "crates/chaffra-telemetry/src/config.rs",
+  "crates/chaffra-plugin/src/config.rs",
+]
+
+[[trust_boundaries]]
+purpose = "telemetry audience and privacy projection"
+patterns = [
+  "crates/chaffra-telemetry/src/collector.rs",
+]
+
+[[trust_boundaries]]
+purpose = "suppression handling"
+patterns = [
+  "crates/chaffra-parse/src/suppression.rs",
+]
+
+[[trust_boundaries]]
+purpose = "persistence boundaries (telemetry sinks)"
+patterns = [
+  "crates/chaffra-telemetry/src/backends/mod.rs",
+  "crates/chaffra-telemetry/src/backends/cloudwatch.rs",
+  "crates/chaffra-telemetry/src/backends/otlp.rs",
+  "crates/chaffra-telemetry/src/backends/prometheus.rs",
+  "crates/chaffra-telemetry/src/backends/statsd.rs",
+  "crates/chaffra-telemetry/src/backends/stderr.rs",
+  "crates/chaffra-telemetry/src/backends/json_file.rs",
+]
+
+[[trust_boundaries]]
+purpose = "gRPC / proto conversion"
+patterns = [
+  "crates/chaffra-core/src/grpc.rs",
+  "crates/chaffra-core/src/grpc/convert.rs",
+  "crates/chaffra-plugin/src/proto.rs",
+]
