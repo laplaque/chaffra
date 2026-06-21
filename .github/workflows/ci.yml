@@ -215,11 +215,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p coverage
-          # --all-features so feature-gated executable code appears in the
-          # LCOV DA records (the checker's executable-line authority). The
-          # inactive-cfg residual is documented in CONTRIBUTING.md (Coverage
-          # > Documented residual) and tracked as chaffra#49.
-          cargo llvm-cov --workspace --all-features --lcov --output-path coverage/lcov.info
+          # NB: --all-features is intentionally NOT used. The workspace test
+          # suite is not --all-features-clean (chaffra#51: a global-cwd race
+          # in test_run_with_telemetry_end_to_end surfaces under the larger
+          # --all-features test set). Until #51 is fixed, coverage is built
+          # in the default feature configuration, matching the `test` job.
+          # Consequently, non-default-feature-gated code — like inactive-cfg
+          # code — is part of the documented coverage residual (CONTRIBUTING.md
+          # > Coverage > Documented residual, tracked as chaffra#49).
+          cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
       - name: Run coverage checker
         env:
           BASE_SHA: ${{ steps.shas.outputs.base }}

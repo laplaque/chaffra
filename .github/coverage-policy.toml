@@ -29,19 +29,24 @@ policy_version = 1
 # Tracked exception (per the carve-out rules above: owner + removal issue
 # inline, does not lower any threshold).
 #
-# Exception:   inactive-cfg-gated executable code on trust-boundary files.
-# Reason:      code reachable only under a non-active `cfg` (e.g.
-#              `#[cfg(target_os = "windows")]` on a Linux runner) is not
-#              present in the LCOV DA records, so the 100% trust-boundary
-#              gate cannot enforce coverage on a change whose only added
-#              lines are gated by an inactive cfg. `--all-features` closes
-#              feature gates but cannot activate another target_os.
+# Exception:   executable code not built in the coverage configuration, on
+#              trust-boundary files. Two cases:
+#              (a) inactive cfg — e.g. `#[cfg(target_os = "windows")]` on a
+#                  Linux runner; no single build can instrument it.
+#              (b) non-default features — the coverage build does NOT pass
+#                  `--all-features` because the workspace test suite is not
+#                  yet --all-features-clean (chaffra#51). Feature-gated code
+#                  is uninstrumented until #51 is fixed.
+#              Such code is absent from the LCOV DA records, so the 100%
+#              trust-boundary gate cannot enforce coverage on a change whose
+#              only added lines are so gated.
 # Scope:       does NOT lower any threshold; reviewers must flag such
-#              changes in code review until the removal issue closes.
+#              changes in code review until the removal issues close.
 # Owner:       @iamclaude697 (accountable for tracking + removal).
-# Removal:     https://github.com/laplaque/chaffra/issues/49
-#              (proposes a multi-target coverage matrix or a tree-sitter
-#              classifier; either closes the gap and retires this exception).
+# Removal:     https://github.com/laplaque/chaffra/issues/49 (multi-config
+#              matrix or tree-sitter classifier) and, for case (b),
+#              https://github.com/laplaque/chaffra/issues/51 (test cwd race
+#              that currently blocks --all-features).
 # Acceptance:  pending maintainer (@laplaque) sign-off on this PR.
 # Full detail: CONTRIBUTING.md > Coverage > Documented residual.
 # ---------------------------------------------------------------------------

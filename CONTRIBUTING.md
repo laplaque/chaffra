@@ -34,20 +34,30 @@ exclusion is unavoidable.
 
 #### Documented residual
 
-The coverage build runs with `--all-features` so feature-gated executable code
-is instrumented. Code reachable only under a non-active `cfg` — for example,
-`#[cfg(target_os = "windows")]` on a Linux runner — cannot be instrumented by
-any single build, so the trust-boundary 100% gate cannot enforce coverage on a
-change whose only added lines are gated by an inactive `cfg`. This residual is
-tracked in [chaffra#49](https://github.com/laplaque/chaffra/issues/49) and
-proposes either a multi-target coverage matrix or a tree-sitter-rust classifier.
-Reviewers must flag such changes in code review until the issue closes.
+The checker treats the LCOV DA records as the authority on which changed lines
+are executable. Code that the coverage build does not compile is therefore not
+enforced by the changed-line gates. Two cases fall into this residual:
+
+- **Inactive `cfg`** — code reachable only under a non-active `cfg`, e.g.
+  `#[cfg(target_os = "windows")]` on a Linux runner. No single build can
+  instrument it.
+- **Non-default features** — the coverage build runs in the default feature
+  configuration (it does **not** pass `--all-features`, because the workspace
+  test suite is not yet `--all-features`-clean; see
+  [chaffra#51](https://github.com/laplaque/chaffra/issues/51)). Code behind a
+  non-default feature is not instrumented until #51 is fixed and `--all-features`
+  can be re-enabled.
+
+Both are tracked in [chaffra#49](https://github.com/laplaque/chaffra/issues/49),
+which proposes a multi-config coverage matrix or a tree-sitter-rust classifier.
+Reviewers must flag trust-boundary changes whose only added lines are gated by
+an inactive `cfg` or a non-default feature, until these issues close.
 
 #### Running coverage locally
 
 ```bash
 # 1. Generate the same LCOV file the CI job uses:
-cargo llvm-cov --workspace --all-features --lcov --output-path coverage/lcov.info
+cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
 
 # 2. Reproduce a PR comparison against an explicit base/head SHA pair:
 python3 scripts/coverage_check.py \

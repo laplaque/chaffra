@@ -20,12 +20,13 @@ not depend on a third-party package index. The CI workflow invokes
 argv lists, never a parallel calculation path.
 
 Scope: this gate is Rust-only (``RUST_EXT``). It never classifies source
-text — the LCOV DA records, produced with ``--all-features``, are the sole
-authority on which changed lines are executable and must be covered. A
-changed line absent from the DA records is a line llvm did not instrument
-(brace, declaration, comment, blank) and is not a failure. The documented
-inactive-cfg residual is described in CONTRIBUTING.md (Coverage > Documented
-residual) and tracked as chaffra#49.
+text — the LCOV DA records are the sole authority on which changed lines
+are executable and must be covered. A changed line absent from the DA
+records is a line the coverage build did not instrument (a brace,
+declaration, comment, blank line, or code gated out by an inactive cfg or
+a non-default feature). The documented residual (inactive-cfg and
+non-default-feature code) is described in CONTRIBUTING.md (Coverage >
+Documented residual) and tracked as chaffra#49 / chaffra#51.
 """
 
 from __future__ import annotations
@@ -682,11 +683,11 @@ def _trust_boundary_gate(
 
     Changed lines that llvm did not instrument (braces, declarations,
     comments, blank lines) are not failures: the coverage build is the
-    authority on which lines are executable, and CI generates it with
-    --all-features so feature-gated executable code is instrumented rather
-    than silently absent. Code reachable only under a non-active ``cfg``
-    (e.g. a different ``target_os``) cannot be instrumented by any single
-    build and is a documented residual limitation.
+    authority on which lines are executable. Code the build does not compile
+    — gated by an inactive ``cfg`` (e.g. a different ``target_os``) or by a
+    non-default feature (CI does not pass ``--all-features``; see chaffra#51)
+    — is absent from the DA records and is a documented residual limitation
+    (chaffra#49).
 
     ``measured`` is the worst per-file changed-line percentage, or 0.0 when
     a file failed for lack of any records, so the value is a usable scalar.
@@ -789,12 +790,12 @@ def evaluate(
         covered_changed = instrumented_changed & covered_for_file
         uncovered = instrumented_changed - covered_for_file
         # Lines llvm did not instrument (DA-absent): closing braces, struct
-        # fields, comments, blank lines, and — once coverage is generated
-        # with --all-features — genuinely non-executable text. We defer the
-        # "is this line executable" judgment to llvm rather than re-deriving
-        # it from a hand-rolled Rust lexer (which was unsound in both
-        # directions). See the trust-boundary gate below for how absence is
-        # treated.
+        # fields, comments, blank lines, plus code the build did not compile
+        # (inactive cfg / non-default feature — the documented residual). We
+        # defer the "is this line executable" judgment to llvm rather than
+        # re-deriving it from a hand-rolled Rust lexer (which was unsound in
+        # both directions). See the trust-boundary gate below for how absence
+        # is treated.
         non_instrumented = changed_lines - instrumented_for_file
         file_results.append(
             FileResult(
