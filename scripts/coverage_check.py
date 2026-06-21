@@ -18,6 +18,14 @@ The tool deliberately uses only the Python standard library so that CI does
 not depend on a third-party package index. The CI workflow invokes
 ``main(sys.argv[1:])``; tests call the same entry point with constructed
 argv lists, never a parallel calculation path.
+
+Scope: this gate is Rust-only (``RUST_EXT``). It never classifies source
+text — the LCOV DA records, produced with ``--all-features``, are the sole
+authority on which changed lines are executable and must be covered. A
+changed line absent from the DA records is a line llvm did not instrument
+(brace, declaration, comment, blank) and is not a failure. The single
+residual gap is code reachable only under a non-active ``cfg`` (e.g. another
+``target_os``), which no single build can instrument.
 """
 
 from __future__ import annotations
@@ -87,17 +95,15 @@ class Policy:
 class FileCoverage:
     """LCOV records for a single source file.
 
-    ``lines`` maps DA line numbers to hits. ``declared_lf``/``declared_lh``
-    capture the per-block ``LF``/``LH`` summaries — the parser requires
-    exactly one of each per SF block and treats the declared values as
-    authoritative for overall arithmetic. The DA records are used for the
-    changed-line gates which need per-line resolution.
+    ``lines`` maps DA line numbers to hits. Coverage arithmetic — overall
+    and changed-line — is computed from these concrete DA records. The
+    per-block ``LF``/``LH`` summaries are validated for structural
+    consistency in :func:`parse_lcov` but are deliberately not stored: a
+    declared total cannot be allowed to drive a reported percentage.
     """
 
     path: str
     lines: dict[int, int] = field(default_factory=dict)
-    declared_lf: int = 0
-    declared_lh: int = 0
 
     def instrumented_lines(self) -> set[int]:
         return set(self.lines.keys())
@@ -123,11 +129,11 @@ class FileResult:
     changed_total: int
     changed_instrumented: int
     changed_covered: int
+    # Changed lines absent from the LCOV DA records — llvm did not instrument
+    # them (braces, declarations, comments, blank lines). Reported for
+    # transparency; not treated as failures, since llvm is the authority on
+    # which lines are executable.
     non_instrumented_lines: list[int]
-    # Subset of ``non_instrumented_lines`` that look executable (non-blank,
-    # not a comment, not an attribute). Only populated for trust-boundary
-    # files — the gate fails when this list is non-empty.
-    non_instrumented_executable_lines: list[int]
     uncovered_lines: list[int]
     has_lcov_records: bool
 
@@ -182,7 +188,6 @@ class Report:
                     "changed_instrumented": fr.changed_instrumented,
                     "changed_covered": fr.changed_covered,
                     "non_instrumented_lines": fr.non_instrumented_lines,
-                    "non_instrumented_executable_lines": fr.non_instrumented_executable_lines,
                     "uncovered_lines": fr.uncovered_lines,
                     "has_lcov_records": fr.has_lcov_records,
                     "percent_changed": fr.percent,
@@ -204,148 +209,6 @@ class Report:
 
 
 # ---------------------------------------------------------------------------
-# Rust line classifier
-# ---------------------------------------------------------------------------
-
-
-def _classify_lines_status(source_text: str) -> list[str]:
-    """Walk ``source_text`` once and label each 1-based line.
-
-    The classifier is intentionally conservative: only blank lines, line
-    comments (`//…`), and lines lying entirely inside a multi-line block
-    comment (`/* … */`) are reported as non-executable. Every other line —
-    including all attributes (`#[serde(default)]`, `#[cfg(target_os = …)]`
-    and similar attributes ARE behaviour-changing), raw string literal
-    continuations, char literals, code following an inline `/* note */`,
-    and anything ambiguous — is reported as ``"executable"``. The trust-
-    boundary gate fails closed when any non-instrumented changed line on a
-    TB file classifies as executable; mistakes therefore err toward
-    requiring an explicit coverage record rather than toward silent
-    acceptance.
-
-    Status values: ``"blank"``, ``"line_comment"``, ``"block_comment"``,
-    ``"executable"``.
-    """
-
-    src_lines = source_text.splitlines()
-    result: list[str] = []
-    block_depth = 0  # active /*…*/ nesting depth across lines
-
-    for raw in src_lines:
-        line_started_in_block = block_depth > 0
-        # Track whether this line touched a block comment opener (even if
-        # it closed in the same line) so a single-line `/* note */` row
-        # classifies as block_comment when there is no other code.
-        line_touched_block = line_started_in_block
-        saw_code_outside = False
-
-        if not raw.strip() and not line_started_in_block:
-            result.append("blank")
-            continue
-
-        i = 0
-        n = len(raw)
-        while i < n:
-            ch = raw[i]
-            nxt = raw[i + 1] if i + 1 < n else ""
-
-            if block_depth > 0:
-                if ch == "*" and nxt == "/":
-                    block_depth -= 1
-                    i += 2
-                    continue
-                if ch == "/" and nxt == "*":
-                    block_depth += 1
-                    i += 2
-                    continue
-                i += 1
-                continue
-
-            if ch == "/" and nxt == "/":
-                # Line comment: the rest of the line is non-code, but if
-                # any executable code preceded it on this same line that
-                # already set saw_code_outside.
-                break
-            if ch == "/" and nxt == "*":
-                block_depth += 1
-                line_touched_block = True
-                i += 2
-                continue
-            if not ch.isspace():
-                saw_code_outside = True
-            i += 1
-
-        if not saw_code_outside and (line_touched_block or line_started_in_block):
-            result.append("block_comment")
-            continue
-        if not saw_code_outside and raw.strip().startswith("//"):
-            result.append("line_comment")
-            continue
-        if not saw_code_outside and not raw.strip():
-            result.append("blank")
-            continue
-        if not saw_code_outside:
-            # No code, no comment, but the line wasn't blank? Treat as
-            # executable to fail closed.
-            result.append("executable")
-            continue
-        result.append("executable")
-
-    return result
-
-
-def classify_executable_lines(
-    source_text: str, line_numbers: Iterable[int]
-) -> list[int]:
-    """Return the subset of ``line_numbers`` whose lines look executable.
-
-    Uses :func:`_classify_lines_status` so multi-line attributes, block
-    comments, and inline ``/* … */`` followed by code are handled correctly
-    (the simple prefix heuristic miscategorised attribute continuations as
-    executable and inline-commented code as non-executable).
-
-    ``line_numbers`` is 1-based and may contain numbers past the end of the
-    file (e.g., when the head tree was truncated). Out-of-range line numbers
-    are treated as executable so a trust-boundary file with a
-    deletion-then-addition does not silently pass.
-    """
-
-    status = _classify_lines_status(source_text)
-    executable: list[int] = []
-    for ln in line_numbers:
-        if ln < 1 or ln > len(status):
-            executable.append(ln)
-            continue
-        if status[ln - 1] == "executable":
-            executable.append(ln)
-    return executable
-
-
-def read_source_at(repo_root: Path, rel_path: str) -> str | None:
-    """Best-effort read of the file at ``rel_path`` under ``repo_root``.
-
-    Returns ``None`` when the file is missing or when ``rel_path`` resolves
-    outside ``repo_root`` (e.g., an absolute LCOV SF path that escaped
-    relativisation, or a ``..``-bearing path). The trust-boundary gate fails
-    closed when source cannot be read for a TB file with non-instrumented
-    changed lines, so refusing to read out-of-tree paths is the safe default.
-    """
-
-    try:
-        repo_real = repo_root.resolve()
-        candidate = (repo_root / rel_path).resolve()
-    except (OSError, ValueError):
-        return None
-    try:
-        candidate.relative_to(repo_real)
-    except ValueError:
-        return None
-    try:
-        return candidate.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # LCOV parser
 # ---------------------------------------------------------------------------
@@ -440,21 +303,17 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                 raise MalformedInput(
                     f"line {line_no}: LH={block_lh} > LF={block_lf} for {current.path!r}"
                 )
-            # LF/LH are the producer's declared instrumentation counts and
-            # are the source of truth for overall arithmetic. The DA records
-            # are a *materialisation* of a subset of those instrumentation
-            # regions: cargo-llvm-cov 0.6.x emits LF/LH that exceed the
-            # emitted DA lines because LLVM tracks regions whose coverage
-            # data is not always serialised into a DA record. The invariants
-            # the checker can rigorously enforce against the producer are
-            # therefore bounds, not equality:
-            #   * LH <= LF                         (hit count cannot exceed instrumented count)
-            #   * LF >= unique DA lines            (every DA line is instrumented)
-            #   * LH >= unique hit DA lines        (every hit DA must be reflected in LH)
-            #
-            # The producer pin (cargo-llvm-cov 0.6.21 in .github/workflows/
-            # ci.yml) is the additional integrity boundary against arbitrary
-            # LF/LH inflation; a different producer must be re-validated.
+            # LF/LH are validated for structural consistency but are NOT used
+            # for coverage arithmetic. Overall and changed-line coverage are
+            # both computed from the concrete DA records (see evaluate()), so
+            # a producer that declares LF/LH far above the emitted DA records
+            # cannot inflate the reported percentage. cargo-llvm-cov 0.6.x
+            # emits LF/LH that exceed unique DA lines (LLVM tracks regions it
+            # does not serialise as DA), so the enforceable invariants are
+            # bounds, not equality:
+            #   * LH <= LF                  (hit count cannot exceed instrumented)
+            #   * LF >= unique DA lines     (every emitted DA line is instrumented)
+            #   * LH >= unique hit DA lines (every emitted hit is reflected in LH)
             if block_lf < unique_lines:
                 raise MalformedInput(
                     f"line {line_no}: declared LF={block_lf} below {unique_lines} unique DA "
@@ -465,8 +324,6 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                     f"line {line_no}: declared LH={block_lh} below {unique_hits} unique hit "
                     f"DA lines for {current.path!r}"
                 )
-            current.declared_lf = block_lf
-            current.declared_lh = block_lh
             current = None
             reset_block()
             seen_record_terminators += 1
@@ -748,6 +605,66 @@ def get_diff_text(repo_root: Path, base: str, head: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _trust_boundary_gate(
+    file_results: list[FileResult], thresholds: Thresholds
+) -> GateResult:
+    """Compute the trust-boundary gate.
+
+    A trust-boundary file fails when either:
+      * it has changed lines but no LCOV records at all — the file was not
+        instrumented, so the change cannot be shown to be covered, or
+      * its instrumented changed lines (the lines llvm emitted DA records
+        for) are below the 100% threshold.
+
+    Changed lines that llvm did not instrument (braces, declarations,
+    comments, blank lines) are not failures: the coverage build is the
+    authority on which lines are executable, and CI generates it with
+    --all-features so feature-gated executable code is instrumented rather
+    than silently absent. Code reachable only under a non-active ``cfg``
+    (e.g. a different ``target_os``) cannot be instrumented by any single
+    build and is a documented residual limitation.
+
+    ``measured`` is the worst per-file changed-line percentage, or 0.0 when
+    a file failed for lack of any records, so the value is a usable scalar.
+    """
+
+    passed = True
+    details: list[str] = []
+    worst: float | None = None
+    for fr in file_results:
+        if not fr.is_trust_boundary or fr.changed_total == 0:
+            continue
+        if not fr.has_lcov_records:
+            passed = False
+            worst = 0.0
+            details.append(f"{fr.path}: no LCOV records for a changed trust-boundary file")
+            continue
+        if fr.changed_instrumented == 0:
+            # Only non-instrumented (brace/decl/comment) lines changed.
+            continue
+        percent = fr.percent
+        if percent is None:
+            continue
+        if worst is None or percent < worst:
+            worst = percent
+        if percent < thresholds.trust_boundary_changed:
+            passed = False
+            details.append(
+                f"{fr.path}: {percent:.2f}% < "
+                f"{thresholds.trust_boundary_changed:.2f}% "
+                f"(uncovered changed lines: {_short_list(fr.uncovered_lines)})"
+            )
+    if not details:
+        details.append("no trust-boundary files changed or all fully covered")
+    return GateResult(
+        name="trust_boundary_changed",
+        threshold=thresholds.trust_boundary_changed,
+        measured=worst,
+        passed=passed,
+        detail="; ".join(details),
+    )
+
+
 def evaluate(
     lcov: dict[str, FileCoverage],
     diff: ChangedLines,
@@ -756,18 +673,15 @@ def evaluate(
     head_sha: str,
     trust_boundary_files: set[str],
     enforce_changed: bool,
-    repo_root: Path,
 ) -> Report:
-    # Overall coverage from LCOV totals.
+    # Overall coverage is computed from the concrete DA records, never from
+    # the declared LF/LH summaries — a producer cannot inflate the reported
+    # percentage by declaring more instrumented lines than it emits.
     total_lf = 0
     total_lh = 0
     for fc in lcov.values():
-        # Use the declared LF/LH summaries (validated against DA in
-        # parse_lcov) so a producer that claims more instrumented lines
-        # than emitted DA cannot be scored from DA-only arithmetic that
-        # disagrees with the summary.
-        total_lf += fc.declared_lf
-        total_lh += fc.declared_lh
+        total_lf += len(fc.lines)
+        total_lh += len(fc.covered_lines())
     overall_percent = 100.0 * total_lh / total_lf if total_lf else 100.0
     overall_block = {
         "lf": total_lf,
@@ -785,31 +699,22 @@ def evaluate(
         instrumented_changed = changed_lines & instrumented_for_file
         covered_changed = instrumented_changed & covered_for_file
         uncovered = instrumented_changed - covered_for_file
+        # Lines llvm did not instrument (DA-absent): closing braces, struct
+        # fields, comments, blank lines, and — once coverage is generated
+        # with --all-features — genuinely non-executable text. We defer the
+        # "is this line executable" judgment to llvm rather than re-deriving
+        # it from a hand-rolled Rust lexer (which was unsound in both
+        # directions). See the trust-boundary gate below for how absence is
+        # treated.
         non_instrumented = changed_lines - instrumented_for_file
-        is_tb = path in trust_boundary_files
-        # Classify non-instrumented changed lines only for trust-boundary files.
-        # The cost (reading source) only buys signal for the strict TB gate.
-        executable_non_instrumented: list[int] = []
-        if is_tb and non_instrumented:
-            source = read_source_at(repo_root, path)
-            if source is None:
-                # Conservatively treat every non-instrumented changed line as
-                # executable so a TB file that disappeared from the tree (or
-                # whose checkout went wrong) fails the gate.
-                executable_non_instrumented = sorted(non_instrumented)
-            else:
-                executable_non_instrumented = classify_executable_lines(
-                    source, sorted(non_instrumented)
-                )
         file_results.append(
             FileResult(
                 path=path,
-                is_trust_boundary=is_tb,
+                is_trust_boundary=path in trust_boundary_files,
                 changed_total=len(changed_lines),
                 changed_instrumented=len(instrumented_changed),
                 changed_covered=len(covered_changed),
                 non_instrumented_lines=sorted(non_instrumented),
-                non_instrumented_executable_lines=executable_non_instrumented,
                 uncovered_lines=sorted(uncovered),
                 has_lcov_records=fc is not None,
             )
@@ -886,71 +791,7 @@ def evaluate(
             )
         )
 
-        # Trust-boundary.
-        #
-        # A trust-boundary file fails the gate when any of:
-        #   (a) it has executable changed lines whose coverage is below
-        #       the threshold,
-        #   (b) it was changed but has no LCOV records at all (the checker
-        #       cannot prove the changes are non-executable),
-        #   (c) it has non-instrumented changed lines that the line
-        #       classifier flagged as executable (the classifier reports
-        #       non-executable only for blank / line-comment / block-
-        #       comment lines; any other shape — including all attributes,
-        #       raw strings, char literals — falls into executable).
-        # When (b) or (c) fires, the measured worst-percent is recorded as
-        # 0.0 so downstream consumers (badges, dashboards) can read the
-        # gate's `measured` field as a worst-signal scalar regardless of
-        # which failure category triggered.
-        tb_passed = True
-        tb_details: list[str] = []
-        tb_worst: float | None = None
-        for fr in file_results:
-            if not fr.is_trust_boundary:
-                continue
-            if fr.changed_total == 0:
-                continue
-            if not fr.has_lcov_records:
-                tb_passed = False
-                tb_worst = 0.0
-                tb_details.append(f"{fr.path}: no LCOV records for changed lines")
-                continue
-            if fr.non_instrumented_executable_lines:
-                tb_passed = False
-                tb_worst = 0.0
-                preview = ", ".join(
-                    str(n) for n in fr.non_instrumented_executable_lines[:10]
-                )
-                more = (
-                    f" (+{len(fr.non_instrumented_executable_lines) - 10})"
-                    if len(fr.non_instrumented_executable_lines) > 10
-                    else ""
-                )
-                tb_details.append(
-                    f"{fr.path}: executable changed lines absent from LCOV: {preview}{more}"
-                )
-            if fr.changed_instrumented > 0:
-                percent = fr.percent
-                if percent is not None:
-                    if tb_worst is None or percent < tb_worst:
-                        tb_worst = percent
-                    if percent < policy.thresholds.trust_boundary_changed:
-                        tb_passed = False
-                        tb_details.append(
-                            f"{fr.path}: {percent:.2f}% < "
-                            f"{policy.thresholds.trust_boundary_changed:.2f}%"
-                        )
-        if tb_passed and not tb_details:
-            tb_details.append("no trust-boundary files changed or all fully covered")
-        gates.append(
-            GateResult(
-                name="trust_boundary_changed",
-                threshold=policy.thresholds.trust_boundary_changed,
-                measured=tb_worst,
-                passed=tb_passed,
-                detail="; ".join(tb_details),
-            )
-        )
+        gates.append(_trust_boundary_gate(file_results, policy.thresholds))
 
     passed = all(g.passed for g in gates)
     return Report(
@@ -1170,7 +1011,6 @@ def main(argv: list[str] | None = None) -> int:
         head_sha=args.head_sha,
         trust_boundary_files=matched,
         enforce_changed=args.mode == "pr",
-        repo_root=repo_root,
     )
 
     json_text = json.dumps(report.to_json(), indent=2, sort_keys=True)

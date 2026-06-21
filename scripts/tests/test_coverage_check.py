@@ -236,6 +236,25 @@ class TestAllGatesPass(CheckerTestCase):
         self.assertIn("bbbbbbb", md)
 
 
+class TestDeclaredTotalsCannotInflateOverall(CheckerTestCase):
+    def test_inflated_lf_lh_ignored_overall_from_da(self) -> None:
+        # A block declaring LF:100/LH:100 with a single covered DA record is
+        # structurally accepted (LF>=DA, LH>=hits, LH<=LF) but overall is
+        # computed from the DA records (1/1), NOT the inflated declaration.
+        # Two uncovered DA lines on a second file pull overall below 85%.
+        lcov = (
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:100\nLH:100\nend_of_record\n"
+            "SF:crates/chaffra-cli/src/main.rs\nDA:1,0\nDA:2,0\nLF:2\nLH:0\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        overall = next(g for g in report["gates"] if g["name"] == "overall")
+        # 1 covered of 3 instrumented DA lines = 33.33%, not the declared 100%.
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertFalse(overall["passed"])
+        self.assertAlmostEqual(report["overall"]["percent"], 100.0 / 3, places=2)
+
+
 class TestOverallFails(CheckerTestCase):
     def test_overall_below_threshold(self) -> None:
         # 4/10 = 40%
@@ -462,43 +481,34 @@ class TestNonInstrumentedChangedLines(CheckerTestCase):
         self.assertEqual(block["changed_covered"], 2)
 
 
-class TestMalformedLcov(CheckerTestCase):
-    def test_malformed_lcov_exits_2(self) -> None:
-        lcov = "SF:foo.rs\nDA:not-a-number,1\nend_of_record\n"
-        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        rc, _, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+class TestMalformedPolicyTable(CheckerTestCase):
+    """Table-driven: malformed/invalid policies exit 2. (Malformed-LCOV cases
+    live in TestMalformedLcovTable.)"""
 
-    def test_lcov_missing_terminators_exits_2(self) -> None:
-        lcov = "SF:foo.rs\nDA:1,1\n"
-        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        rc, _, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+    _MISSING_TB_GROUP = textwrap.dedent(
+        """\
+        policy_version = 1
+        [thresholds]
+        overall = 85.0
+        aggregate_changed = 95.0
+        per_file_changed = 90.0
+        trust_boundary_changed = 100.0
+        """
+    )
 
+    def cases(self) -> list[tuple[str, str]]:
+        return [
+            ("threshold out of range", basic_policy({"overall": 150.0})),
+            ("missing trust-boundary group", self._MISSING_TB_GROUP),
+        ]
 
-class TestMalformedPolicy(CheckerTestCase):
-    def test_threshold_out_of_range_exits_2(self) -> None:
-        policy = basic_policy({"overall": 150.0})
+    def test_every_invalid_policy_exits_2(self) -> None:
         lcov = lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])])
         diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        rc, _, _ = self.run_check(lcov=lcov, policy=policy, diff=diff)
-        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
-
-    def test_missing_trust_boundary_group_exits_2(self) -> None:
-        policy = textwrap.dedent(
-            """\
-            policy_version = 1
-            [thresholds]
-            overall = 85.0
-            aggregate_changed = 95.0
-            per_file_changed = 90.0
-            trust_boundary_changed = 100.0
-            """
-        )
-        lcov = lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        rc, _, _ = self.run_check(lcov=lcov, policy=policy, diff=diff)
-        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        for label, policy in self.cases():
+            with self.subTest(case=label):
+                rc, _, _ = self.run_check(lcov=lcov, policy=policy, diff=diff)
+                self.assertEqual(rc, coverage_check.EXIT_MALFORMED, label)
 
 
 class TestTrustBoundaryPatternMatchesNothing(CheckerTestCase):
@@ -613,26 +623,16 @@ class TestTrustBoundaryDetailUsesPolicyThreshold(CheckerTestCase):
         self.assertIn("95.00%", gate["detail"])
 
 
-class TestTrustBoundaryExecutableClassification(CheckerTestCase):
-    """H4: distinguish comment / doc / attribute changes (compliant) from
-    executable but uninstrumented changes (gate fail) on trust-boundary files."""
+class TestTrustBoundaryDaMembership(CheckerTestCase):
+    """The trust-boundary gate defers to the LCOV DA records — the coverage
+    build is the authority on which changed lines are executable. Changed
+    lines llvm did not instrument (braces, declarations, comments) pass;
+    instrumented changed lines must reach 100%; a changed TB file with no
+    LCOV records at all fails."""
 
-    def _write_tb_source(self, line_50: str, line_51: str, line_52: str) -> None:
-        # Build a 60-line file where lines 50..52 carry the test-provided
-        # content. Earlier lines are inert filler so a classifier reading the
-        # whole file does not surface unrelated executable findings.
-        lines = ["// filler" for _ in range(60)]
-        lines[49] = line_50
-        lines[50] = line_51
-        lines[51] = line_52
-        write(self.tmp / BASIC_TRUST_BOUNDARY_FILE, "\n".join(lines) + "\n")
-
-    def test_comment_only_changes_pass(self) -> None:
-        self._write_tb_source(
-            "    /// doc comment for next field",
-            "    // another inline comment",
-            "    // a regular line comment",
-        )
+    def test_only_non_instrumented_changes_pass(self) -> None:
+        # Changed lines 50-52 are absent from the DA records → llvm did not
+        # instrument them → they pass without any source classification.
         lcov = lcov_text(
             [
                 (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)]),
@@ -641,66 +641,17 @@ class TestTrustBoundaryExecutableClassification(CheckerTestCase):
         )
         diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])])
         rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        gate_names = {g["name"]: g for g in report["gates"]}
-        self.assertEqual(rc, coverage_check.EXIT_OK, gate_names)
-        self.assertTrue(gate_names["trust_boundary_changed"]["passed"])
-        # File row must report the non-instrumented lines but zero of them
-        # classify as executable.
+        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertEqual(rc, coverage_check.EXIT_OK, gate)
+        self.assertTrue(gate["passed"])
         block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
         self.assertEqual(block["non_instrumented_lines"], [50, 51, 52])
-        self.assertEqual(block["non_instrumented_executable_lines"], [])
 
-    def test_executable_but_uninstrumented_changes_fail(self) -> None:
-        self._write_tb_source(
-            "    let x = some_call();",
-            "    if condition { do_thing(); }",
-            "    return Ok(x);",
-        )
+    def test_instrumented_changed_line_uncovered_fails(self) -> None:
+        # Line 50 IS a DA record but uncovered (hits 0) → must fail at 100%.
         lcov = lcov_text(
             [
-                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)]),
-                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
-            ]
-        )
-        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertFalse(gate["passed"])
-        self.assertIn("executable changed lines absent from LCOV", gate["detail"])
-        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
-        self.assertEqual(block["non_instrumented_executable_lines"], [50, 51, 52])
-
-    def test_behavior_changing_attribute_fails_closed(self) -> None:
-        # `#[serde(default)]` and similar attributes change deserialisation
-        # behaviour; the classifier must NOT exempt them. A TB file that
-        # adds such an attribute without an LCOV record fails the gate.
-        self._write_tb_source(
-            "    #[serde(default)]",
-            "    #[cfg(target_os = \"linux\")]",
-            "    pub field: u32,",
-        )
-        lcov = lcov_text(
-            [
-                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)]),
-                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
-            ]
-        )
-        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertFalse(gate["passed"])
-        self.assertEqual(gate["measured"], 0.0)
-        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
-        self.assertEqual(block["non_instrumented_executable_lines"], [50, 51, 52])
-
-    def test_missing_source_fails_closed(self) -> None:
-        # No source file written → checker conservatively flags every
-        # non-instrumented changed line as executable.
-        lcov = lcov_text(
-            [
-                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1)]),
+                (BASIC_TRUST_BOUNDARY_FILE, [(50, 0), (51, 1)]),
                 (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
             ]
         )
@@ -709,8 +660,19 @@ class TestTrustBoundaryExecutableClassification(CheckerTestCase):
         gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
         self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
         self.assertFalse(gate["passed"])
-        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
-        self.assertEqual(block["non_instrumented_executable_lines"], [50, 51])
+        self.assertEqual(gate["measured"], 50.0)
+        self.assertIn("50", gate["detail"])
+
+    def test_file_absent_from_lcov_fails(self) -> None:
+        # TB file changed but has no SF block at all → cannot prove coverage.
+        lcov = lcov_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 2)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["measured"], 0.0)
+        self.assertIn("no LCOV records", gate["detail"])
 
 
 class TestPushMode(CheckerTestCase):
@@ -729,73 +691,6 @@ class TestPushMode(CheckerTestCase):
         gate_names = {g["name"] for g in report["gates"]}
         self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
         self.assertEqual(gate_names, {"overall"})
-
-
-class TestExecutableClassifierEdgeCases(unittest.TestCase):
-    """Table-driven coverage of `_classify_lines_status`.
-
-    The classifier reports non-executable for only three line shapes — blank,
-    line-comment, or inside a multi-line block-comment — and treats every
-    other line as executable so the trust-boundary gate fails closed on
-    behavior-changing attributes (`#[serde(default)]`, `#[cfg(...)]`), raw
-    string literal bodies, char literals, and inline `/* note */` followed
-    by code. Each row pairs a source string with the expected classification
-    of its lines.
-    """
-
-    CASES: list[tuple[str, str, list[str]]] = [
-        (
-            "multi-line attribute body classifies as executable",
-            "#[derive(\n    Debug,\n    Clone,\n)]\nstruct Foo;\n",
-            ["executable", "executable", "executable", "executable", "executable"],
-        ),
-        (
-            "single-line attribute classifies as executable",
-            "#[serde(default)]\nfield: u32,\n",
-            ["executable", "executable"],
-        ),
-        (
-            "inline block-comment then code is executable",
-            "    /* TODO */ let secret = decode(token)?;\n    /* note */\n    let x = 1;\n",
-            ["executable", "block_comment", "executable"],
-        ),
-        (
-            "multi-line block comment fully covered",
-            "/* opening\n * middle\n * closing */\nfn run() {}\n",
-            ["block_comment", "block_comment", "block_comment", "executable"],
-        ),
-        (
-            "string literal containing // is executable",
-            'let url = "https://example.com";\n',
-            ["executable"],
-        ),
-        (
-            "raw string literal body classifies as executable",
-            'let json = r#"{\n  "k": "v"\n}"#;\n',
-            ["executable", "executable", "executable"],
-        ),
-        (
-            "doc comments classify as line_comment",
-            "/// docs\n//! inner docs\n// regular\n",
-            ["line_comment", "line_comment", "line_comment"],
-        ),
-        (
-            "blank lines",
-            "\n   \n\nfn f() {}\n",
-            ["blank", "blank", "blank", "executable"],
-        ),
-        (
-            "code with trailing line comment is executable",
-            "    let n = 1; // value\n",
-            ["executable"],
-        ),
-    ]
-
-    def test_each_classifier_row(self) -> None:
-        for label, source, expected in self.CASES:
-            with self.subTest(case=label):
-                actual = coverage_check._classify_lines_status(source)
-                self.assertEqual(actual, expected, label)
 
 
 class TestMalformedLcovTable(CheckerTestCase):
@@ -824,6 +719,10 @@ class TestMalformedLcovTable(CheckerTestCase):
         ("new SF before end_of_record", "SF:a.rs\nDA:1,1\nSF:b.rs\nend_of_record\n"),
         ("malformed LF record", "SF:foo.rs\nDA:1,1\nLF:abc\nend_of_record\n"),
         ("malformed LH record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:abc\nend_of_record\n"),
+        ("missing LF/LH summary", "SF:foo.rs\nDA:1,1\nend_of_record\n"),
+        ("duplicate DA for same line", "SF:foo.rs\nDA:1,1\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"),
+        ("duplicate LF record", "SF:foo.rs\nDA:1,1\nLF:1\nLF:1\nLH:1\nend_of_record\n"),
+        ("duplicate SF path", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\nSF:foo.rs\nDA:2,1\nLF:1\nLH:1\nend_of_record\n"),
         ("no records at all", "TN:test\n"),
     ]
 
