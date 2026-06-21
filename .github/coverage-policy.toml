@@ -25,8 +25,26 @@
 
 policy_version = 1
 
-# Documented residual: inactive-cfg-gated executable code is not in LCOV.
-# See CONTRIBUTING.md > Coverage > Documented residual, tracker: chaffra#49.
+# ---------------------------------------------------------------------------
+# Tracked exception (per the carve-out rules above: owner + removal issue
+# inline, does not lower any threshold).
+#
+# Exception:   inactive-cfg-gated executable code on trust-boundary files.
+# Reason:      code reachable only under a non-active `cfg` (e.g.
+#              `#[cfg(target_os = "windows")]` on a Linux runner) is not
+#              present in the LCOV DA records, so the 100% trust-boundary
+#              gate cannot enforce coverage on a change whose only added
+#              lines are gated by an inactive cfg. `--all-features` closes
+#              feature gates but cannot activate another target_os.
+# Scope:       does NOT lower any threshold; reviewers must flag such
+#              changes in code review until the removal issue closes.
+# Owner:       @iamclaude697 (accountable for tracking + removal).
+# Removal:     https://github.com/laplaque/chaffra/issues/49
+#              (proposes a multi-target coverage matrix or a tree-sitter
+#              classifier; either closes the gap and retires this exception).
+# Acceptance:  pending maintainer (@laplaque) sign-off on this PR.
+# Full detail: CONTRIBUTING.md > Coverage > Documented residual.
+# ---------------------------------------------------------------------------
 
 [thresholds]
 # Overall line coverage on the workspace. Enforced on pull requests and on

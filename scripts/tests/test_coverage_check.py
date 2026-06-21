@@ -1,8 +1,16 @@
 """Deterministic tests for the chaffra coverage checker.
 
-The tests drive the same `main(argv)` entry point that CI invokes. Synthetic
-LCOV, policy, and diff fixtures are constructed inline so the table of cases
-is reviewable in one place and the suite has no external dependencies.
+The tests drive the same `main(argv)` entry point that CI invokes. There are
+two fixture styles:
+
+* **Unit cases** (the `CheckerTestCase` subclasses) construct small synthetic
+  LCOV / policy / diff strings inline, so each table of cases is reviewable in
+  one place.
+* **Integration cases** (the `RealGitTestCase` subclasses) build a real
+  temporary git repository and copy checked-in fixtures from
+  `scripts/tests/fixtures/integration/` (Rust source, LCOV, policy), per
+  CONTRIBUTING.md's "Fixture-based for integration tests ... Never generate
+  fixture content at runtime." Only git metadata is created at runtime.
 
 Run locally with::
 
@@ -238,12 +246,29 @@ class TestAllGatesPass(CheckerTestCase):
         self.assertIn("bbbbbbb", md)
 
 
-class TestDeclaredTotalsCannotInflateOverall(CheckerTestCase):
-    def test_inflated_lf_lh_ignored_overall_from_da(self) -> None:
-        # A block declaring LF:100/LH:100 with one covered DA record cannot
-        # inflate overall: the checker discards LF/LH values entirely and
-        # arithmetic is from the DA records (1 covered of 3 instrumented =
-        # 33.33%), not the producer's declared 100%.
+class TestNoExecutableLinesBlock(CheckerTestCase):
+    def test_lf0_lh0_zero_da_block_accepted(self) -> None:
+        # cargo-llvm-cov emits LF:0/LH:0 with no DA records for a file that
+        # has no executable lines (e.g. a `pub mod` re-export). The parser
+        # must accept it (contributing 0 to overall), not reject the report.
+        lcov = (
+            "SF:crates/chaffra-cli/src/main.rs\nLF:0\nLH:0\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:2\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertEqual(rc, coverage_check.EXIT_OK, report.get("gates"))
+        # Only config.rs's 2 instrumented lines count toward overall.
+        self.assertEqual(report["overall"]["instrumented_lines"], 2)
+        self.assertEqual(report["overall"]["covered_lines"], 2)
+
+
+class TestDeclaredSummaryCannotInflateOverall(CheckerTestCase):
+    def test_high_lf_lowers_score_cannot_inflate(self) -> None:
+        # Overall denominator is Σ LF (declared instrumented), numerator is
+        # covered DA lines. A block declaring LF:100/LH:100 with one covered
+        # DA line contributes 1/100, NOT a DA-derived 1/1=100%. The inflated
+        # LF only lowers the score: 1 covered of 102 declared = 0.98%.
         lcov = (
             "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:100\nLH:100\nend_of_record\n"
             "SF:crates/chaffra-cli/src/main.rs\nDA:1,0\nDA:2,0\nLF:2\nLH:0\nend_of_record\n"
@@ -253,7 +278,19 @@ class TestDeclaredTotalsCannotInflateOverall(CheckerTestCase):
         overall = next(g for g in report["gates"] if g["name"] == "overall")
         self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
         self.assertFalse(overall["passed"])
-        self.assertAlmostEqual(report["overall"]["percent"], 100.0 / 3, places=2)
+        self.assertAlmostEqual(report["overall"]["percent"], 100.0 / 102, places=2)
+
+    def test_high_lh_cannot_inflate_numerator(self) -> None:
+        # A producer that declares LH high (LH:100) but serialises only one
+        # covered DA line cannot inflate: the numerator uses covered DA
+        # lines, never the declared LH. 1 covered of 100 declared = 1%.
+        lcov = (
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:100\nLH:100\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertAlmostEqual(report["overall"]["percent"], 1.0, places=2)
 
 
 class TestSyntheticSfPathsAreDropped(CheckerTestCase):
@@ -280,8 +317,8 @@ class TestSyntheticSfPathsAreDropped(CheckerTestCase):
         # Overall is 2/3 (50% from main.rs + 1/1 from config.rs), not
         # inflated to ~85% by the synthetic 4/4.
         overall = report["overall"]
-        self.assertEqual(overall["lf"], 3)
-        self.assertEqual(overall["lh"], 2)
+        self.assertEqual(overall["instrumented_lines"], 3)
+        self.assertEqual(overall["covered_lines"], 2)
         self.assertIn("crates/chaffra-cli/src/fake.rs", overall["dropped_synthetic_sf_paths"])
         self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)  # 66.67% < 85%
 
@@ -322,93 +359,6 @@ class TestSyntheticSfPathsAreDropped(CheckerTestCase):
         self.assertEqual(report["files"], [])
         self.assertEqual(report["gates"], [])
         self.assertIn("synthetic_a.rs", report["detail"])
-
-
-class TestExactHeadValidation(unittest.TestCase):
-    """H6: the `git rev-parse HEAD == --head-sha` check must reject a
-    mismatched head_sha, not just guard the happy path."""
-
-    @unittest.skipUnless(shutil.which("git"), "git binary not available")
-    def test_mismatched_head_sha_exits_2_with_failure_artifact(self) -> None:
-        tmp = Path(tempfile.mkdtemp(prefix="cov-head-"))
-        try:
-            env = dict(os.environ)
-            env.update(
-                {
-                    "GIT_CONFIG_GLOBAL": "/dev/null",
-                    "GIT_CONFIG_SYSTEM": "/dev/null",
-                    "GIT_CONFIG_COUNT": "0",
-                    "GIT_AUTHOR_NAME": "t",
-                    "GIT_AUTHOR_EMAIL": "t@t",
-                    "GIT_COMMITTER_NAME": "t",
-                    "GIT_COMMITTER_EMAIL": "t@t",
-                }
-            )
-
-            def git(*args: str) -> str:
-                return subprocess.check_output(
-                    ["git", *args], cwd=tmp, text=True, env=env
-                ).strip()
-
-            git("init", "-q", "-b", "main")
-            (tmp / "a.rs").write_text("fn x() {}\n", encoding="utf-8")
-            git("add", ".")
-            git("commit", "-q", "-m", "c")
-            actual_head = git("rev-parse", "HEAD")
-            lcov_path = tmp / "lcov.info"
-            lcov_path.write_text(lcov_file_block("a.rs", [(1, 1)]), encoding="utf-8")
-            policy_path = tmp / "p.toml"
-            policy_path.write_text(
-                textwrap.dedent(
-                    """\
-                    policy_version = 1
-                    [thresholds]
-                    overall = 85.0
-                    aggregate_changed = 95.0
-                    per_file_changed = 90.0
-                    trust_boundary_changed = 100.0
-                    [[trust_boundaries]]
-                    purpose = "fake"
-                    patterns = ["a.rs"]
-                    """
-                ),
-                encoding="utf-8",
-            )
-            bogus = "0" * 40
-            json_out = tmp / "out.json"
-            md_out = tmp / "out.md"
-            rc = coverage_check.main(
-                [
-                    "--lcov",
-                    str(lcov_path),
-                    "--policy",
-                    str(policy_path),
-                    "--repo-root",
-                    str(tmp),
-                    "--base-sha",
-                    actual_head,
-                    "--head-sha",
-                    bogus,
-                    "--json-out",
-                    str(json_out),
-                    "--markdown-out",
-                    str(md_out),
-                    "--mode",
-                    "pr",
-                ]
-            )
-            self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
-            # H6 + M9: failure artifact must be present and identify the
-            # exact-SHA mismatch, not be silently absent.
-            self.assertTrue(json_out.exists())
-            payload = json.loads(json_out.read_text(encoding="utf-8"))
-            self.assertEqual(payload["status"], "malformed_input")
-            self.assertEqual(payload["head_sha"], bogus)
-            self.assertIn(actual_head, payload["detail"])
-            self.assertTrue(md_out.exists())
-            self.assertIn("MALFORMED INPUT", md_out.read_text(encoding="utf-8"))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestOverallFails(CheckerTestCase):
@@ -493,40 +443,6 @@ class TestPerFileFails(CheckerTestCase):
         self.assertTrue(gate_names["aggregate_changed"]["passed"], gate_names["aggregate_changed"])
         self.assertFalse(gate_names["per_file_changed"]["passed"])
         self.assertIn(NON_TRUST_BOUNDARY_FILE, gate_names["per_file_changed"]["detail"])
-
-
-class TestTrustBoundaryGateFails(CheckerTestCase):
-    def test_trust_boundary_below_100(self) -> None:
-        # Trust-boundary file: 9/10 = 90%, must be 100%.
-        tb_lines = [(n, 1 if n < 19 else 0) for n in range(10, 20)]
-        lcov = lcov_text(
-            [
-                (BASIC_TRUST_BOUNDARY_FILE, tb_lines),
-                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
-            ]
-        )
-        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(10, 10)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        gate_names = {g["name"]: g for g in report["gates"]}
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertFalse(gate_names["trust_boundary_changed"]["passed"])
-        self.assertIn(BASIC_TRUST_BOUNDARY_FILE, gate_names["trust_boundary_changed"]["detail"])
-
-
-class TestTrustBoundaryNoCoverageRecords(CheckerTestCase):
-    def test_trust_boundary_file_missing_from_lcov(self) -> None:
-        # No LCOV records for the trust-boundary file at all.
-        lcov = lcov_text(
-            [
-                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
-            ]
-        )
-        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(10, 5)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        gate_names = {g["name"]: g for g in report["gates"]}
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertFalse(gate_names["trust_boundary_changed"]["passed"])
-        self.assertIn("no LCOV records", gate_names["trust_boundary_changed"]["detail"])
 
 
 class TestAddedFile(CheckerTestCase):
@@ -762,23 +678,6 @@ class TestDeletedFile(CheckerTestCase):
         self.assertEqual(report["files"], [])
 
 
-class TestTrustBoundaryDetailUsesPolicyThreshold(CheckerTestCase):
-    def test_detail_string_reports_configured_threshold(self) -> None:
-        policy = basic_policy({"trust_boundary_changed": 95.0})
-        # 9/10 = 90% trust-boundary coverage, below 95% threshold.
-        tb_lines = [(n, 1 if n < 19 else 0) for n in range(10, 20)]
-        lcov = lcov_text(
-            [(BASIC_TRUST_BOUNDARY_FILE, tb_lines), (NON_TRUST_BOUNDARY_FILE, [(1, 1)])]
-        )
-        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(10, 10)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=policy, diff=diff)
-        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertFalse(gate["passed"])
-        # Must mention the configured 95%, not a hard-coded 100%.
-        self.assertIn("95.00%", gate["detail"])
-
-
 class TestTrustBoundaryDaMembership(CheckerTestCase):
     """Table-driven: trust-boundary gate defers to the LCOV DA records — the
     coverage build is the authority on which changed lines are executable.
@@ -791,11 +690,14 @@ class TestTrustBoundaryDaMembership(CheckerTestCase):
 
     def cases(
         self,
-    ) -> list[tuple[str, str, str, int, bool, float | None, str]]:
-        # (label, lcov, diff, expected_rc, expected_passed, expected_measured, detail_substring)
+    ) -> list[tuple[str, str, str, str, int, bool, float | None, str]]:
+        # (label, policy, lcov, diff, rc, passed, measured, detail_substring)
+        tb95 = basic_policy({"trust_boundary_changed": 95.0})
+        below95 = self._baseline_lcov([(n, 1 if n < 19 else 0) for n in range(10, 20)])
         return [
             (
                 "only non-instrumented lines changed → pass",
+                basic_policy(),
                 self._baseline_lcov([(1, 1), (2, 1), (3, 1)]),
                 diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])]),
                 coverage_check.EXIT_OK,
@@ -805,6 +707,7 @@ class TestTrustBoundaryDaMembership(CheckerTestCase):
             ),
             (
                 "instrumented uncovered changed line → fail",
+                basic_policy(),
                 self._baseline_lcov([(50, 0), (51, 1)]),
                 diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 2)])]),
                 coverage_check.EXIT_GATE_FAIL,
@@ -814,6 +717,7 @@ class TestTrustBoundaryDaMembership(CheckerTestCase):
             ),
             (
                 "TB file absent from LCOV → fail",
+                basic_policy(),
                 lcov_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]),
                 diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 2)])]),
                 coverage_check.EXIT_GATE_FAIL,
@@ -821,14 +725,22 @@ class TestTrustBoundaryDaMembership(CheckerTestCase):
                 0.0,
                 "no LCOV records",
             ),
+            (
+                "detail reports the configured (non-100) threshold",
+                tb95,
+                below95,
+                diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(10, 10)])]),
+                coverage_check.EXIT_GATE_FAIL,
+                False,
+                90.0,
+                "95.00%",
+            ),
         ]
 
     def test_each_row(self) -> None:
-        for label, lcov, diff, rc_exp, passed_exp, measured_exp, detail in self.cases():
+        for label, policy, lcov, diff, rc_exp, passed_exp, measured_exp, detail in self.cases():
             with self.subTest(case=label):
-                rc, report, _ = self.run_check(
-                    lcov=lcov, policy=basic_policy(), diff=diff
-                )
+                rc, report, _ = self.run_check(lcov=lcov, policy=policy, diff=diff)
                 self.assertEqual(rc, rc_exp, label)
                 gate = next(
                     g for g in report["gates"] if g["name"] == "trust_boundary_changed"
@@ -864,24 +776,28 @@ class TestMalformedLcovTable(CheckerTestCase):
     """
 
     # LF/LH values are intentionally NOT parsed — see parse_lcov docstring.
-    # A producer that emits an inflated LF/LH cannot inflate the reported
-    # percentage (proved by TestDeclaredTotalsCannotInflateOverall), so the
-    # checker syntax-validates the records but does not reject value
-    # disagreements; those are no longer malformed-input cases.
+    # Active SF blocks require exactly one LF and one LH, with LH<=LF,
+    # LF>=unique DA lines and LH>=unique hit DA lines. Violations exit 2.
     CASES: list[tuple[str, str]] = [
         ("non-numeric DA hits", "SF:foo.rs\nDA:1,not-a-number\nend_of_record\n"),
-        ("missing end_of_record", "SF:foo.rs\nDA:1,1\n"),
-        ("empty SF block (no DA)", "SF:foo.rs\nend_of_record\n"),
+        ("missing end_of_record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\n"),
+        ("zero DA but LF>0 (contradiction)", "SF:foo.rs\nLF:5\nLH:0\nend_of_record\n"),
         ("new SF before end_of_record", "SF:a.rs\nDA:1,1\nSF:b.rs\nend_of_record\n"),
         ("malformed LF record", "SF:foo.rs\nDA:1,1\nLF:abc\nend_of_record\n"),
         ("malformed LH record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:abc\nend_of_record\n"),
-        ("duplicate DA for same line", "SF:foo.rs\nDA:1,1\nDA:1,1\nend_of_record\n"),
+        ("missing LF/LH summary", "SF:foo.rs\nDA:1,1\nend_of_record\n"),
+        ("duplicate LF record", "SF:foo.rs\nDA:1,1\nLF:1\nLF:1\nLH:1\nend_of_record\n"),
+        ("duplicate LH record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\nLH:1\nend_of_record\n"),
+        ("LH > LF", "SF:foo.rs\nDA:1,1\nLF:1\nLH:5\nend_of_record\n"),
+        ("LF below unique DA lines", "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:1\nLH:2\nend_of_record\n"),
+        ("LH below unique hit DA lines", "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:1\nend_of_record\n"),
+        ("duplicate DA for same line", "SF:foo.rs\nDA:1,1\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"),
         (
             "duplicate SF path",
-            "SF:foo.rs\nDA:1,1\nend_of_record\nSF:foo.rs\nDA:2,1\nend_of_record\n",
+            "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\nSF:foo.rs\nDA:2,1\nLF:1\nLH:1\nend_of_record\n",
         ),
         ("no records at all", "TN:test\n"),
-        # Skipped (out-of-repo) block must still validate structure:
+        # Skipped (out-of-repo) block must still validate record syntax:
         ("malformed DA inside out-of-repo SF", "SF:/etc/passwd\nDA:1,not-a-number\nend_of_record\n"),
         ("out-of-repo SF missing end_of_record", "SF:/etc/passwd\nDA:1,1\n"),
         ("empty SF path", "SF:\nDA:1,1\nend_of_record\n"),
@@ -935,11 +851,20 @@ import shutil
 
 
 @unittest.skipUnless(shutil.which("git"), "git binary not available")
-class TestMainGitIntegration(unittest.TestCase):
-    """M1: drive main() through the production acquisition path that uses
-    `git diff base...head` and `git ls-files`, with neither --diff nor
-    --repo-files supplied. Uses a temporary git repository so the test stays
-    deterministic and self-contained. Skipped on runners without git."""
+class RealGitTestCase(unittest.TestCase):
+    """Shared harness for the tests that need a real git repository.
+
+    Provides an isolated temporary repo, an env-isolated ``git`` runner, and
+    a helper that lays down the checked-in integration fixtures (Rust source,
+    LCOV, policy) and produces a two-commit base/head history. Only git
+    metadata (init + commits) is generated at runtime; all reviewable content
+    comes from ``scripts/tests/fixtures/integration`` per CONTRIBUTING.md's
+    "Fixture-based for integration tests ... Never generate fixture content
+    at runtime."
+    """
+
+    FIXTURES = Path(__file__).resolve().parent / "fixtures" / "integration"
+    REL = "crates/chaffra-core/src/config.rs"
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cov-git-"))
@@ -947,13 +872,11 @@ class TestMainGitIntegration(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _git(self, *args: str) -> str:
-        import subprocess as sp
-
-        # Inherit the caller env first so PATH and similar essentials reach
-        # git, THEN apply the isolation overrides. The previous order put
-        # /dev/null first and let inherited GIT_CONFIG_GLOBAL escape the
-        # isolation. GIT_CONFIG_COUNT=0 prevents per-key config injection.
+    def git(self, *args: str) -> str:
+        # Inherit the caller env first so PATH reaches git, THEN apply the
+        # isolation overrides (otherwise an inherited GIT_CONFIG_GLOBAL
+        # escapes the /dev/null isolation). GIT_CONFIG_COUNT=0 blocks per-key
+        # config injection.
         env = dict(os.environ)
         env.update(
             {
@@ -966,62 +889,102 @@ class TestMainGitIntegration(unittest.TestCase):
                 "GIT_COMMITTER_EMAIL": "test@example.com",
             }
         )
-        return sp.check_output(
+        return subprocess.check_output(
             ["git", *args], cwd=self.tmp, text=True, env=env
         ).strip()
 
-    # Per CONTRIBUTING.md > Style: "Fixture-based for integration tests.
-    # Small self-contained source files under `tests/fixtures/` ... Never
-    # generate fixture content at runtime."
-    FIXTURES = Path(__file__).resolve().parent / "fixtures" / "integration"
-
-    def test_end_to_end_via_git_diff_and_ls_files(self) -> None:
-        # Build the tiny repo by COPYING checked-in fixture files (Rust
-        # source, policy, LCOV) into a temporary git workspace. The git
-        # metadata (init + commits) is created at runtime per CONTRIBUTING's
-        # carve-out, but the content under review is committed to the repo.
-        self._git("init", "-q", "-b", "main")
-        rel = "crates/chaffra-core/src/config.rs"
+    def build_fixture_repo(self) -> tuple[str, str]:
+        """Lay down the checked-in fixtures and return (base_sha, head_sha)."""
+        self.git("init", "-q", "-b", "main")
         (self.tmp / "crates/chaffra-core/src").mkdir(parents=True)
-        shutil.copyfile(self.FIXTURES / "config_base.rs", self.tmp / rel)
-        self._git("add", ".")
-        self._git("commit", "-q", "-m", "base")
-        base_sha = self._git("rev-parse", "HEAD")
-        shutil.copyfile(self.FIXTURES / "config_head.rs", self.tmp / rel)
-        self._git("add", rel)
-        self._git("commit", "-q", "-m", "head")
-        head_sha = self._git("rev-parse", "HEAD")
+        shutil.copyfile(self.FIXTURES / "config_base.rs", self.tmp / self.REL)
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "base")
+        base_sha = self.git("rev-parse", "HEAD")
+        shutil.copyfile(self.FIXTURES / "config_head.rs", self.tmp / self.REL)
+        self.git("add", self.REL)
+        self.git("commit", "-q", "-m", "head")
+        head_sha = self.git("rev-parse", "HEAD")
+        shutil.copyfile(self.FIXTURES / "lcov.info", self.tmp / "lcov.info")
+        shutil.copyfile(self.FIXTURES / "policy.toml", self.tmp / "policy.toml")
+        return base_sha, head_sha
 
-        lcov_path = self.tmp / "lcov.info"
-        shutil.copyfile(self.FIXTURES / "lcov.info", lcov_path)
-        policy_path = self.tmp / "policy.toml"
-        shutil.copyfile(self.FIXTURES / "policy.toml", policy_path)
-        rc = coverage_check.main(
+    def run_main(self, *, base_sha: str, head_sha: str) -> int:
+        return coverage_check.main(
             [
-                "--lcov",
-                str(lcov_path),
-                "--policy",
-                str(policy_path),
-                "--repo-root",
-                str(self.tmp),
-                "--base-sha",
-                base_sha,
-                "--head-sha",
-                head_sha,
-                "--json-out",
-                str(self.tmp / "out.json"),
-                "--markdown-out",
-                str(self.tmp / "out.md"),
-                "--mode",
-                "pr",
+                "--lcov", str(self.tmp / "lcov.info"),
+                "--policy", str(self.tmp / "policy.toml"),
+                "--repo-root", str(self.tmp),
+                "--base-sha", base_sha,
+                "--head-sha", head_sha,
+                "--json-out", str(self.tmp / "out.json"),
+                "--markdown-out", str(self.tmp / "out.md"),
+                "--mode", "pr",
             ]
         )
+
+    def report(self) -> dict:
+        return json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+
+
+class TestMainGitIntegration(RealGitTestCase):
+    """M1: drive main() through the production acquisition path
+    (`git diff base...head`, `git ls-tree`) with neither --diff nor
+    --repo-files supplied."""
+
+    def test_end_to_end_via_git(self) -> None:
+        base_sha, head_sha = self.build_fixture_repo()
+        rc = self.run_main(base_sha=base_sha, head_sha=head_sha)
         self.assertEqual(rc, coverage_check.EXIT_OK)
-        report = json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+        report = self.report()
         self.assertEqual(report["base_sha"], base_sha)
         self.assertEqual(report["head_sha"], head_sha)
-        paths = [f["path"] for f in report["files"]]
-        self.assertEqual(paths, [rel])
+        self.assertEqual([f["path"] for f in report["files"]], [self.REL])
+
+
+class TestStagedFileNotEligible(RealGitTestCase):
+    """H5: a generated .rs file staged into the index after the head commit
+    must NOT become an eligible coverage source. The universe is derived
+    from `git ls-tree <head_sha>` (immutable tree), not `git ls-files`
+    (mutable index)."""
+
+    def test_staged_generated_file_dropped_from_overall(self) -> None:
+        base_sha, head_sha = self.build_fixture_repo()
+        # Simulate a build script staging a generated, fully-covered .rs file
+        # that is NOT in the head commit, then claiming coverage for it.
+        gen_rel = "crates/chaffra-core/src/generated.rs"
+        (self.tmp / gen_rel).write_text("fn g() { 1; }\n", encoding="utf-8")
+        self.git("add", gen_rel)  # staged, but never committed → not in head tree
+        (self.tmp / "lcov.info").write_text(
+            lcov_file_block(self.REL, [(1, 1), (2, 1)])
+            + lcov_file_block(gen_rel, [(1, 1), (2, 1), (3, 1), (4, 1)]),
+            encoding="utf-8",
+        )
+        rc = self.run_main(base_sha=base_sha, head_sha=head_sha)
+        report = self.report()
+        # The staged file's records must be dropped, not counted toward overall.
+        self.assertIn(gen_rel, report["overall"]["dropped_synthetic_sf_paths"])
+        self.assertEqual(rc, coverage_check.EXIT_OK)
+        # Overall denominator is only the committed file's 2 lines.
+        self.assertEqual(report["overall"]["instrumented_lines"], 2)
+
+
+class TestExactHeadValidation(RealGitTestCase):
+    """H6: the `git rev-parse HEAD == --head-sha` check must reject a
+    mismatched head_sha with a failure artifact, not just guard the happy
+    path. Reuses the shared fixture repo and harness."""
+
+    def test_mismatched_head_sha_exits_2_with_failure_artifact(self) -> None:
+        base_sha, head_sha = self.build_fixture_repo()
+        bogus = "0" * 40
+        rc = self.run_main(base_sha=base_sha, head_sha=bogus)
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        payload = self.report()
+        self.assertEqual(payload["status"], "malformed_input")
+        self.assertEqual(payload["head_sha"], bogus)
+        # Detail must name the actual HEAD so the mismatch is auditable.
+        self.assertIn(head_sha, payload["detail"])
+        self.assertIn("MALFORMED INPUT", (self.tmp / "out.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

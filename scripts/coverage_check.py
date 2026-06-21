@@ -95,15 +95,19 @@ class Policy:
 class FileCoverage:
     """LCOV records for a single source file.
 
-    ``lines`` maps DA line numbers to hits. Coverage arithmetic — overall
-    and changed-line — is computed from these concrete DA records. The
-    per-block ``LF``/``LH`` summaries are validated for structural
-    consistency in :func:`parse_lcov` but are deliberately not stored: a
-    declared total cannot be allowed to drive a reported percentage.
+    ``lines`` maps DA line numbers to hits. Per-file ``declared_lf`` is the
+    producer's ``LF`` summary (count of instrumented lines). Overall coverage
+    uses ``Σ declared_lf`` as the denominator and the count of covered DA
+    lines as the numerator, so a producer cannot inflate the percentage by
+    declaring a high ``LF`` (it only lowers the score) or a high ``LH`` (the
+    numerator uses demonstrated DA hits, never the declared ``LH``). The
+    changed-line gates use the DA records directly for per-line resolution.
     """
 
     path: str
     lines: dict[int, int] = field(default_factory=dict)
+    declared_lf: int = 0
+    declared_lh: int = 0
 
     def instrumented_lines(self) -> set[int]:
         return set(self.lines.keys())
@@ -221,31 +225,30 @@ _LCOV_LH = re.compile(r"^LH:(\d+)$")
 def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
     """Parse LCOV text into a map of repository-relative path -> FileCoverage.
 
-    Per-block invariants — any violation raises ``MalformedInput`` (exit 2):
+    Per-block invariants for ACTIVE (in-repo) blocks — any violation raises
+    ``MalformedInput`` (exit 2):
 
-      * end_of_record terminates every SF block,
-      * no duplicate DA record for the same line within a block,
-      * at least one DA record per ACTIVE (in-repo) block,
-      * malformed DA/LF/LH records are rejected regardless of whether the
-        enclosing SF is in-repo or skipped (so a skipped block cannot
-        smuggle structural garbage past the parser).
+      * exactly one ``LF`` and one ``LH`` record (reject missing / duplicate),
+      * ``LH <= LF``,
+      * ``LF >= unique DA lines`` and ``LH >= unique hit DA lines`` — the DA
+        detail must be a subset of the declared summary (reconciliation),
+      * no duplicate DA record for the same line,
+      * at least one DA record,
+      * ``end_of_record`` terminates the block.
+
+    These bounds are the strongest that the pinned producer (cargo-llvm-cov
+    0.6.21) satisfies: empirically it declares ``LF`` strictly greater than
+    the number of serialised DA lines in 72 / 88 workspace blocks, so a
+    strict ``LF == DA-count`` equality would reject legitimate output. The
+    reconciliation is therefore a bound plus the arithmetic choice in
+    :func:`evaluate` (overall denominator = ``Σ LF``, numerator = covered DA
+    lines), which makes a declared summary impossible to inflate.
 
     Two SF blocks that normalise to the same repository-relative path are
-    rejected as a collision so an attacker cannot inflate overall coverage
-    by emitting alias paths. SF paths that escape ``repo_root`` start a
-    *skipped* block: the parser keeps validating record boundaries and
-    record syntax inside the block (so a missing ``end_of_record`` or a
-    malformed ``DA`` cannot hide in a skipped block) but discards the data
-    from arithmetic.
-
-    LF / LH records are intentionally **not parsed**. The producer's
-    declared summary is metadata that can disagree with the DA records it
-    serialised; the checker treats DA records as the single auditable
-    source of truth for all four gates, so a contradiction with declared
-    summaries is structurally impossible. Lines beginning with ``LF:`` /
-    ``LH:`` are syntax-checked (they must be ``LF:<int>`` / ``LH:<int>``
-    or the parser rejects the file as malformed) but their values are
-    never used.
+    rejected as a collision. SF paths that escape ``repo_root`` start a
+    *skipped* block: the parser still validates record syntax and
+    ``end_of_record`` termination inside it, but does not enforce the
+    LF/LH/DA-count invariants and discards the data.
     """
 
     files: dict[str, FileCoverage] = {}
@@ -254,12 +257,18 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
     state = "IDLE"
     current: FileCoverage | None = None
     block_da_lines: set[int] = set()
+    block_hit_lines: set[int] = set()
+    block_lf: int | None = None
+    block_lh: int | None = None
     seen_record_terminators = 0
     line_no = 0
 
     def reset_block() -> None:
-        nonlocal block_da_lines
+        nonlocal block_da_lines, block_hit_lines, block_lf, block_lh
         block_da_lines = set()
+        block_hit_lines = set()
+        block_lf = None
+        block_lh = None
 
     for raw in text.splitlines():
         line_no += 1
@@ -299,10 +308,45 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                 raise MalformedInput(f"line {line_no}: end_of_record outside SF block")
             if state == "ACTIVE":
                 assert current is not None
-                if not block_da_lines:
+                where = current.path
+                if block_lf is None or block_lh is None:
                     raise MalformedInput(
-                        f"line {line_no}: SF block for {current.path!r} has no DA records"
+                        f"line {line_no}: SF block for {where!r} missing LF/LH summary"
                     )
+                if not block_da_lines:
+                    # A file with no executable lines (e.g. a `pub mod` re-export
+                    # module) is emitted by cargo-llvm-cov as LF:0/LH:0 with no
+                    # DA records. Accept it (it contributes 0 to overall); only
+                    # reject a zero-DA block that nonetheless claims instrumented
+                    # lines, which is internally contradictory.
+                    if block_lf != 0 or block_lh != 0:
+                        raise MalformedInput(
+                            f"line {line_no}: SF block for {where!r} has no DA records "
+                            f"but declares LF={block_lf}/LH={block_lh}"
+                        )
+                    current.declared_lf = 0
+                    current.declared_lh = 0
+                    current = None
+                    reset_block()
+                    state = "IDLE"
+                    seen_record_terminators += 1
+                    continue
+                if block_lh > block_lf:
+                    raise MalformedInput(
+                        f"line {line_no}: LH={block_lh} > LF={block_lf} for {where!r}"
+                    )
+                if block_lf < len(block_da_lines):
+                    raise MalformedInput(
+                        f"line {line_no}: LF={block_lf} below {len(block_da_lines)} "
+                        f"unique DA lines for {where!r}"
+                    )
+                if block_lh < len(block_hit_lines):
+                    raise MalformedInput(
+                        f"line {line_no}: LH={block_lh} below {len(block_hit_lines)} "
+                        f"unique hit DA lines for {where!r}"
+                    )
+                current.declared_lf = block_lf
+                current.declared_lh = block_lh
             current = None
             reset_block()
             state = "IDLE"
@@ -323,19 +367,31 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                     f"line {line_no}: duplicate DA record for line {ln} in {where}"
                 )
             block_da_lines.add(ln)
+            if hits > 0:
+                block_hit_lines.add(ln)
             if state == "ACTIVE":
                 assert current is not None
                 current.lines[ln] = hits
             continue
         if line.startswith("LF:"):
-            if not _LCOV_LF.match(line):
+            m_lf = _LCOV_LF.match(line)
+            if not m_lf:
                 raise MalformedInput(f"line {line_no}: malformed LF record: {line!r}")
-            # Value intentionally discarded — see parser docstring.
+            if state == "ACTIVE" and block_lf is not None:
+                raise MalformedInput(
+                    f"line {line_no}: duplicate LF record for {current.path!r}"
+                )
+            block_lf = int(m_lf.group(1))
             continue
         if line.startswith("LH:"):
-            if not _LCOV_LH.match(line):
+            m_lh = _LCOV_LH.match(line)
+            if not m_lh:
                 raise MalformedInput(f"line {line_no}: malformed LH record: {line!r}")
-            # Value intentionally discarded — see parser docstring.
+            if state == "ACTIVE" and block_lh is not None:
+                raise MalformedInput(
+                    f"line {line_no}: duplicate LH record for {current.path!r}"
+                )
+            block_lh = int(m_lh.group(1))
             continue
         # Other records (FN/FNDA/BRDA/BRF/BRH) are ignored — this tool gates
         # only on line coverage from DA records.
@@ -546,16 +602,39 @@ def expand_trust_boundary_files(
     return matches, by_pattern
 
 
-def list_tracked_rs_files(repo_root: Path) -> list[str]:
+def list_tracked_rs_files(repo_root: Path, head_sha: str) -> list[str]:
+    """List ``*.rs`` paths in the immutable tree at ``head_sha``.
+
+    Uses ``git ls-tree`` against the commit rather than ``git ls-files``
+    (which reads the mutable index/worktree). A build script that stages a
+    generated ``.rs`` path during ``cargo llvm-cov`` cannot then make its SF
+    records eligible: the file does not exist in the reviewed commit tree.
+    """
+
+    # NB: `git ls-tree`'s pathspec is not a shell glob (unlike `git
+    # ls-files`), so `-- '*.rs'` would match nothing — list the whole tree
+    # and filter in Python. `-z` emits NUL-terminated raw paths; combined
+    # with `core.quotePath=false` this avoids git's default C-quoting of
+    # non-ASCII names (which would otherwise append a `"` and silently drop
+    # a tracked file from the eligibility set, inflating overall coverage).
     try:
         out = subprocess.check_output(
-            ["git", "ls-files", "--", "*.rs"],
+            [
+                "git",
+                "-c",
+                "core.quotePath=false",
+                "ls-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                head_sha,
+            ],
             cwd=repo_root,
             text=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise MalformedInput(f"git ls-files failed: {exc}") from exc
-    return [line.strip() for line in out.splitlines() if line.strip()]
+        raise MalformedInput(f"git ls-tree failed: {exc}") from exc
+    return [path for path in out.split("\0") if path.endswith(RUST_EXT)]
 
 
 # ---------------------------------------------------------------------------
@@ -564,9 +643,20 @@ def list_tracked_rs_files(repo_root: Path) -> list[str]:
 
 
 def get_diff_text(repo_root: Path, base: str, head: str) -> str:
+    # core.quotePath=false so non-ASCII paths in `+++ b/...` headers are not
+    # C-quoted (which the unified-diff parser would carry literally).
     try:
         return subprocess.check_output(
-            ["git", "diff", "--unified=0", f"{base}...{head}", "--", "*.rs"],
+            [
+                "git",
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--unified=0",
+                f"{base}...{head}",
+                "--",
+                "*.rs",
+            ],
             cwd=repo_root,
             text=True,
         )
@@ -656,26 +746,34 @@ def evaluate(
     # for every downstream gate computation in this function.
     eligible_lcov = {p: fc for p, fc in lcov.items() if p in tracked_rs_files}
     dropped_synthetic = sorted(set(lcov) - set(eligible_lcov))
+    # Overall denominator is the producer's declared instrumented-line count
+    # (Σ LF); numerator is the count of DA lines actually demonstrated covered.
+    # Declaring a high LF only lowers the score, and the numerator never uses
+    # the declared LH, so the summary cannot inflate the percentage.
     total_lf = 0
     total_lh = 0
     for fc in eligible_lcov.values():
-        total_lf += len(fc.lines)
+        total_lf += fc.declared_lf
         total_lh += len(fc.covered_lines())
     if total_lf == 0:
-        # Zero eligible DA records means the LCOV had no SF block for any
-        # tracked Rust file: every block was either out-of-repo or synthetic.
-        # A vacuous 100% would let a malicious or broken producer pass the
-        # overall gate with no real coverage — raise so the malformed-input
-        # path writes a failure artifact instead of a misleading success.
+        # Zero eligible instrumented lines means the LCOV had no SF block for
+        # any tracked Rust file: every block was either out-of-repo or
+        # synthetic. A vacuous 100% would let a malicious or broken producer
+        # pass the overall gate with no real coverage — raise so the
+        # malformed-input path writes a failure artifact instead.
         raise MalformedInput(
-            "no LCOV DA records match any tracked Rust file at head_sha "
+            "no LCOV records match any tracked Rust file at head_sha "
             f"(dropped synthetic/out-of-repo SF paths: "
             f"{', '.join(dropped_synthetic) if dropped_synthetic else '<none>'})"
         )
     overall_percent = 100.0 * total_lh / total_lf
     overall_block = {
-        "lf": total_lf,
-        "lh": total_lh,
+        # Honest key names: the denominator is the producer's declared
+        # instrumented-line count (Σ LF); the numerator is the count of DA
+        # lines demonstrated covered. They are deliberately NOT a declared
+        # LF/LH pair, so the keys are named for what they hold.
+        "instrumented_lines": total_lf,
+        "covered_lines": total_lh,
         "percent": overall_percent,
         "dropped_synthetic_sf_paths": dropped_synthetic,
     }
@@ -842,7 +940,7 @@ def render_markdown(report: Report) -> str:
         out.append("")
     out.append(
         f"## Overall workspace coverage: {report.overall['percent']:.2f}% "
-        f"({report.overall['lh']}/{report.overall['lf']} lines)"
+        f"({report.overall['covered_lines']}/{report.overall['instrumented_lines']} lines)"
     )
     out.append("")
     return "\n".join(out)
@@ -885,8 +983,10 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Optional path to a newline-separated list of repository files to use "
-            "as the universe for trust-boundary glob matching. When omitted, the "
-            "tool calls 'git ls-files -- *.rs' inside --repo-root."
+            "as the universe for trust-boundary glob matching and coverage "
+            "eligibility. When omitted, the tool reads the immutable tree at "
+            "--head-sha via 'git ls-tree -r <head_sha>' inside --repo-root (NOT "
+            "the mutable index), filtering for '.rs'."
         ),
     )
     parser.add_argument(
@@ -1022,7 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
             return fail_malformed(f"cannot read repo-files: {exc}")
     else:
         try:
-            repo_files = list_tracked_rs_files(repo_root)
+            repo_files = list_tracked_rs_files(repo_root, args.head_sha)
         except MalformedInput as exc:
             return fail_malformed(str(exc))
 
