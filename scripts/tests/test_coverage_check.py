@@ -11,18 +11,25 @@ Run locally with::
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = REPO_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
-
-import coverage_check  # noqa: E402
+# Load the checker module directly from its file so the test suite does not
+# depend on `scripts/` being importable as a package or on sys.path being
+# mutated mid-file (which would force a static-analysis suppression).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CHECKER_PATH = _REPO_ROOT / "scripts" / "coverage_check.py"
+_spec = importlib.util.spec_from_file_location("coverage_check", _CHECKER_PATH)
+assert _spec is not None and _spec.loader is not None
+coverage_check = importlib.util.module_from_spec(_spec)
+sys.modules["coverage_check"] = coverage_check
+_spec.loader.exec_module(coverage_check)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +190,10 @@ class CheckerTestCase(unittest.TestCase):
                 str(self.tmp),
                 "--mode",
                 mode,
+                # Tests work in a tmp dir that is not a git repository; the
+                # head-drift contract only applies to CI runs that produce
+                # LCOV against a real checkout.
+                "--allow-head-drift",
             ]
         )
         report_text = json_out.read_text(encoding="utf-8") if json_out.exists() else "{}"
@@ -619,7 +630,7 @@ class TestTrustBoundaryExecutableClassification(CheckerTestCase):
     def test_comment_only_changes_pass(self) -> None:
         self._write_tb_source(
             "    /// doc comment for next field",
-            "    #[serde(default)]",
+            "    // another inline comment",
             "    // a regular line comment",
         )
         lcov = lcov_text(
@@ -660,6 +671,30 @@ class TestTrustBoundaryExecutableClassification(CheckerTestCase):
         block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
         self.assertEqual(block["non_instrumented_executable_lines"], [50, 51, 52])
 
+    def test_behavior_changing_attribute_fails_closed(self) -> None:
+        # `#[serde(default)]` and similar attributes change deserialisation
+        # behaviour; the classifier must NOT exempt them. A TB file that
+        # adds such an attribute without an LCOV record fails the gate.
+        self._write_tb_source(
+            "    #[serde(default)]",
+            "    #[cfg(target_os = \"linux\")]",
+            "    pub field: u32,",
+        )
+        lcov = lcov_text(
+            [
+                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)]),
+                (NON_TRUST_BOUNDARY_FILE, [(1, 1)]),
+            ]
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(50, 3)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["measured"], 0.0)
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["non_instrumented_executable_lines"], [50, 51, 52])
+
     def test_missing_source_fails_closed(self) -> None:
         # No source file written → checker conservatively flags every
         # non-instrumented changed line as executable.
@@ -697,70 +732,70 @@ class TestPushMode(CheckerTestCase):
 
 
 class TestExecutableClassifierEdgeCases(unittest.TestCase):
-    """Direct tests for `_classify_lines_status` covering the edge cases the
-    simple prefix heuristic mishandled: multi-line attributes, inline block
-    comments followed by code, code inside string literals containing `//`."""
+    """Table-driven coverage of `_classify_lines_status`.
 
-    def _status(self, source: str) -> list[str]:
-        return coverage_check._classify_lines_status(source)
+    The classifier reports non-executable for only three line shapes — blank,
+    line-comment, or inside a multi-line block-comment — and treats every
+    other line as executable so the trust-boundary gate fails closed on
+    behavior-changing attributes (`#[serde(default)]`, `#[cfg(...)]`), raw
+    string literal bodies, char literals, and inline `/* note */` followed
+    by code. Each row pairs a source string with the expected classification
+    of its lines.
+    """
 
-    def test_multiline_attribute_continuation_is_not_executable(self) -> None:
-        source = (
-            "#[derive(\n"
-            "    Debug,\n"
-            "    Clone,\n"
-            ")]\n"
-            "struct Foo;\n"
-        )
-        status = self._status(source)
-        # Lines 1-4 are the attribute; line 5 is executable code.
-        self.assertEqual(status[0], "attribute")
-        self.assertEqual(status[1], "attribute")
-        self.assertEqual(status[2], "attribute")
-        self.assertEqual(status[3], "attribute")
-        self.assertEqual(status[4], "executable")
+    CASES: list[tuple[str, str, list[str]]] = [
+        (
+            "multi-line attribute body classifies as executable",
+            "#[derive(\n    Debug,\n    Clone,\n)]\nstruct Foo;\n",
+            ["executable", "executable", "executable", "executable", "executable"],
+        ),
+        (
+            "single-line attribute classifies as executable",
+            "#[serde(default)]\nfield: u32,\n",
+            ["executable", "executable"],
+        ),
+        (
+            "inline block-comment then code is executable",
+            "    /* TODO */ let secret = decode(token)?;\n    /* note */\n    let x = 1;\n",
+            ["executable", "block_comment", "executable"],
+        ),
+        (
+            "multi-line block comment fully covered",
+            "/* opening\n * middle\n * closing */\nfn run() {}\n",
+            ["block_comment", "block_comment", "block_comment", "executable"],
+        ),
+        (
+            "string literal containing // is executable",
+            'let url = "https://example.com";\n',
+            ["executable"],
+        ),
+        (
+            "raw string literal body classifies as executable",
+            'let json = r#"{\n  "k": "v"\n}"#;\n',
+            ["executable", "executable", "executable"],
+        ),
+        (
+            "doc comments classify as line_comment",
+            "/// docs\n//! inner docs\n// regular\n",
+            ["line_comment", "line_comment", "line_comment"],
+        ),
+        (
+            "blank lines",
+            "\n   \n\nfn f() {}\n",
+            ["blank", "blank", "blank", "executable"],
+        ),
+        (
+            "code with trailing line comment is executable",
+            "    let n = 1; // value\n",
+            ["executable"],
+        ),
+    ]
 
-    def test_inline_block_comment_then_code_is_executable(self) -> None:
-        source = (
-            "    /* TODO */ let secret = decode(token)?;\n"
-            "    /* note */\n"
-            "    let x = 1;\n"
-        )
-        status = self._status(source)
-        self.assertEqual(status[0], "executable")
-        self.assertEqual(status[1], "block_comment")
-        self.assertEqual(status[2], "executable")
-
-    def test_multiline_block_comment(self) -> None:
-        source = (
-            "/* opening\n"
-            " * middle\n"
-            " * closing */\n"
-            "fn run() {}\n"
-        )
-        status = self._status(source)
-        self.assertEqual(status[0], "block_comment")
-        self.assertEqual(status[1], "block_comment")
-        self.assertEqual(status[2], "block_comment")
-        self.assertEqual(status[3], "executable")
-
-    def test_string_literal_with_slash_slash_is_executable(self) -> None:
-        source = 'let url = "https://example.com";\n'
-        status = self._status(source)
-        self.assertEqual(status[0], "executable")
-
-    def test_doc_comments_classify_as_line_comment(self) -> None:
-        source = "/// docs\n//! inner docs\n// regular\n"
-        status = self._status(source)
-        self.assertEqual(status, ["line_comment", "line_comment", "line_comment"])
-
-    def test_blank_lines_are_blank(self) -> None:
-        source = "\n   \n\nfn f() {}\n"
-        status = self._status(source)
-        self.assertEqual(status[0], "blank")
-        self.assertEqual(status[1], "blank")
-        self.assertEqual(status[2], "blank")
-        self.assertEqual(status[3], "executable")
+    def test_each_classifier_row(self) -> None:
+        for label, source, expected in self.CASES:
+            with self.subTest(case=label):
+                actual = coverage_check._classify_lines_status(source)
+                self.assertEqual(actual, expected, label)
 
 
 class TestMalformedLcovTable(CheckerTestCase):
@@ -855,18 +890,24 @@ class TestMainGitIntegration(unittest.TestCase):
     def _git(self, *args: str) -> str:
         import subprocess as sp
 
-        return sp.check_output(
-            ["git", *args],
-            cwd=self.tmp,
-            text=True,
-            env={
-                **{"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
-                **dict(__import__("os").environ),
+        # Inherit the caller env first so PATH and similar essentials reach
+        # git, THEN apply the isolation overrides. The previous order put
+        # /dev/null first and let inherited GIT_CONFIG_GLOBAL escape the
+        # isolation. GIT_CONFIG_COUNT=0 prevents per-key config injection.
+        env = dict(os.environ)
+        env.update(
+            {
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+                "GIT_CONFIG_COUNT": "0",
                 "GIT_AUTHOR_NAME": "test",
                 "GIT_AUTHOR_EMAIL": "test@example.com",
                 "GIT_COMMITTER_NAME": "test",
                 "GIT_COMMITTER_EMAIL": "test@example.com",
-            },
+            }
+        )
+        return sp.check_output(
+            ["git", *args], cwd=self.tmp, text=True, env=env
         ).strip()
 
     def test_end_to_end_via_git_diff_and_ls_files(self) -> None:

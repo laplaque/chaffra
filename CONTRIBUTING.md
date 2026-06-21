@@ -12,7 +12,7 @@ job in `.github/workflows/ci.yml`. The versioned source of truth for both the
 thresholds and the trust-boundary path list is
 [`.github/coverage-policy.toml`](.github/coverage-policy.toml).
 
-- **85%** overall line coverage (enforced on every push and PR).
+- **85%** overall line coverage (enforced on pull requests and on pushes to `main`; feature-branch pushes skip the coverage job).
 - **95%** aggregate changed-line coverage across all changed Rust files on a PR.
 - **90%** changed-line coverage in every individual changed Rust file on a PR.
 - **100%** changed-line coverage for trust-boundary paths (configuration

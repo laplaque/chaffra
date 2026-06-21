@@ -28,14 +28,10 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
-
-try:
-    import tomllib  # Python >= 3.11
-except ModuleNotFoundError:  # pragma: no cover - tomli fallback for older runners
-    import tomli as tomllib  # type: ignore[no-redef]
 
 
 VERSION = "1.0.0"
@@ -89,11 +85,19 @@ class Policy:
 
 @dataclass
 class FileCoverage:
-    """LCOV records for a single source file."""
+    """LCOV records for a single source file.
+
+    ``lines`` maps DA line numbers to hits. ``declared_lf``/``declared_lh``
+    capture the per-block ``LF``/``LH`` summaries — the parser requires
+    exactly one of each per SF block and treats the declared values as
+    authoritative for overall arithmetic. The DA records are used for the
+    changed-line gates which need per-line resolution.
+    """
 
     path: str
-    # line -> hits
     lines: dict[int, int] = field(default_factory=dict)
+    declared_lf: int = 0
+    declared_lh: int = 0
 
     def instrumented_lines(self) -> set[int]:
         return set(self.lines.keys())
@@ -205,54 +209,46 @@ class Report:
 
 
 def _classify_lines_status(source_text: str) -> list[str]:
-    """Walk ``source_text`` once and label each 1-based line as one of:
+    """Walk ``source_text`` once and label each 1-based line.
 
-      * ``"blank"`` — empty or whitespace-only.
-      * ``"line_comment"`` — entire stripped line begins with ``//``.
-      * ``"block_comment"`` — the line lies entirely inside a ``/*…*/`` span.
-        Lines that open or close such a span without other code also fall
-        here. Lines where executable code appears outside the comment fall
-        into ``"executable"``.
-      * ``"attribute"`` — the line is part of a Rust outer/inner attribute
-        (``#[…]`` or ``#![…]``). Multi-line attributes are tracked by
-        bracket-depth so continuation lines (e.g. ``Debug,``) classify here
-        and not as executable. A line that closes the attribute but has
-        further code after the closing ``]`` falls into ``"executable"``.
-      * ``"executable"`` — anything else.
+    The classifier is intentionally conservative: only blank lines, line
+    comments (`//…`), and lines lying entirely inside a multi-line block
+    comment (`/* … */`) are reported as non-executable. Every other line —
+    including all attributes (`#[serde(default)]`, `#[cfg(target_os = …)]`
+    and similar attributes ARE behaviour-changing), raw string literal
+    continuations, char literals, code following an inline `/* note */`,
+    and anything ambiguous — is reported as ``"executable"``. The trust-
+    boundary gate fails closed when any non-instrumented changed line on a
+    TB file classifies as executable; mistakes therefore err toward
+    requiring an explicit coverage record rather than toward silent
+    acceptance.
 
-    The walker handles ``//`` and ``/*`` correctly inside string and char
-    literals so a code line containing ``"//"`` is not misread as a comment.
+    Status values: ``"blank"``, ``"line_comment"``, ``"block_comment"``,
+    ``"executable"``.
     """
 
     src_lines = source_text.splitlines()
     result: list[str] = []
     block_depth = 0  # active /*…*/ nesting depth across lines
-    attr_depth = 0   # active #[…]/#![…] bracket depth across lines
 
     for raw in src_lines:
-        if not raw.strip() and block_depth == 0 and attr_depth == 0:
+        line_started_in_block = block_depth > 0
+        # Track whether this line touched a block comment opener (even if
+        # it closed in the same line) so a single-line `/* note */` row
+        # classifies as block_comment when there is no other code.
+        line_touched_block = line_started_in_block
+        saw_code_outside = False
+
+        if not raw.strip() and not line_started_in_block:
             result.append("blank")
             continue
 
         i = 0
         n = len(raw)
-        # Track whether any executable Rust character appears OUTSIDE of
-        # block-comment and attribute spans on THIS line.
-        saw_code_outside = False
-        # Whether the line touched a block comment at any point — set when
-        # we are already inside one, OR when we open one mid-line.
-        line_touched_block = block_depth > 0
-        line_started_in_block = block_depth > 0
-        line_started_in_attr = attr_depth > 0
-        in_str = False
-        str_quote = ""
-        in_char = False
-
         while i < n:
             ch = raw[i]
             nxt = raw[i + 1] if i + 1 < n else ""
 
-            # Inside an active block comment, only `*/` matters.
             if block_depth > 0:
                 if ch == "*" and nxt == "/":
                     block_depth -= 1
@@ -265,106 +261,33 @@ def _classify_lines_status(source_text: str) -> list[str]:
                 i += 1
                 continue
 
-            # Inside an active attribute, count brackets and watch for `]`
-            # closing the outermost attribute.
-            if attr_depth > 0 and not in_str and not in_char:
-                if ch == "[":
-                    attr_depth += 1
-                elif ch == "]":
-                    attr_depth -= 1
-                # Strings inside attribute args (e.g. `rename = "x"`) must
-                # not be mistaken for code.
-                elif ch == '"':
-                    in_str = True
-                    str_quote = ch
-                i += 1
-                continue
-
-            # Inside a string literal.
-            if in_str:
-                if ch == "\\" and nxt:
-                    i += 2
-                    continue
-                if ch == str_quote:
-                    in_str = False
-                i += 1
-                continue
-            if in_char:
-                if ch == "\\" and nxt:
-                    i += 2
-                    continue
-                if ch == "'":
-                    in_char = False
-                i += 1
-                continue
-
             if ch == "/" and nxt == "/":
-                # Rest of the line is a line comment.
+                # Line comment: the rest of the line is non-code, but if
+                # any executable code preceded it on this same line that
+                # already set saw_code_outside.
                 break
             if ch == "/" and nxt == "*":
                 block_depth += 1
                 line_touched_block = True
                 i += 2
                 continue
-            if ch == "#" and (nxt == "[" or (nxt == "!" and raw[i + 2 : i + 3] == "[")):
-                # Outer #[…] or inner #![…] attribute start. Allow leading
-                # whitespace; if non-whitespace code preceded this, it's
-                # executable already.
-                if raw[:i].strip():
-                    saw_code_outside = True
-                attr_depth = 1
-                i += 2 if nxt == "[" else 3
-                continue
-            if ch == '"':
-                in_str = True
-                str_quote = ch
-                i += 1
-                continue
-            if ch == "'":
-                # Rust uses ' for both char literals and lifetimes. A char
-                # literal closes within a few chars; a lifetime does not.
-                # For the purposes of the comment/attribute scanner we treat
-                # both as not-a-string and let other characters drive code
-                # detection.
-                i += 1
-                continue
             if not ch.isspace():
                 saw_code_outside = True
             i += 1
 
-        if line_started_in_block and block_depth == 0 and not saw_code_outside:
-            # Line was inside a block comment; closed cleanly without code.
+        if not saw_code_outside and (line_touched_block or line_started_in_block):
             result.append("block_comment")
             continue
-        if line_started_in_block and block_depth > 0 and not saw_code_outside:
-            result.append("block_comment")
-            continue
-        if line_started_in_attr and attr_depth == 0 and not saw_code_outside:
-            result.append("attribute")
-            continue
-        if line_started_in_attr and attr_depth > 0 and not saw_code_outside:
-            result.append("attribute")
-            continue
-        # Brand-new attribute opened and closed (or still open) on this line
-        # with no other code → attribute.
-        if not line_started_in_attr and not saw_code_outside and (attr_depth > 0):
-            result.append("attribute")
-            continue
-        # New block comment opened with no other code → block_comment.
-        if line_touched_block and not saw_code_outside:
-            result.append("block_comment")
-            continue
-        stripped = raw.strip()
-        if not saw_code_outside and stripped.startswith("//"):
+        if not saw_code_outside and raw.strip().startswith("//"):
             result.append("line_comment")
             continue
-        if not saw_code_outside and not stripped:
+        if not saw_code_outside and not raw.strip():
             result.append("blank")
             continue
         if not saw_code_outside:
-            # Defensive fallback for tokens like `]` closing the last attr
-            # without any other code.
-            result.append("attribute" if attr_depth == 0 and line_started_in_attr else "blank")
+            # No code, no comment, but the line wasn't blank? Treat as
+            # executable to fail closed.
+            result.append("executable")
             continue
         result.append("executable")
 
@@ -436,25 +359,28 @@ _LCOV_LH = re.compile(r"^LH:(\d+)$")
 def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
     """Parse LCOV text into a map of repository-relative path -> FileCoverage.
 
-    Raises ``MalformedInput`` for any of:
-      * missing ``end_of_record`` markers,
-      * unparseable DA/LF/LH records,
-      * an SF block containing zero DA records (empty instrumentation),
-      * an SF block whose declared LF/LH do not match the DA records seen
-        in that block (LF must equal the DA count; LH must equal the
-        number of DA records with a non-zero hit count).
+    The parser enforces a strict, unambiguous contract per SF block; any
+    violation raises ``MalformedInput`` (exit 2):
 
-    The strict checks exist so a structurally valid but semantically empty
-    LCOV (`SF:foo.rs` + `LF:0` + `LH:0` + `end_of_record`) cannot silently
-    feed 100% to the overall gate.
+      * exactly one ``LF`` record and one ``LH`` record per block,
+      * no duplicate ``DA`` records for the same line within a block,
+      * ``LH <= LF``,
+      * ``LH`` equals the number of DA records with non-zero hits,
+      * ``LF`` equals the number of DA records,
+      * at least one DA record (no empty instrumentation),
+      * end_of_record properly terminates every SF block.
+
+    Two SF blocks that normalise to the same repository-relative path are
+    rejected as a collision so an attacker cannot inflate overall coverage
+    by emitting alias paths. SF paths that escape ``repo_root`` are dropped
+    (return ``None`` from ``_normalize_path``) before arithmetic.
+
+    The declared ``LF``/``LH`` values are the authoritative inputs to the
+    overall arithmetic; the DA records drive the changed-line gates.
     """
 
     files: dict[str, FileCoverage] = {}
     current: FileCoverage | None = None
-    # Track per-block unique-line counts so LF/LH validation matches LCOV
-    # semantics — LF/LH are unique-line counters in producers like
-    # cargo-llvm-cov, not raw DA-record counters. Multiple DA records for
-    # the same line are common when llvm coverage emits per-region data.
     block_lines: dict[int, int] = {}
     block_lf: int | None = None
     block_lh: int | None = None
@@ -479,47 +405,68 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                 )
             sf_path = line[len("SF:") :]
             rel = _normalize_path(sf_path, repo_root)
-            existing = files.get(rel)
-            if existing is not None:
-                current = existing
-            else:
-                current = FileCoverage(path=rel)
-                files[rel] = current
+            if rel is None:
+                # SF path escapes the repo root (e.g., vendored crate under
+                # ~/.cargo/registry/). Skip the entire block so out-of-tree
+                # coverage cannot inflate overall totals — the parser still
+                # walks the rest of the block to keep state consistent.
+                current = None
+                reset_block()
+                continue
+            if rel in files:
+                raise MalformedInput(
+                    f"line {line_no}: duplicate SF block for normalized path {rel!r}"
+                )
+            current = FileCoverage(path=rel)
+            files[rel] = current
             reset_block()
             continue
         if line == "end_of_record":
             if current is None:
-                raise MalformedInput(f"line {line_no}: end_of_record outside SF block")
+                # Skipped SF (out-of-repo). No invariants to enforce.
+                reset_block()
+                continue
             unique_lines = len(block_lines)
             unique_hits = sum(1 for hits in block_lines.values() if hits > 0)
             if unique_lines == 0:
                 raise MalformedInput(
                     f"line {line_no}: SF block for {current.path!r} has no DA records"
                 )
-            # LF/LH validation: producers (cargo-llvm-cov) sometimes record
-            # LF higher than the count of emitted DA records when the LLVM
-            # instrumentation tracks lines without an executable region.
-            # The strict invariants the gate must preserve are bounded:
-            #   * LH <= LF  (hit count cannot exceed instrumented count)
-            #   * unique hit DA lines <= LH  (every emitted hit must be in LH)
-            #   * unique DA lines <= LF  (every emitted DA line must be in LF)
-            # Reports that violate any of these are internally inconsistent
-            # and reject with exit 2.
-            if block_lf is not None and block_lh is not None and block_lh > block_lf:
+            if block_lf is None or block_lh is None:
                 raise MalformedInput(
-                    f"line {line_no}: LH={block_lh} > LF={block_lf} "
-                    f"for {current.path!r}"
+                    f"line {line_no}: SF block for {current.path!r} missing LF/LH summary"
                 )
-            if block_lf is not None and unique_lines > block_lf:
+            if block_lh > block_lf:
                 raise MalformedInput(
-                    f"line {line_no}: {unique_lines} unique DA lines exceed declared LF={block_lf} "
-                    f"for {current.path!r}"
+                    f"line {line_no}: LH={block_lh} > LF={block_lf} for {current.path!r}"
                 )
-            if block_lh is not None and unique_hits > block_lh:
+            # LF/LH are the producer's declared instrumentation counts and
+            # are the source of truth for overall arithmetic. The DA records
+            # are a *materialisation* of a subset of those instrumentation
+            # regions: cargo-llvm-cov 0.6.x emits LF/LH that exceed the
+            # emitted DA lines because LLVM tracks regions whose coverage
+            # data is not always serialised into a DA record. The invariants
+            # the checker can rigorously enforce against the producer are
+            # therefore bounds, not equality:
+            #   * LH <= LF                         (hit count cannot exceed instrumented count)
+            #   * LF >= unique DA lines            (every DA line is instrumented)
+            #   * LH >= unique hit DA lines        (every hit DA must be reflected in LH)
+            #
+            # The producer pin (cargo-llvm-cov 0.6.21 in .github/workflows/
+            # ci.yml) is the additional integrity boundary against arbitrary
+            # LF/LH inflation; a different producer must be re-validated.
+            if block_lf < unique_lines:
                 raise MalformedInput(
-                    f"line {line_no}: {unique_hits} unique hit DA lines exceed declared LH={block_lh} "
-                    f"for {current.path!r}"
+                    f"line {line_no}: declared LF={block_lf} below {unique_lines} unique DA "
+                    f"lines for {current.path!r}"
                 )
+            if block_lh < unique_hits:
+                raise MalformedInput(
+                    f"line {line_no}: declared LH={block_lh} below {unique_hits} unique hit "
+                    f"DA lines for {current.path!r}"
+                )
+            current.declared_lf = block_lf
+            current.declared_lh = block_lh
             current = None
             reset_block()
             seen_record_terminators += 1
@@ -533,26 +480,31 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                 raise MalformedInput(f"line {line_no}: malformed DA record: {line!r}")
             ln = int(m.group(1))
             hits = int(m.group(2))
-            previous = current.lines.get(ln, 0)
-            # When the same line appears more than once we sum hits (LCOV
-            # allows merged reports). This is unambiguous because hits are
-            # non-negative integers.
-            current.lines[ln] = previous + hits
-            # Block-local counter is per unique line: re-emitting DA for the
-            # same line within one SF block sums the hits but does not move
-            # the unique-line count, matching LCOV's LF/LH semantics.
-            block_lines[ln] = block_lines.get(ln, 0) + hits
+            if ln in block_lines:
+                raise MalformedInput(
+                    f"line {line_no}: duplicate DA record for line {ln} in {current.path!r}"
+                )
+            current.lines[ln] = hits
+            block_lines[ln] = hits
             continue
         if line.startswith("LF:"):
             m_lf = _LCOV_LF.match(line)
             if not m_lf:
                 raise MalformedInput(f"line {line_no}: malformed LF record: {line!r}")
+            if block_lf is not None:
+                raise MalformedInput(
+                    f"line {line_no}: duplicate LF record for {current.path!r}"
+                )
             block_lf = int(m_lf.group(1))
             continue
         if line.startswith("LH:"):
             m_lh = _LCOV_LH.match(line)
             if not m_lh:
                 raise MalformedInput(f"line {line_no}: malformed LH record: {line!r}")
+            if block_lh is not None:
+                raise MalformedInput(
+                    f"line {line_no}: duplicate LH record for {current.path!r}"
+                )
             block_lh = int(m_lh.group(1))
             continue
         # Other records (FN/FNDA/BRDA/BRF/BRH) are ignored — this tool only
@@ -564,22 +516,33 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
     return files
 
 
-def _normalize_path(path: str, repo_root: Path) -> str:
+def _normalize_path(path: str, repo_root: Path) -> str | None:
     """Normalize a path to a repository-relative POSIX string.
 
-    LCOV files may contain absolute paths (typical for cargo-llvm-cov) or
-    already-relative ones. Paths outside the repo are returned as-is so that
-    the caller can distinguish them in the output.
+    Returns ``None`` when the path resolves outside ``repo_root`` so the
+    caller drops the corresponding SF block before arithmetic. This forces
+    every coverage figure to be computed over the repository tree only —
+    vendored crates under ``~/.cargo/registry/`` and aliased ``./..`` paths
+    cannot contribute to overall or changed-line gates.
     """
 
     p = Path(path)
+    repo_real = repo_root.resolve()
     if p.is_absolute():
         try:
-            rel = p.resolve().relative_to(repo_root.resolve())
+            rel = p.resolve().relative_to(repo_real)
         except ValueError:
-            return p.as_posix()
+            return None
         return rel.as_posix()
-    return p.as_posix()
+    # For a repository-relative entry, resolve through repo_root so
+    # `./a.rs` and `a.rs` canonicalize to the same key and `../escape.rs`
+    # is rejected as out-of-tree.
+    try:
+        candidate = (repo_root / p).resolve()
+        rel = candidate.relative_to(repo_real)
+    except (OSError, ValueError):
+        return None
+    return rel.as_posix()
 
 
 # ---------------------------------------------------------------------------
@@ -799,8 +762,12 @@ def evaluate(
     total_lf = 0
     total_lh = 0
     for fc in lcov.values():
-        total_lf += len(fc.lines)
-        total_lh += len(fc.covered_lines())
+        # Use the declared LF/LH summaries (validated against DA in
+        # parse_lcov) so a producer that claims more instrumented lines
+        # than emitted DA cannot be scored from DA-only arithmetic that
+        # disagrees with the summary.
+        total_lf += fc.declared_lf
+        total_lh += fc.declared_lh
     overall_percent = 100.0 * total_lh / total_lf if total_lf else 100.0
     overall_block = {
         "lf": total_lf,
@@ -922,16 +889,19 @@ def evaluate(
         # Trust-boundary.
         #
         # A trust-boundary file fails the gate when any of:
-        #   (a) it has executable changed lines and the coverage of those
-        #       lines is below the threshold,
-        #   (b) it was changed but is absent from the LCOV report entirely
-        #       (so the checker cannot prove the changes are non-executable),
-        #   (c) it has non-instrumented changed lines that the Rust line
-        #       classifier flags as executable (e.g., code excluded from
-        #       instrumentation by `cfg(...)` or by an LCOV truncation).
-        # A file whose changed lines are all comments, doc strings, blank,
-        # or attributes passes — those lines carry no behaviour risk and
-        # the classifier confirms it from the head-tree source.
+        #   (a) it has executable changed lines whose coverage is below
+        #       the threshold,
+        #   (b) it was changed but has no LCOV records at all (the checker
+        #       cannot prove the changes are non-executable),
+        #   (c) it has non-instrumented changed lines that the line
+        #       classifier flagged as executable (the classifier reports
+        #       non-executable only for blank / line-comment / block-
+        #       comment lines; any other shape — including all attributes,
+        #       raw strings, char literals — falls into executable).
+        # When (b) or (c) fires, the measured worst-percent is recorded as
+        # 0.0 so downstream consumers (badges, dashboards) can read the
+        # gate's `measured` field as a worst-signal scalar regardless of
+        # which failure category triggered.
         tb_passed = True
         tb_details: list[str] = []
         tb_worst: float | None = None
@@ -942,14 +912,12 @@ def evaluate(
                 continue
             if not fr.has_lcov_records:
                 tb_passed = False
+                tb_worst = 0.0
                 tb_details.append(f"{fr.path}: no LCOV records for changed lines")
                 continue
-            # Accumulate every failure on this file rather than reporting just
-            # the first — operators triaging a coverage regression must see
-            # both 'executable lines absent from LCOV' and 'below threshold'
-            # at once, not in two CI rounds.
             if fr.non_instrumented_executable_lines:
                 tb_passed = False
+                tb_worst = 0.0
                 preview = ", ".join(
                     str(n) for n in fr.non_instrumented_executable_lines[:10]
                 )
@@ -1099,9 +1067,37 @@ def main(argv: list[str] | None = None) -> int:
             "not used to fail the build)."
         ),
     )
+    parser.add_argument(
+        "--allow-head-drift",
+        action="store_true",
+        help=(
+            "Skip the `git rev-parse HEAD == --head-sha` startup check. CI must "
+            "never set this — the worktree drift it covers is exactly the "
+            "scenario the check exists to catch. Tests pass this flag because "
+            "their fixture trees are not git repositories."
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve()
+    if not args.allow_head_drift:
+        try:
+            current_head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                f"error: cannot read repo HEAD ({exc}); pass --allow-head-drift to skip",
+                file=sys.stderr,
+            )
+            return EXIT_MALFORMED
+        if current_head != args.head_sha:
+            print(
+                f"error: worktree HEAD ({current_head}) != --head-sha ({args.head_sha}); "
+                "classification would read the wrong tree",
+                file=sys.stderr,
+            )
+            return EXIT_MALFORMED
     try:
         lcov_text = Path(args.lcov).read_text(encoding="utf-8")
     except OSError as exc:

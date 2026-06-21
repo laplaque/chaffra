@@ -2,7 +2,9 @@
 #
 # This file is the single source of truth for coverage thresholds and the
 # list of trust-boundary paths whose changed lines must be fully covered.
-# The CI `coverage` job loads it via `scripts/coverage_check.py`.
+# The CI `coverage` job loads it via `scripts/coverage_check.py` on every
+# pull request and on every push to `main`. Feature-branch pushes do not
+# run the coverage gate; the PR run is authoritative.
 #
 # How to add a trust-boundary path
 # --------------------------------
@@ -24,7 +26,8 @@
 policy_version = 1
 
 [thresholds]
-# Overall line coverage on the workspace. Enforced on every push and PR.
+# Overall line coverage on the workspace. Enforced on pull requests and on
+# pushes to the `main` branch (see CONTRIBUTING.md for full event coverage).
 overall = 85.0
 # Aggregate changed-line coverage across all changed Rust files on a PR.
 aggregate_changed = 95.0
@@ -95,4 +98,18 @@ patterns = [
   "crates/chaffra-mcp/src/tools.rs",
   "crates/chaffra-mcp/src/protocol.rs",
   "crates/chaffra-cli/src/lsp.rs",
+]
+
+[[trust_boundaries]]
+purpose = "management HTTP server and API (telemetry / config over HTTP)"
+patterns = [
+  "crates/chaffra-management/src/api.rs",
+  "crates/chaffra-management/src/server.rs",
+]
+
+[[trust_boundaries]]
+purpose = "external plugin gRPC framing and host dispatch"
+patterns = [
+  "crates/chaffra-plugin/src/client.rs",
+  "crates/chaffra-plugin/src/host.rs",
 ]
