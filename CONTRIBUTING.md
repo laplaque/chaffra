@@ -35,29 +35,34 @@ exclusion is unavoidable.
 #### Documented residual
 
 The checker treats the LCOV DA records as the authority on which changed lines
-are executable. Code that the coverage build does not compile is therefore not
-enforced by the changed-line gates. Two cases fall into this residual:
+are executable, so code the coverage build does not compile is not enforced by
+the changed-line gates. To minimise this gap:
 
-- **Inactive `cfg`** — code reachable only under a non-active `cfg`, e.g.
-  `#[cfg(target_os = "windows")]` on a Linux runner. No single build can
-  instrument it.
-- **Non-default features** — the coverage build runs in the default feature
-  configuration (it does **not** pass `--all-features`, because the workspace
-  test suite is not yet `--all-features`-clean; see
-  [chaffra#51](https://github.com/laplaque/chaffra/issues/51)). Code behind a
-  non-default feature is not instrumented until #51 is fixed and `--all-features`
-  can be re-enabled.
+- **Feature gates are enumerated by name in CI.** The `coverage` job passes
+  `--features` listing every non-default feature in the workspace (today only
+  `chaffra-telemetry/cloudwatch`) so feature-gated executable code does reach
+  the DA records. When a new non-default feature is added, the contributor
+  MUST add it to both the local command and the CI command in the same PR; the
+  reviewer verifies it. We do not pass `--all-features` because the workspace
+  test suite is not `--all-features`-clean (see
+  [chaffra#51](https://github.com/laplaque/chaffra/issues/51)).
+- **Inactive target `cfg` is the one residual.** Code reachable only under a
+  non-active `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]` on
+  the coverage runner cannot be instrumented by any single build. No
+  trust-boundary file currently contains such a gate; the exception in
+  `.github/coverage-policy.toml` is the documented mechanism for the next
+  time one is introduced. Tracked in
+  [chaffra#49](https://github.com/laplaque/chaffra/issues/49), which proposes
+  a multi-target coverage matrix or a tree-sitter-rust classifier.
 
-Both are tracked in [chaffra#49](https://github.com/laplaque/chaffra/issues/49),
-which proposes a multi-config coverage matrix or a tree-sitter-rust classifier.
-Reviewers must flag trust-boundary changes whose only added lines are gated by
-an inactive `cfg` or a non-default feature, until these issues close.
+Reviewers must flag any trust-boundary change whose only added lines are
+gated by an inactive target `cfg`, until #49 closes.
 
 #### Running coverage locally
 
 ```bash
 # 1. Generate the same LCOV file the CI job uses:
-cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+cargo llvm-cov --workspace --features chaffra-telemetry/cloudwatch --lcov --output-path coverage/lcov.info
 
 # 2. Reproduce a PR comparison against an explicit base/head SHA pair:
 python3 scripts/coverage_check.py \

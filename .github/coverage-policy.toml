@@ -29,24 +29,34 @@ policy_version = 1
 # Tracked exception (per the carve-out rules above: owner + removal issue
 # inline, does not lower any threshold).
 #
-# Exception:   executable code not built in the coverage configuration, on
-#              trust-boundary files. Two cases:
-#              (a) inactive cfg — e.g. `#[cfg(target_os = "windows")]` on a
-#                  Linux runner; no single build can instrument it.
-#              (b) non-default features — the coverage build does NOT pass
-#                  `--all-features` because the workspace test suite is not
-#                  yet --all-features-clean (chaffra#51). Feature-gated code
-#                  is uninstrumented until #51 is fixed.
-#              Such code is absent from the LCOV DA records, so the 100%
-#              trust-boundary gate cannot enforce coverage on a change whose
-#              only added lines are so gated.
-# Scope:       does NOT lower any threshold; reviewers must flag such
-#              changes in code review until the removal issues close.
+# Exception:   inactive-cfg-gated executable code on trust-boundary files.
+# Reason:      a `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]`
+#              attribute that is FALSE on the coverage runner cannot be
+#              instrumented in a single build, so the 100% trust-boundary
+#              gate cannot enforce coverage on a TB change whose only added
+#              lines are so gated. Feature-gated code is NOT in this
+#              exception: the coverage job now enumerates every non-default
+#              feature in the workspace by name (currently only
+#              `chaffra-telemetry/cloudwatch`); when a new non-default
+#              feature is added, the CI command MUST list it and reviewers
+#              MUST verify this in the PR.
+# Scope:       (1) only files matching `cfg(target_*)` attributes whose
+#              condition is false on `ubuntu-latest` x86_64;
+#              (2) does NOT lower any threshold;
+#              (3) reviewers must flag such changes in code review until
+#              the removal issue closes.
+# Affected:    no trust-boundary file currently contains a target-`cfg`
+#              gate (`grep -r 'cfg(target_' crates/chaffra-{cli,core,
+#              telemetry,plugin,mcp,parse,audit,impact,management}/src/`
+#              returns no matches). The exception is empty in scope today;
+#              it is retained as the documented mechanism for the next time
+#              such a gate is introduced.
 # Owner:       @iamclaude697 (accountable for tracking + removal).
-# Removal:     https://github.com/laplaque/chaffra/issues/49 (multi-config
-#              matrix or tree-sitter classifier) and, for case (b),
-#              https://github.com/laplaque/chaffra/issues/51 (test cwd race
-#              that currently blocks --all-features).
+# Removal:     https://github.com/laplaque/chaffra/issues/49 (multi-target
+#              coverage matrix or tree-sitter classifier).
+# Adjacent:    https://github.com/laplaque/chaffra/issues/51 (test cwd race)
+#              must close before `--all-features` can replace the explicit
+#              enumeration in the coverage job.
 # Acceptance:  pending maintainer (@laplaque) sign-off on this PR.
 # Full detail: CONTRIBUTING.md > Coverage > Documented residual.
 # ---------------------------------------------------------------------------

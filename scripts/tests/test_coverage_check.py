@@ -263,34 +263,41 @@ class TestNoExecutableLinesBlock(CheckerTestCase):
         self.assertEqual(report["overall"]["covered_lines"], 2)
 
 
-class TestDeclaredSummaryCannotInflateOverall(CheckerTestCase):
-    def test_high_lf_lowers_score_cannot_inflate(self) -> None:
-        # Overall denominator is Σ LF (declared instrumented), numerator is
-        # covered DA lines. A block declaring LF:100/LH:100 with one covered
-        # DA line contributes 1/100, NOT a DA-derived 1/1=100%. The inflated
-        # LF only lowers the score: 1 covered of 102 declared = 0.98%.
-        lcov = (
-            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:100\nLH:100\nend_of_record\n"
-            "SF:crates/chaffra-cli/src/main.rs\nDA:1,0\nDA:2,0\nLF:2\nLH:0\nend_of_record\n"
-        )
-        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
-        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        overall = next(g for g in report["gates"] if g["name"] == "overall")
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertFalse(overall["passed"])
-        self.assertAlmostEqual(report["overall"]["percent"], 100.0 / 102, places=2)
+class TestSummaryConsistencyRejectsInflatedLcov(CheckerTestCase):
+    """Overall uses the standard producer summary ΣLH/ΣLF (matching what
+    `cargo llvm-cov --summary-only` reports). The reconciliation bound
+    (LH-covered_DA) ≤ (LF-unique_DA) rejects producers whose summary
+    claims more *unseen* hits than there is undeclared instrumentation
+    behind them."""
 
-    def test_high_lh_cannot_inflate_numerator(self) -> None:
-        # A producer that declares LH high (LH:100) but serialises only one
-        # covered DA line cannot inflate: the numerator uses covered DA
-        # lines, never the declared LH. 1 covered of 100 declared = 1%.
+    def test_inflated_unseen_hits_rejected(self) -> None:
+        # LF:10/LH:10 with `DA:1,1; DA:2,0`: unseen_hits = 10-1 = 9,
+        # unseen_inst = 10-2 = 8 → 9 > 8 → MALFORMED.
         lcov = (
-            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:100\nLH:100\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\n"
+            "DA:1,1\nDA:2,0\nLF:10\nLH:10\nend_of_record\n"
         )
         diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
         rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
-        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
-        self.assertAlmostEqual(report["overall"]["percent"], 1.0, places=2)
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertEqual(report["status"], "malformed_input")
+        self.assertIn("hits unaccounted", report["detail"])
+
+    def test_consistent_summary_passes_with_standard_metric(self) -> None:
+        # LF:10/LH:7 with three covered + two uncovered DA records:
+        # unseen_hits = 7-3 = 4, unseen_inst = 10-5 = 5 → 4 ≤ 5 OK.
+        # Overall is the standard ΣLH/ΣLF = 7/10 = 70%, matching what
+        # `cargo llvm-cov --summary-only` would report for this file.
+        lcov = (
+            "SF:crates/chaffra-core/src/config.rs\n"
+            "DA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nDA:5,0\nLF:10\nLH:7\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)  # 70% < 85%
+        self.assertEqual(report["overall"]["instrumented_lines"], 10)
+        self.assertEqual(report["overall"]["covered_lines"], 7)
+        self.assertAlmostEqual(report["overall"]["percent"], 70.0, places=2)
 
 
 class TestSyntheticSfPathsAreDropped(CheckerTestCase):
@@ -775,9 +782,11 @@ class TestMalformedLcovTable(CheckerTestCase):
     inputs. New malformed-LCOV cases land as rows here, not new classes.
     """
 
-    # LF/LH values are intentionally NOT parsed — see parse_lcov docstring.
-    # Active SF blocks require exactly one LF and one LH, with LH<=LF,
-    # LF>=unique DA lines and LH>=unique hit DA lines. Violations exit 2.
+    # Active SF blocks require exactly one LF and exactly one LH, validated
+    # under: LH<=LF; LF>=unique DA lines; LH>=unique hit DA lines; and the
+    # reconciliation bound (LH - covered_DA) <= (LF - unique_DA). Violations
+    # exit 2 with a failure artifact. See parse_lcov's docstring for the
+    # full contract.
     CASES: list[tuple[str, str]] = [
         ("non-numeric DA hits", "SF:foo.rs\nDA:1,not-a-number\nend_of_record\n"),
         ("missing end_of_record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\n"),
@@ -791,6 +800,10 @@ class TestMalformedLcovTable(CheckerTestCase):
         ("LH > LF", "SF:foo.rs\nDA:1,1\nLF:1\nLH:5\nend_of_record\n"),
         ("LF below unique DA lines", "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:1\nLH:2\nend_of_record\n"),
         ("LH below unique hit DA lines", "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:1\nend_of_record\n"),
+        # Reconciliation bound: unseen_hits=LH-covered_DA (2-0=2) must
+        # not exceed unseen_inst=LF-unique_DA (2-1=1). Producer claims hits
+        # behind the DA records that exceed the undeclared instrumentation.
+        ("unseen hits exceed unseen instrumented", "SF:foo.rs\nDA:1,0\nLF:2\nLH:2\nend_of_record\n"),
         ("duplicate DA for same line", "SF:foo.rs\nDA:1,1\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"),
         (
             "duplicate SF path",
@@ -951,15 +964,15 @@ class TestStagedFileNotEligible(RealGitTestCase):
     def test_staged_generated_file_dropped_from_overall(self) -> None:
         base_sha, head_sha = self.build_fixture_repo()
         # Simulate a build script staging a generated, fully-covered .rs file
-        # that is NOT in the head commit, then claiming coverage for it.
+        # that is NOT in the head commit. All fixture content — both the
+        # staged Rust source and the LCOV that includes a block for it —
+        # comes from the checked-in `scripts/tests/fixtures/integration/`
+        # directory per CONTRIBUTING.md's "Never generate fixture content
+        # at runtime"; only the `git add` of the file is dynamic.
         gen_rel = "crates/chaffra-core/src/generated.rs"
-        (self.tmp / gen_rel).write_text("fn g() { 1; }\n", encoding="utf-8")
+        shutil.copyfile(self.FIXTURES / "staged_generated.rs", self.tmp / gen_rel)
         self.git("add", gen_rel)  # staged, but never committed → not in head tree
-        (self.tmp / "lcov.info").write_text(
-            lcov_file_block(self.REL, [(1, 1), (2, 1)])
-            + lcov_file_block(gen_rel, [(1, 1), (2, 1), (3, 1), (4, 1)]),
-            encoding="utf-8",
-        )
+        shutil.copyfile(self.FIXTURES / "staged_lcov.info", self.tmp / "lcov.info")
         rc = self.run_main(base_sha=base_sha, head_sha=head_sha)
         report = self.report()
         # The staged file's records must be dropped, not counted toward overall.

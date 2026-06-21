@@ -346,6 +346,21 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                         f"line {line_no}: LH={block_lh} below {len(block_hit_lines)} "
                         f"unique hit DA lines for {where!r}"
                     )
+                # Reconciliation bound between the summary and the detail:
+                # the producer's *unseen* hits (LH − covered DA lines) must
+                # not exceed the producer's *unseen* instrumented lines
+                # (LF − unique DA lines). A producer cannot claim more hits
+                # behind the DA records than there is undeclared
+                # instrumentation behind them. This rejects, e.g.,
+                # `LF:10 LH:10 DA:1,1 DA:2,0` (unseen_hits=9 > unseen_inst=8).
+                unseen_inst = block_lf - len(block_da_lines)
+                unseen_hits = block_lh - len(block_hit_lines)
+                if unseen_hits > unseen_inst:
+                    raise MalformedInput(
+                        f"line {line_no}: LH={block_lh} claims {unseen_hits} hits "
+                        f"unaccounted for in DA but LF={block_lf} accounts for only "
+                        f"{unseen_inst} instrumented lines outside DA for {where!r}"
+                    )
                 current.declared_lf = block_lf
                 current.declared_lh = block_lh
             current = None
@@ -747,15 +762,26 @@ def evaluate(
     # for every downstream gate computation in this function.
     eligible_lcov = {p: fc for p, fc in lcov.items() if p in tracked_rs_files}
     dropped_synthetic = sorted(set(lcov) - set(eligible_lcov))
-    # Overall denominator is the producer's declared instrumented-line count
-    # (Σ LF); numerator is the count of DA lines actually demonstrated covered.
-    # Declaring a high LF only lowers the score, and the numerator never uses
-    # the declared LH, so the summary cannot inflate the percentage.
+    # Overall is the producer's standard summary metric, ΣLH / ΣLF — a
+    # coherent pair from one LCOV representation (matches what
+    # `cargo llvm-cov --summary-only` reports). The summary cannot be
+    # inflated arbitrarily because parse_lcov enforces, per ACTIVE block:
+    #   * LH <= LF                                     (hits ≤ instrumented)
+    #   * LF >= unique DA lines                        (every visible DA is instrumented)
+    #   * LH >= unique hit DA lines                    (every visible hit is in LH)
+    #   * (LH - covered_DA) <= (LF - unique_DA)        (unseen hits ≤ unseen
+    #                                                   instrumented; rejects
+    #                                                   producers whose summary
+    #                                                   claims more hits behind
+    #                                                   the DA records than
+    #                                                   there is undeclared
+    #                                                   instrumentation behind
+    #                                                   them).
     total_lf = 0
     total_lh = 0
     for fc in eligible_lcov.values():
         total_lf += fc.declared_lf
-        total_lh += len(fc.covered_lines())
+        total_lh += fc.declared_lh
     if total_lf == 0:
         # Zero eligible instrumented lines means the LCOV had no SF block for
         # any tracked Rust file: every block was either out-of-repo or

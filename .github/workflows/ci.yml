@@ -215,15 +215,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p coverage
-          # NB: --all-features is intentionally NOT used. The workspace test
-          # suite is not --all-features-clean (chaffra#51: a global-cwd race
-          # in test_run_with_telemetry_end_to_end surfaces under the larger
-          # --all-features test set). Until #51 is fixed, coverage is built
-          # in the default feature configuration, matching the `test` job.
-          # Consequently, non-default-feature-gated code — like inactive-cfg
-          # code — is part of the documented coverage residual (CONTRIBUTING.md
-          # > Coverage > Documented residual, tracked as chaffra#49).
-          cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+          # Coverage is built across the default feature configuration PLUS
+          # every non-default feature the workspace defines, by name, so
+          # feature-gated executable code on trust-boundary files reaches the
+          # LCOV DA records. We do NOT pass `--all-features`: chaffra#51
+          # tracks a global-cwd race in test_run_with_telemetry_end_to_end
+          # that the larger --all-features test set exposes, breaking the
+          # whole job.
+          #
+          # The full list of non-default features in the workspace today:
+          #   - chaffra-telemetry: `cloudwatch`
+          # When a new non-default feature is added, append it here so its
+          # executable code does not silently slip into the coverage
+          # residual. `cargo llvm-cov` accepts the same `--features` syntax
+          # as cargo build.
+          cargo llvm-cov --workspace \
+            --features chaffra-telemetry/cloudwatch \
+            --lcov --output-path coverage/lcov.info
       - name: Run coverage checker
         env:
           BASE_SHA: ${{ steps.shas.outputs.base }}
