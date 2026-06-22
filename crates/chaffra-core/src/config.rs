@@ -270,6 +270,32 @@ impl ChaffraConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TEMPORARY multi-target coverage-matrix demonstration (chaffra#48 / #49).
+// This block exists only to prove, in CI, that the per-target matrix
+// instruments and the merge enforces Windows-gated trust-boundary code that
+// no single-target build compiles. It is gated to the Windows target, so it
+// is compiled and exercised ONLY on the windows instrument leg; the
+// linux/macos legs (and every other CI job, which runs on linux) never see
+// it. To be reverted before merge.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_only_trust_boundary_demo(enabled: bool) -> u8 {
+    // A trust-boundary-shaped branch (config gate) reachable only on Windows.
+    if enabled { 1 } else { 0 }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_matrix_demo_tests {
+    use super::*;
+
+    #[test]
+    fn windows_only_demo_is_covered_on_the_windows_leg() {
+        assert_eq!(windows_only_trust_boundary_demo(true), 1);
+        assert_eq!(windows_only_trust_boundary_demo(false), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
