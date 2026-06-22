@@ -23,10 +23,12 @@ Scope: this gate is Rust-only (``RUST_EXT``). It never classifies source
 text — the LCOV DA records are the sole authority on which changed lines
 are executable and must be covered. A changed line absent from the DA
 records is a line the coverage build did not instrument (a brace,
-declaration, comment, blank line, or code gated out by an inactive cfg or
-a non-default feature). The documented residual (inactive-cfg and
-non-default-feature code) is described in CONTRIBUTING.md (Coverage >
-Documented residual) and tracked as chaffra#49 / chaffra#51.
+declaration, comment, blank line). Target-`cfg`-gated code reaches the DA
+records via the per-target instrumentation matrix in CI; non-default
+features reach them via the explicit ``--features`` argument. Both
+mechanisms are documented in CONTRIBUTING.md (Coverage > Multi-target
+instrumentation) and policed by ``scripts/tests/test_coverage_check.py``
+(see ``TestPolicyAndCiInvariants``).
 """
 
 from __future__ import annotations
@@ -90,13 +92,15 @@ class Policy:
 class FileCoverage:
     """LCOV records for a single source file.
 
-    ``lines`` maps DA line numbers to hits. Per-file ``declared_lf`` is the
-    producer's ``LF`` summary (count of instrumented lines). Overall coverage
-    uses ``Σ declared_lf`` as the denominator and the count of covered DA
-    lines as the numerator, so a producer cannot inflate the percentage by
-    declaring a high ``LF`` (it only lowers the score) or a high ``LH`` (the
-    numerator uses demonstrated DA hits, never the declared ``LH``). The
-    changed-line gates use the DA records directly for per-line resolution.
+    ``lines`` maps DA line numbers to hits. Both gates compute over the DA
+    records directly — overall uses ``Σ(unique DA) / Σ(unique covered DA)``
+    (the DA-coherent metric); changed-line gates use the DA records for
+    per-line resolution. The producer's declared ``LF``/``LH`` summary is
+    structurally validated by :func:`parse_lcov` (LH<=LF, LF>=unique-DA,
+    LH>=unique-hit-DA, and the reconciliation bound) but is *not* an input to
+    the arithmetic, so an overstated summary cannot inflate the score past
+    what the DA records demonstrate. The fields are retained on the dataclass
+    for diagnostics / merge bookkeeping only.
     """
 
     path: str
@@ -308,60 +312,68 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
         if line == "end_of_record":
             if state == "IDLE":
                 raise MalformedInput(f"line {line_no}: end_of_record outside SF block")
-            if state == "ACTIVE":
-                assert current is not None
-                where = current.path
-                if block_lf is None or block_lh is None:
+            # SKIPPED blocks were treated permissively in an earlier revision
+            # — only their record syntax was validated, while LF/LH/DA bounds
+            # were skipped. That let a malformed out-of-repo SF carry the
+            # parser past inputs the contract calls "malformed or ambiguous
+            # LCOV." Apply the same per-block invariants to both states; only
+            # ACTIVE blocks then persist their declared totals.
+            where = current.path if state == "ACTIVE" else "<skipped block>"
+            if block_lf is None or block_lh is None:
+                raise MalformedInput(
+                    f"line {line_no}: SF block for {where!r} missing LF/LH summary"
+                )
+            if not block_da_lines:
+                # A file with no executable lines (e.g. a `pub mod` re-export
+                # module) is emitted by cargo-llvm-cov as LF:0/LH:0 with no
+                # DA records. Accept it (ACTIVE contributes 0 to overall;
+                # SKIPPED is dropped) only when LF:0/LH:0; a zero-DA block
+                # that claims instrumented lines is internally contradictory.
+                if block_lf != 0 or block_lh != 0:
                     raise MalformedInput(
-                        f"line {line_no}: SF block for {where!r} missing LF/LH summary"
+                        f"line {line_no}: SF block for {where!r} has no DA records "
+                        f"but declares LF={block_lf}/LH={block_lh}"
                     )
-                if not block_da_lines:
-                    # A file with no executable lines (e.g. a `pub mod` re-export
-                    # module) is emitted by cargo-llvm-cov as LF:0/LH:0 with no
-                    # DA records. Accept it (it contributes 0 to overall); only
-                    # reject a zero-DA block that nonetheless claims instrumented
-                    # lines, which is internally contradictory.
-                    if block_lf != 0 or block_lh != 0:
-                        raise MalformedInput(
-                            f"line {line_no}: SF block for {where!r} has no DA records "
-                            f"but declares LF={block_lf}/LH={block_lh}"
-                        )
+                if state == "ACTIVE":
+                    assert current is not None
                     current.declared_lf = 0
                     current.declared_lh = 0
-                    current = None
-                    reset_block()
-                    state = "IDLE"
-                    seen_record_terminators += 1
-                    continue
-                if block_lh > block_lf:
-                    raise MalformedInput(
-                        f"line {line_no}: LH={block_lh} > LF={block_lf} for {where!r}"
-                    )
-                if block_lf < len(block_da_lines):
-                    raise MalformedInput(
-                        f"line {line_no}: LF={block_lf} below {len(block_da_lines)} "
-                        f"unique DA lines for {where!r}"
-                    )
-                if block_lh < len(block_hit_lines):
-                    raise MalformedInput(
-                        f"line {line_no}: LH={block_lh} below {len(block_hit_lines)} "
-                        f"unique hit DA lines for {where!r}"
-                    )
-                # Reconciliation bound between the summary and the detail:
-                # the producer's *unseen* hits (LH − covered DA lines) must
-                # not exceed the producer's *unseen* instrumented lines
-                # (LF − unique DA lines). A producer cannot claim more hits
-                # behind the DA records than there is undeclared
-                # instrumentation behind them. This rejects, e.g.,
-                # `LF:10 LH:10 DA:1,1 DA:2,0` (unseen_hits=9 > unseen_inst=8).
-                unseen_inst = block_lf - len(block_da_lines)
-                unseen_hits = block_lh - len(block_hit_lines)
-                if unseen_hits > unseen_inst:
-                    raise MalformedInput(
-                        f"line {line_no}: LH={block_lh} claims {unseen_hits} hits "
-                        f"unaccounted for in DA but LF={block_lf} accounts for only "
-                        f"{unseen_inst} instrumented lines outside DA for {where!r}"
-                    )
+                current = None
+                reset_block()
+                state = "IDLE"
+                seen_record_terminators += 1
+                continue
+            if block_lh > block_lf:
+                raise MalformedInput(
+                    f"line {line_no}: LH={block_lh} > LF={block_lf} for {where!r}"
+                )
+            if block_lf < len(block_da_lines):
+                raise MalformedInput(
+                    f"line {line_no}: LF={block_lf} below {len(block_da_lines)} "
+                    f"unique DA lines for {where!r}"
+                )
+            if block_lh < len(block_hit_lines):
+                raise MalformedInput(
+                    f"line {line_no}: LH={block_lh} below {len(block_hit_lines)} "
+                    f"unique hit DA lines for {where!r}"
+                )
+            # Reconciliation bound between the summary and the detail:
+            # the producer's *unseen* hits (LH − covered DA lines) must
+            # not exceed the producer's *unseen* instrumented lines
+            # (LF − unique DA lines). A producer cannot claim more hits
+            # behind the DA records than there is undeclared
+            # instrumentation behind them. This rejects, e.g.,
+            # `LF:10 LH:10 DA:1,1 DA:2,0` (unseen_hits=9 > unseen_inst=8).
+            unseen_inst = block_lf - len(block_da_lines)
+            unseen_hits = block_lh - len(block_hit_lines)
+            if unseen_hits > unseen_inst:
+                raise MalformedInput(
+                    f"line {line_no}: LH={block_lh} claims {unseen_hits} hits "
+                    f"unaccounted for in DA but LF={block_lf} accounts for only "
+                    f"{unseen_inst} instrumented lines outside DA for {where!r}"
+                )
+            if state == "ACTIVE":
+                assert current is not None
                 current.declared_lf = block_lf
                 current.declared_lh = block_lh
             current = None
@@ -394,9 +406,10 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
             m_lf = _LCOV_LF.match(line)
             if not m_lf:
                 raise MalformedInput(f"line {line_no}: malformed LF record: {line!r}")
-            if state == "ACTIVE" and block_lf is not None:
+            if block_lf is not None:
+                where = current.path if state == "ACTIVE" else "<skipped block>"
                 raise MalformedInput(
-                    f"line {line_no}: duplicate LF record for {current.path!r}"
+                    f"line {line_no}: duplicate LF record for {where!r}"
                 )
             block_lf = int(m_lf.group(1))
             continue
@@ -404,9 +417,10 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
             m_lh = _LCOV_LH.match(line)
             if not m_lh:
                 raise MalformedInput(f"line {line_no}: malformed LH record: {line!r}")
-            if state == "ACTIVE" and block_lh is not None:
+            if block_lh is not None:
+                where = current.path if state == "ACTIVE" else "<skipped block>"
                 raise MalformedInput(
-                    f"line {line_no}: duplicate LH record for {current.path!r}"
+                    f"line {line_no}: duplicate LH record for {where!r}"
                 )
             block_lh = int(m_lh.group(1))
             continue
@@ -713,6 +727,93 @@ def list_tracked_rs_files(repo_root: Path, head_sha: str) -> list[str]:
     return [path for path in out.split("\0") if path.endswith(RUST_EXT)]
 
 
+def get_source_line_counts(
+    repo_root: Path, head_sha: str, paths: list[str]
+) -> dict[str, int]:
+    """Return ``{path: line_count}`` for ``paths`` in the immutable head tree.
+
+    Reads each blob via ``git cat-file --batch`` against ``head_sha:path``
+    and counts the lines that exist in the reviewed commit, NOT the mutable
+    worktree. This is the authority the DA-line-range gate validates against:
+    a producer that emits ``DA:999999,1`` for a tracked path whose blob has
+    20 lines cannot inflate coverage by claiming coordinates that don't
+    exist. ``cat-file --batch`` streams one process for all paths so the
+    cost is one git invocation per gate run.
+
+    ``paths`` are repository-relative POSIX strings. A path missing from the
+    head tree is omitted from the result, so the caller's DA-line check
+    skips it (eligibility already drops untracked paths before this helper
+    is reached).
+
+    Line counting follows POSIX convention: the count is the number of
+    trailing-newline-terminated lines plus 1 if a final non-newline-
+    terminated trailer exists. cargo-llvm-cov emits DA records for the
+    1-based line number of each instrumented statement, so this metric is
+    the upper bound a DA line number may take.
+    """
+
+    if not paths:
+        return {}
+    request = "".join(f"{head_sha}:{p}\n" for p in paths).encode("utf-8")
+    try:
+        proc = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            input=request,
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        # `cwd` does not exist → FileNotFoundError; `git` binary missing →
+        # PermissionError or FileNotFoundError. Either way, no source range
+        # can be validated, so this is malformed for the gate's purposes.
+        raise MalformedInput(f"git cat-file failed: {exc}") from exc
+    if proc.returncode != 0:
+        # cat-file in a non-git directory exits 128 with `fatal: not a git
+        # repository`; any other non-zero is also a hard error because the
+        # H7 gate cannot enforce DA-line bounds without a trusted blob view.
+        raise MalformedInput(
+            f"git cat-file --batch exited {proc.returncode}: "
+            f"{proc.stderr.decode('utf-8', 'replace')!r}"
+        )
+    out = proc.stdout
+    counts: dict[str, int] = {}
+    pos = 0
+    for path in paths:
+        nl = out.find(b"\n", pos)
+        if nl < 0:
+            raise MalformedInput(
+                f"git cat-file output truncated before header for {path!r}"
+            )
+        header = out[pos:nl].decode("utf-8", "replace")
+        pos = nl + 1
+        # Missing entries print "<spec> missing\n" with no blob body.
+        if header.endswith(" missing"):
+            continue
+        parts = header.split()
+        # Expect exactly "<sha> blob <size>". `cat-file --batch` produces
+        # exactly that format for a blob; eligibility has already restricted
+        # us to .rs files, so a non-blob (e.g. a tree spec) is a malformed
+        # input rather than something to skip. Raising here ensures the
+        # subsequent body offset (pos += size + 1) cannot desync the loop.
+        if len(parts) != 3 or parts[1] != "blob":
+            raise MalformedInput(
+                f"git cat-file: expected blob header for {path!r}, "
+                f"got {header!r}"
+            )
+        # `parts[2]` is the size cat-file printed; it is always a non-negative
+        # decimal integer for a blob, so an exception here would mean git's
+        # output contract changed — fail closed.
+        size = int(parts[2])
+        blob = out[pos : pos + size]
+        pos += size + 1  # the blob is followed by a trailing newline
+        line_count = blob.count(b"\n")
+        if blob and not blob.endswith(b"\n"):
+            line_count += 1
+        counts[path] = line_count
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Diff acquisition
 # ---------------------------------------------------------------------------
@@ -758,11 +859,12 @@ def _trust_boundary_gate(
 
     Changed lines that llvm did not instrument (braces, declarations,
     comments, blank lines) are not failures: the coverage build is the
-    authority on which lines are executable. Code the build does not compile
-    — gated by an inactive ``cfg`` (e.g. a different ``target_os``) or by a
-    non-default feature (CI does not pass ``--all-features``; see chaffra#51)
-    — is absent from the DA records and is a documented residual limitation
-    (chaffra#49).
+    authority on which lines are executable. Target-`cfg`-gated code is
+    handled by the per-target matrix in CI (linux+macos legs, merged by
+    :func:`merge_lcov`); feature-gated code is handled by the explicit
+    ``--features`` argument the workflow passes to ``cargo llvm-cov``.
+    Both mechanisms are policed by ``TestPolicyAndCiInvariants`` so a future
+    addition cannot silently fall outside coverage.
 
     ``measured`` is the worst per-file changed-line percentage, or 0.0 when
     a file failed for lack of any records, so the value is a usable scalar.
@@ -814,6 +916,7 @@ def evaluate(
     trust_boundary_files: set[str],
     tracked_rs_files: set[str],
     enforce_changed: bool,
+    source_line_counts: dict[str, int] | None = None,
 ) -> Report:
     # Restrict the LCOV records to TRACKED Rust files at HEAD. A producer
     # that emits SF blocks for synthetic in-tree paths (e.g. ``SF:fake.rs``)
@@ -822,6 +925,33 @@ def evaluate(
     # for every downstream gate computation in this function.
     eligible_lcov = {p: fc for p, fc in lcov.items() if p in tracked_rs_files}
     dropped_synthetic = sorted(set(lcov) - set(eligible_lcov))
+    # H7: reject DA coordinates that the immutable head_sha:path blob cannot
+    # contain (line 0 is never valid; line > blob_line_count means the
+    # producer fabricated a coordinate inside a tracked file). Done after
+    # eligibility so we only spend git on paths whose data is going to
+    # influence arithmetic. ``source_line_counts`` is None in test mode
+    # (``--allow-head-drift``) where the head_sha is synthetic; callers MUST
+    # pass it in production runs.
+    if source_line_counts is not None:
+        for path, fc in eligible_lcov.items():
+            max_line = source_line_counts.get(path)
+            if max_line is None:
+                # Tracked at head but missing a blob count means the cat-file
+                # batch did not return its size — refuse to gate against an
+                # unknown source range rather than silently letting any DA
+                # line through.
+                raise MalformedInput(
+                    f"source line count missing for tracked file {path!r}; "
+                    "cannot validate DA coordinates against head blob"
+                )
+            invalid = sorted(
+                ln for ln in fc.lines if ln < 1 or ln > max_line
+            )
+            if invalid:
+                raise MalformedInput(
+                    f"file {path!r}: DA line numbers {invalid} outside source "
+                    f"range 1..{max_line} for head_sha {head_sha}"
+                )
     # Overall is the **DA-coherent** metric: both numerator and denominator
     # come from the concrete DA records. Numerator = unique covered DA
     # lines; denominator = unique instrumented DA lines. This is one of the
@@ -877,12 +1007,12 @@ def evaluate(
         covered_changed = instrumented_changed & covered_for_file
         uncovered = instrumented_changed - covered_for_file
         # Lines llvm did not instrument (DA-absent): closing braces, struct
-        # fields, comments, blank lines, plus code the build did not compile
-        # (inactive cfg / non-default feature — the documented residual). We
-        # defer the "is this line executable" judgment to llvm rather than
-        # re-deriving it from a hand-rolled Rust lexer (which was unsound in
-        # both directions). See the trust-boundary gate below for how absence
-        # is treated.
+        # fields, comments, blank lines. Target-cfg and feature-gated code
+        # reach llvm via the matrix and `--features` respectively and so are
+        # NOT in this bucket. We defer the "is this line executable" judgment
+        # to llvm rather than re-deriving it from a hand-rolled Rust lexer
+        # (which was unsound in both directions). See the trust-boundary gate
+        # below for how absence is treated.
         non_instrumented = changed_lines - instrumented_for_file
         file_results.append(
             FileResult(
@@ -1237,6 +1367,17 @@ def main(argv: list[str] | None = None) -> int:
 
     tracked_rs_set = {f for f in repo_files if f.endswith(RUST_EXT)}
     try:
+        # H7: compute the immutable per-file line count for every eligible
+        # LCOV path so `evaluate` can reject DA coordinates beyond the
+        # source. ``--allow-head-drift`` (tests) means the head_sha is
+        # synthetic and cat-file would error; suppress the check there.
+        if args.allow_head_drift:
+            source_line_counts: dict[str, int] | None = None
+        else:
+            eligible_paths = sorted(p for p in lcov.keys() if p in tracked_rs_set)
+            source_line_counts = get_source_line_counts(
+                repo_root, args.head_sha, eligible_paths
+            )
         report = evaluate(
             lcov=lcov,
             diff=diff,
@@ -1246,6 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
             trust_boundary_files=matched,
             tracked_rs_files=tracked_rs_set,
             enforce_changed=args.mode == "pr",
+            source_line_counts=source_line_counts,
         )
     except MalformedInput as exc:
         return fail_malformed(f"malformed lcov: {exc}")

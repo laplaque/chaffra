@@ -297,53 +297,55 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p coverage
-          # One coverage build per target OS/arch (see the matrix `covers`
-          # field). cargo-llvm-cov instruments only code the current target
-          # compiles, so `#[cfg(target_os = "...")]`-gated code is captured
-          # on the leg whose target matches; the merge step in the `coverage`
-          # job unions the per-leg LCOV so the 100% trust-boundary gate sees
-          # all targets the matrix builds.
-          #
-          # --features enumerates every non-default feature in the workspace
-          # by name (today only chaffra-telemetry/cloudwatch) so feature-gated
-          # executable code reaches the LCOV DA records. We do NOT pass
-          # --all-features: chaffra#51 tracks a global-cwd race in
-          # test_run_with_telemetry_end_to_end that the larger --all-features
-          # test set exposes. When a new non-default feature is added, append
-          # it here and to CONTRIBUTING.md; a test enforces both.
+          # Two coverage builds per target OS/arch — one with every
+          # non-default workspace feature enabled (today
+          # `chaffra-telemetry/cloudwatch`) and one with no non-default
+          # features. This is what lets the 100% trust-boundary gate enforce
+          # BOTH `#[cfg(feature = "...")]` and `#[cfg(not(feature = "..."))]`
+          # code paths: each profile compiles a different set of branches,
+          # the merge in the `coverage` job unions them.
+          # cargo-llvm-cov also instruments only the current target's code,
+          # so target-`cfg`-gated code is captured on the matching leg.
+          # When a new non-default feature is added, append it to the
+          # features-on profile and to CONTRIBUTING.md; a test enforces both.
+          # `--all-features` is intentionally not used: a strict superset of
+          # the profiles below would not cover the no-features branches.
+          mkdir -p coverage
           cargo llvm-cov --workspace \
             --features chaffra-telemetry/cloudwatch \
-            --lcov --output-path coverage/lcov.info
+            --lcov --output-path coverage/lcov-features-on.info
+          cargo llvm-cov --workspace \
+            --lcov --output-path coverage/lcov-features-off.info
       - name: Normalize LCOV SF paths to repo-relative POSIX
         env:
           WORKSPACE: ${{ github.workspace }}
         run: |
           set -euo pipefail
           # cargo-llvm-cov emits each SF path using the HOST OS's path
-          # conventions — an absolute path under the checkout, with backslashes
-          # and a drive letter on Windows. The `coverage` job merges every
-          # leg's LCOV on a Linux runner and keys files by repo-relative POSIX
-          # path, so a Windows SF block like
+          # conventions — an absolute path under the checkout, with
+          # backslashes and a drive letter on Windows. The `coverage` job
+          # merges every leg's LCOV on a Linux runner and keys files by
+          # repo-relative POSIX path, so a Windows SF block like
           # `SF:D:\a\chaffra\chaffra\crates\...\config.rs` would never match
-          # the policy key `crates/.../config.rs` and would silently drop out
-          # of the gate — making the non-Linux legs decorative. Relativize each
-          # leg's LCOV HERE, where the host path semantics are known, so the
-          # merge sees identical repo-relative keys from every target.
+          # the policy key `crates/.../config.rs` and would silently drop
+          # out of the gate. Relativize each LCOV HERE, where the host path
+          # semantics are known, so the merge sees identical repo-relative
+          # keys from every target × profile.
           python3 - "$WORKSPACE" <<'PY'
           import pathlib
           import sys
 
           workspace = sys.argv[1].replace("\\", "/").rstrip("/") + "/"
-          lcov = pathlib.Path("coverage/lcov.info")
-          out = []
-          for line in lcov.read_text(encoding="utf-8").splitlines():
-              if line.startswith("SF:"):
-                  sf = line[len("SF:"):].replace("\\", "/")
-                  if sf.startswith(workspace):
-                      sf = sf[len(workspace):]
-                  line = "SF:" + sf
-              out.append(line)
-          lcov.write_text("\n".join(out) + "\n", encoding="utf-8")
+          for lcov in pathlib.Path("coverage").glob("lcov-*.info"):
+              out = []
+              for line in lcov.read_text(encoding="utf-8").splitlines():
+                  if line.startswith("SF:"):
+                      sf = line[len("SF:"):].replace("\\", "/")
+                      if sf.startswith(workspace):
+                          sf = sf[len(workspace):]
+                      line = "SF:" + sf
+                  out.append(line)
+              lcov.write_text("\n".join(out) + "\n", encoding="utf-8")
           PY
       - name: Verify runner target matches the leg's declared `covers`
         env:
@@ -385,7 +387,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-lcov-${{ matrix.label }}-${{ needs.coverage-prep.outputs.head }}
-          path: coverage/lcov.info
+          # Both feature profiles (`lcov-features-on.info` and
+          # `lcov-features-off.info`) are uploaded together for this leg.
+          path: coverage/lcov-*.info
           # Fail loudly: a missing LCOV would silently shrink the merged
           # denominator in the gate job.
           if-no-files-found: error
@@ -458,19 +462,23 @@ jobs:
           # subdirectory. Pass them all to --lcov; the checker unions DA lines
           # across targets (a line is instrumented if any target compiled it,
           # and covered if any target exercised it).
-          mapfile -t lcovs < <(find lcov-artifacts -name lcov.info | sort)
-          # Expect exactly one LCOV per matrix leg. Deriving the count from
-          # ci.yml's `covers:` keys (not a magic number) means adding a matrix
-          # leg automatically tightens this guard. Anything less than the full
-          # set would silently shrink the merged denominator and let a target's
-          # cfg-gated code pass the gate by absence — refuse partial data.
-          expected="$(grep -cE '^[[:space:]]+covers:' .github/workflows/ci.yml)"
+          mapfile -t lcovs < <(find lcov-artifacts -name 'lcov-*.info' | sort)
+          # Expect TWO LCOV files per matrix leg: one with non-default
+          # features enabled, one without. The product covers both
+          # `cfg(feature = "x")` and `cfg(not(feature = "x"))` branches.
+          # Deriving the count from ci.yml's `covers:` keys (not a magic
+          # number) means adding a matrix leg automatically tightens this
+          # guard. Anything less than the full set would silently shrink
+          # the merged denominator and let a target's cfg-gated code pass
+          # the gate by absence — refuse partial data.
+          legs="$(grep -cE '^[[:space:]]+covers:' .github/workflows/ci.yml)"
+          expected="$((legs * 2))"
           if [ "${#lcovs[@]}" -ne "$expected" ]; then
-            echo "expected $expected per-target LCOV file(s) (one per matrix " \
-                 "leg) but found ${#lcovs[@]} under lcov-artifacts/" >&2
+            echo "expected $expected LCOV file(s) ($legs leg(s) × 2 feature " \
+                 "profiles) but found ${#lcovs[@]} under lcov-artifacts/" >&2
             exit 1
           fi
-          echo "merging ${#lcovs[@]} per-target LCOV file(s):"
+          echo "merging ${#lcovs[@]} LCOV file(s):"
           printf '  %s\n' "${lcovs[@]}"
           python3 scripts/coverage_check.py \
             --lcov "${lcovs[@]}" \
@@ -493,7 +501,7 @@ jobs:
         with:
           name: coverage-${{ needs.coverage-prep.outputs.head }}
           path: |
-            lcov-artifacts/**/lcov.info
+            lcov-artifacts/**/lcov-*.info
             coverage/result.json
             coverage/result.md
           if-no-files-found: warn

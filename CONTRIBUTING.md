@@ -44,41 +44,50 @@ the changed-line gates. Two mechanisms close that gap:
   the DA records. When a new non-default feature is added, the contributor
   MUST add it to both the local command and the CI command in the same PR; a
   test (`test_ci_coverage_command_enumerates_every_non_default_feature`)
-  enforces it. We do not pass `--all-features` because the workspace test
-  suite is not `--all-features`-clean (see
-  [chaffra#51](https://github.com/laplaque/chaffra/issues/51)).
+  parses the literal `cargo llvm-cov --features` argument from the workflow
+  and the local command block in this file and compares it to the workspace
+  manifests — feature names mentioned only in comments do not satisfy the
+  check.
 - **Target `cfg` gates are covered by a per-target matrix.** Code reachable
-  only under a `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]`
-  attribute cannot be instrumented by any single build. The
-  `coverage-instrument` matrix in `.github/workflows/ci.yml` therefore runs
-  `cargo llvm-cov` once per target — linux+x86_64 (`ubuntu-latest`),
-  macos+aarch64 (`macos-latest`), windows+x86_64 (`windows-latest`) — and the
-  `coverage` job merges the per-target LCOV before the gate (a line is
-  instrumented if any target compiled it and covered if any target exercised
-  it). Target-`cfg`-gated trust-boundary code is thus enforced on the leg
-  whose target matches. Each matrix leg declares the target tokens it builds
-  in a `covers:` field; the test
-  `test_trust_boundary_target_cfg_is_covered_by_matrix` fails the build if a
-  trust-boundary file gates code on a target NO leg builds, forcing the matrix
-  to be widened (or the `cfg` split) in the same PR. This resolves
+  only under a target-`cfg` attribute cannot be instrumented by any single
+  build. The `coverage-instrument` matrix in `.github/workflows/ci.yml`
+  therefore runs `cargo llvm-cov` once per target the workspace actually
+  compiles on — `linux/x86_64` (`ubuntu-latest`) and `macos/aarch64`
+  (`macos-latest`) — and the `coverage` job merges the per-target LCOV before
+  the gate (a line is instrumented if any built target compiled it and
+  covered if any built target exercised it). Windows is intentionally NOT in
+  the matrix: `chaffra-autofix` uses `std::os::unix` unconditionally, so a
+  `windows-latest` leg would fail to compile and produce no LCOV (verified
+  empirically in chaffra#52). Target-`cfg`-gated trust-boundary code is thus
+  enforced on the leg whose target matches. The H4 guard
+  (`test_trust_boundary_target_cfg_is_covered_by_matrix`) structurally parses
+  every `#[cfg(...)]` predicate in every trust-boundary file (after expanding
+  the policy's fnmatch globs against the immutable head tree) against a
+  per-leg environment plus the explicit feature set, and fails closed on any
+  conditional form it cannot validate — so a trust-boundary addition gated on
+  `target_os = "windows"` (or any cfg the matrix cannot reach) fails the
+  build until the matrix is widened or the cfg removed. This resolves
   [chaffra#49](https://github.com/laplaque/chaffra/issues/49); there is no
   longer an inactive-`cfg` carve-out in the policy.
 
 #### Running coverage locally
 
-A local run uses a single LCOV from your own platform; CI runs the full
-per-target matrix and merges the results. The checker accepts one or more
-`--lcov` files and merges them, so you can reproduce the matrix locally by
-generating an LCOV per target you can build and passing them all.
+A local run instruments your host target only; CI runs the full per-target
+matrix (linux + macos) and merges the results. Each leg runs `cargo llvm-cov`
+twice — once with every non-default workspace feature enabled, once with
+none — so both `cfg(feature = "x")` and `cfg(not(feature = "x"))` branches
+reach LCOV. The checker accepts multiple `--lcov` files and merges them.
 
 ```bash
-# 1. Generate the same LCOV the CI matrix uses (your host target):
-cargo llvm-cov --workspace --features chaffra-telemetry/cloudwatch --lcov --output-path coverage/lcov.info
+# 1. Generate the same two LCOV profiles the CI matrix uses (your host target):
+cargo llvm-cov --workspace --features chaffra-telemetry/cloudwatch --lcov --output-path coverage/lcov-features-on.info
+cargo llvm-cov --workspace --lcov --output-path coverage/lcov-features-off.info
 
 # 2. Reproduce a PR comparison against an explicit base/head SHA pair. Pass
-#    multiple --lcov files (one per target) to mirror the CI merge:
+#    every per-profile LCOV (you can also add LCOVs from other targets you
+#    build locally) to mirror the CI merge:
 python3 scripts/coverage_check.py \
-    --lcov coverage/lcov.info \
+    --lcov coverage/lcov-features-on.info coverage/lcov-features-off.info \
     --policy .github/coverage-policy.toml \
     --base-sha "$(git merge-base origin/main HEAD)" \
     --head-sha "$(git rev-parse HEAD)" \

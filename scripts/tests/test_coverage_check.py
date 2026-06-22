@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1500,6 +1501,354 @@ class TestMainGitFailurePaths(unittest.TestCase):
         self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
 
 
+@unittest.skipUnless(shutil.which("git"), "git binary not available")
+class TestSourceLineCountsAndH7(RealGitTestCase):
+    """H7: a producer cannot fabricate covered evidence at DA coordinates that
+    do not exist in the immutable head_sha:path blob. `get_source_line_counts`
+    reads each blob via `git cat-file --batch` and `evaluate` rejects DA lines
+    that are line 0 or beyond the blob's range. Drives the helper's edge
+    cases plus the end-to-end refusal via the real-git harness."""
+
+    def test_empty_paths_returns_empty_dict(self) -> None:
+        self.build_fixture_repo()
+        self.assertEqual(
+            coverage_check.get_source_line_counts(self.tmp, "HEAD", []), {}
+        )
+
+    def test_missing_path_omitted(self) -> None:
+        # A `<spec> missing` header in `git cat-file --batch` output must not
+        # raise; the path is simply omitted from the result. Eligibility has
+        # already filtered out unknown paths in the production flow, so this
+        # is only reachable when something concurrent advances HEAD between
+        # ls-tree and cat-file — but we still handle it defensively.
+        self.build_fixture_repo()
+        counts = coverage_check.get_source_line_counts(
+            self.tmp, "HEAD", [self.REL, "does/not/exist.rs"]
+        )
+        self.assertIn(self.REL, counts)
+        self.assertNotIn("does/not/exist.rs", counts)
+
+    def test_blob_without_trailing_newline_counts_trailer(self) -> None:
+        # Two-line file with no final newline → 2, exercising the
+        # `if blob and not blob.endswith(b"\\n"): line_count += 1` branch.
+        # The integration fixture `config_head.rs` is exactly this shape, so
+        # the integration test path also covers it; this guards the line
+        # number against rot.
+        self.build_fixture_repo()
+        counts = coverage_check.get_source_line_counts(self.tmp, "HEAD", [self.REL])
+        self.assertEqual(counts[self.REL], 2)
+
+    # Table-driven: H7 rejects DA coordinates that the immutable head_sha:path
+    # blob cannot contain. Each row is (label, lcov_body) where the body is
+    # an SF block referencing `self.REL` (2 lines at HEAD).
+    _OUT_OF_RANGE_DA_CASES: tuple[tuple[str, str], ...] = (
+        ("DA line beyond blob range",
+         "DA:1,1\nDA:999,1\nLF:2\nLH:2\nend_of_record\n"),
+        ("DA line zero (LCOV is 1-based)",
+         "DA:0,1\nDA:1,1\nLF:2\nLH:2\nend_of_record\n"),
+        ("DA line exactly max+1",
+         "DA:1,1\nDA:3,1\nLF:2\nLH:2\nend_of_record\n"),
+    )
+
+    def test_out_of_range_da_lines_are_malformed(self) -> None:
+        base_sha, head_sha = self.build_fixture_repo()
+        for label, body in self._OUT_OF_RANGE_DA_CASES:
+            with self.subTest(case=label):
+                (self.tmp / "lcov.info").write_text(
+                    f"SF:{self.REL}\n{body}", encoding="utf-8"
+                )
+                rc = self.run_main(base_sha=base_sha, head_sha=head_sha)
+                self.assertEqual(rc, coverage_check.EXIT_MALFORMED, label)
+                detail = self.report()["detail"]
+                self.assertIn("outside source range", detail, label)
+
+    def test_unknown_head_sha_emits_missing_for_all_paths(self) -> None:
+        # `cat-file --batch` writes "<spec> missing\n" (and returns 0) for an
+        # unknown sha. The helper drops missing entries, returning an empty
+        # dict; the H7 gate then refuses to validate (max_line is None →
+        # MalformedInput in evaluate, exercised by
+        # TestH7MaxLineNoneInEvaluate below).
+        self.build_fixture_repo()
+        counts = coverage_check.get_source_line_counts(
+            self.tmp, "0" * 40, [self.REL]
+        )
+        self.assertEqual(counts, {})
+
+    def test_oserror_bad_cwd_surfaces_as_malformed(self) -> None:
+        # subprocess.run raises FileNotFoundError (subclass of OSError) when
+        # cwd does not exist — the helper must convert it to MalformedInput
+        # so a malformed-artifact path is produced rather than a Python
+        # traceback escaping main().
+        with self.assertRaises(coverage_check.MalformedInput) as ctx:
+            coverage_check.get_source_line_counts(
+                Path("/no/such/path"), "HEAD", ["a.rs"]
+            )
+        self.assertIn("cat-file", str(ctx.exception))
+
+    def test_nonzero_returncode_in_non_git_dir_is_malformed(self) -> None:
+        # cat-file in a real-but-not-a-git directory returns 128 with
+        # `fatal: not a git repository`. The helper must raise MalformedInput
+        # rather than silently returning empty counts (which would let an
+        # attacker present any DA coordinates as "outside no range").
+        tmp = Path(tempfile.mkdtemp(prefix="cov-nogit-"))
+        try:
+            with self.assertRaises(coverage_check.MalformedInput) as ctx:
+                coverage_check.get_source_line_counts(tmp, "HEAD", ["a.rs"])
+            self.assertIn("cat-file", str(ctx.exception))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_non_blob_spec_is_malformed(self) -> None:
+        # Passing a path that resolves to a tree (not a blob) is malformed:
+        # the parser cannot count source lines for a tree, and silently
+        # skipping it would let a future caller's offset accounting desync.
+        self.build_fixture_repo()
+        # `crates/chaffra-core/src` is the directory holding REL; the spec
+        # `<head>:crates/chaffra-core/src` resolves to a tree.
+        with self.assertRaises(coverage_check.MalformedInput) as ctx:
+            coverage_check.get_source_line_counts(
+                self.tmp, "HEAD", ["crates/chaffra-core/src"]
+            )
+        self.assertIn("blob header", str(ctx.exception))
+
+    def test_truncated_cat_file_output_is_malformed(self) -> None:
+        # Defensive: if cat-file's stdout is truncated mid-record (the kernel
+        # killed the subprocess between writes, a pipe broke), the helper
+        # must raise MalformedInput rather than misalign the parse. Real
+        # subprocess.run will never produce this, so the only deterministic
+        # way to exercise the branch is to stub the subprocess call. Stdlib
+        # unittest.mock keeps the test self-contained.
+        import unittest.mock as _mock
+        class _FakeProc:
+            returncode = 0
+            stdout = b"deadbeef blob"  # no terminating newline at all
+            stderr = b""
+        self.build_fixture_repo()
+        with _mock.patch.object(coverage_check.subprocess, "run", return_value=_FakeProc()):
+            with self.assertRaises(coverage_check.MalformedInput) as ctx:
+                coverage_check.get_source_line_counts(self.tmp, "HEAD", [self.REL])
+        self.assertIn("truncated", str(ctx.exception))
+
+    def test_blob_without_trailing_newline_counts_trailer_real_git(self) -> None:
+        # cargo-llvm-cov emits DA records up to the last source line, so a
+        # file without a final newline must count its trailing line. Commit
+        # a file ending mid-line and verify the count is 3, not 2.
+        self.build_fixture_repo()
+        no_trailer = self.tmp / "crates/chaffra-core/src/no_trailing_newline.rs"
+        no_trailer.write_text("a\nb\nc", encoding="utf-8")  # 3 lines, no \n at end
+        self.git("add", str(no_trailer.relative_to(self.tmp)))
+        self.git("commit", "-q", "-m", "no-trailer")
+        counts = coverage_check.get_source_line_counts(
+            self.tmp,
+            "HEAD",
+            ["crates/chaffra-core/src/no_trailing_newline.rs"],
+        )
+        self.assertEqual(counts["crates/chaffra-core/src/no_trailing_newline.rs"], 3)
+
+
+@unittest.skipUnless(shutil.which("git"), "git binary not available")
+class TestH7MaxLineNoneInEvaluate(RealGitTestCase):
+    """H7 also fires in `evaluate` when a tracked file is in eligible_lcov
+    but absent from source_line_counts — e.g. a race between ls-tree and
+    cat-file. The path is reachable end-to-end by supplying --repo-files
+    that lists a path NOT present in the head tree blob (so cat-file returns
+    `missing` for it), while the LCOV references that path."""
+
+    def test_eligible_path_missing_from_source_counts_is_malformed(self) -> None:
+        base_sha, head_sha = self.build_fixture_repo()
+        # repo-files claims `ghost.rs` is tracked; the head tree does not
+        # contain it. cat-file therefore returns missing for it, so
+        # source_line_counts has no entry for `ghost.rs` — but evaluate sees
+        # it in eligible_lcov and raises MalformedInput rather than silently
+        # accepting unbounded DA coordinates.
+        repo_files = self.tmp / "repo-files.txt"
+        repo_files.write_text("ghost.rs\n" + self.REL + "\n", encoding="utf-8")
+        (self.tmp / "lcov.info").write_text(
+            "SF:ghost.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
+            "SF:" + self.REL + "\nDA:1,1\nDA:2,1\nLF:2\nLH:2\nend_of_record\n",
+            encoding="utf-8",
+        )
+        rc = coverage_check.main(
+            [
+                "--lcov", str(self.tmp / "lcov.info"),
+                "--policy", str(self.tmp / "policy.toml"),
+                "--repo-root", str(self.tmp),
+                "--base-sha", base_sha,
+                "--head-sha", head_sha,
+                "--repo-files", str(repo_files),
+                "--json-out", str(self.tmp / "out.json"),
+                "--markdown-out", str(self.tmp / "out.md"),
+                "--mode", "pr",
+            ]
+        )
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        payload = json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+        self.assertIn("source line count missing", payload["detail"])
+        self.assertIn("ghost.rs", payload["detail"])
+
+
+class TestSkippedBlockInvariants(CheckerTestCase):
+    """M13: out-of-repo (SKIPPED) blocks must satisfy the same LF/LH
+    structural invariants the in-repo (ACTIVE) blocks do. A malformed summary
+    inside a skipped block was previously discarded silently."""
+
+    CASES: list[tuple[str, str]] = [
+        (
+            "skipped block missing LF/LH",
+            "SF:/etc/passwd\nDA:1,1\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "skipped block duplicate LF",
+            "SF:/etc/passwd\nDA:1,1\nLF:1\nLF:1\nLH:1\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "skipped block duplicate LH",
+            "SF:/etc/passwd\nDA:1,1\nLF:1\nLH:1\nLH:1\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "skipped block LH > LF",
+            "SF:/etc/passwd\nDA:1,1\nLF:1\nLH:5\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "skipped block LF below unique DA",
+            "SF:/etc/passwd\nDA:1,1\nDA:2,1\nLF:1\nLH:2\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "skipped block LF:0 with DA contradicts",
+            "SF:/etc/passwd\nLF:5\nLH:0\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+        (
+            "skipped block unseen-hits exceeds unseen-instrumented",
+            "SF:/etc/passwd\nDA:1,0\nLF:2\nLH:2\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+        ),
+    ]
+
+    def test_every_skipped_invariant_rejected(self) -> None:
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        for label, lcov in self.CASES:
+            with self.subTest(case=label):
+                rc, _r, _m = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+                self.assertEqual(
+                    rc, coverage_check.EXIT_MALFORMED,
+                    f"case {label!r}: expected EXIT_MALFORMED, got {rc}",
+                )
+
+    def test_skipped_lf0_lh0_no_da_accepted(self) -> None:
+        # Symmetric to the ACTIVE case: an SF with zero executable lines
+        # (LF:0/LH:0, no DA) is legitimate and the SKIPPED variant must NOT
+        # be rejected — it just contributes nothing.
+        lcov = (
+            "SF:/etc/passwd\nLF:0\nLH:0\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        # Only the valid in-repo block contributes (1/1 = 100%); overall passes.
+        self.assertEqual(rc, coverage_check.EXIT_OK, report.get("gates"))
+        self.assertEqual(report["overall"]["instrumented_lines"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Structural cfg parser support (H4a)
+# ---------------------------------------------------------------------------
+#
+# The H4a guard parses Rust `cfg(...)` predicates structurally rather than
+# scraping them with a regex (which had several documented blind spots:
+# nested predicates truncated at the first `)`, multi-line forms missed
+# entirely, `cfg_attr` ignored, only a subset of `target_*` predicates
+# recognized). The AST and helpers below are scoped to the test file because
+# the production checker never inspects source — only LCOV — so the parser
+# has no place in `coverage_check.py`.
+
+
+class _CfgParseError(Exception):
+    """Raised by the H4a structural parser; treated as a fail-closed offender."""
+
+
+class _CfgPred:
+    """Marker base class for parsed cfg predicates (no behavior of its own)."""
+
+
+class _CfgLiteral(_CfgPred):
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:  # pragma: no cover  (diagnostic only)
+        return f"Literal({self.name!r})"
+
+
+class _CfgEquals(_CfgPred):
+    __slots__ = ("key", "value")
+
+    def __init__(self, key: str, value: str) -> None:
+        self.key = key
+        self.value = value
+
+    def __repr__(self) -> str:  # pragma: no cover  (diagnostic only)
+        return f"Equals({self.key!r}, {self.value!r})"
+
+
+class _CfgNot(_CfgPred):
+    __slots__ = ("child",)
+
+    def __init__(self, child: _CfgPred) -> None:
+        self.child = child
+
+
+class _CfgAny(_CfgPred):
+    __slots__ = ("children",)
+
+    def __init__(self, children: list[_CfgPred]) -> None:
+        self.children = children
+
+
+class _CfgAll(_CfgPred):
+    __slots__ = ("children",)
+
+    def __init__(self, children: list[_CfgPred]) -> None:
+        self.children = children
+
+
+def _split_top_level_comma(text: str) -> tuple[str, str]:
+    """Split ``text`` at the FIRST top-level comma (outside string/paren).
+
+    Returns ``(before, after)``. If no top-level comma exists, ``after`` is
+    the empty string. Used by the `cfg_attr(P, attr)` extractor to isolate
+    the gating predicate P from the conditionally-applied attribute.
+    """
+    depth = 0
+    in_str = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return text[:i], text[i + 1 :]
+        i += 1
+    return text, ""
+
+
 class TestPolicyAndCiInvariants(unittest.TestCase):
     """Regression guards that keep the multi-target coverage mechanism honest
     (chaffra#49 / H4).
@@ -1518,37 +1867,55 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
     WORKSPACE = Path(__file__).resolve().parents[2]
 
     @staticmethod
-    def _read_policy_paths() -> set[str]:
-        policy_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "coverage-policy.toml"
-        text = policy_path.read_text(encoding="utf-8")
-        # Extract every literal path token from `patterns = [...]` blocks.
-        return set(re.findall(r'"((?:crates|docs)[^"]+\.rs)"', text))
+    def _expand_policy_paths() -> set[str]:
+        """Return the union of trust-boundary file paths the policy matches.
+
+        Reuses the checker's own policy loader and glob expansion against
+        the immutable tracked-file set at HEAD (``git ls-tree -r``), so a
+        policy entry written as a glob (``crates/.../backends/*.rs``) is
+        treated identically here and at gate time. Previously this helper
+        regex-scraped literal-looking path tokens out of the TOML, which
+        silently dropped any sanctioned glob.
+        """
+        workspace = TestPolicyAndCiInvariants.WORKSPACE
+        policy = coverage_check.load_policy(workspace / ".github" / "coverage-policy.toml")
+        tracked = coverage_check.list_tracked_rs_files(workspace, "HEAD")
+        matched, _ = coverage_check.expand_trust_boundary_files(policy, tracked)
+        return matched
 
     @staticmethod
-    def _matrix_legs() -> list[set[str]]:
-        """Per-leg sets of cfg target tokens the coverage matrix builds.
+    def _matrix_legs() -> list[dict[str, str]]:
+        """Per-leg dict of `cfg` target tokens the coverage matrix builds.
 
-        Parsed from the `covers: "..."` field on each `coverage-instrument`
-        matrix entry in ci.yml. Each returned set is one leg's tokens (e.g.
-        ``{"target_os=linux", "target_arch=x86_64"}``), so a multi-token cfg
-        can be checked for co-location on a single leg rather than merely
-        token-by-token across different legs.
+        Each leg returns ``{"target_os": ..., "target_arch": ...}`` parsed
+        from the `covers:` field on the matrix entry in ci.yml. The dict
+        shape (vs a flat set) lets the cfg evaluator look up `target_os`
+        and `target_arch` directly during predicate evaluation.
         """
         ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
         text = ci_path.read_text(encoding="utf-8")
-        return [
-            set(m.group(1).split())
-            for m in re.finditer(r'covers:\s*"([^"]*)"', text)
-        ]
+        legs: list[dict[str, str]] = []
+        for m in re.finditer(r'covers:\s*"([^"]*)"', text):
+            leg: dict[str, str] = {}
+            for tok in m.group(1).split():
+                if "=" not in tok:
+                    continue
+                k, v = tok.split("=", 1)
+                leg[k] = v
+            legs.append(leg)
+        return legs
 
     @staticmethod
-    def _parse_non_default_features() -> dict[str, list[str]]:
-        """Return {crate_name: [non_default_feature, ...]} for the workspace.
+    def _parse_workspace_features() -> dict[str, dict[str, set[str]]]:
+        """Return per-crate feature data: ``{crate: {"default": {...}, "all": {...}}}``.
 
-        Parses `[features]` tables in every `crates/*/Cargo.toml`. A feature
-        is non-default iff it is not in the `default = [...]` list.
+        The ``default`` set is the union of features cargo enables when no
+        ``--features`` is passed; ``all`` is every feature defined in the
+        ``[features]`` table including the implicit ``default``. Used by both
+        ``_parse_non_default_features`` (for H4b's expected-set computation)
+        and the H4a guard's per-leg active-feature derivation.
         """
-        out: dict[str, list[str]] = {}
+        out: dict[str, dict[str, set[str]]] = {}
         crates_dir = TestPolicyAndCiInvariants.WORKSPACE / "crates"
         for cargo_toml in sorted(crates_dir.glob("*/Cargo.toml")):
             data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
@@ -1557,105 +1924,541 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 continue
             crate_name = cargo_toml.parent.name
             default = set(features.get("default", []))
-            non_default = [k for k in features if k != "default" and k not in default]
-            if non_default:
-                out[crate_name] = sorted(non_default)
+            all_feats = {k for k in features if k != "default"}
+            out[crate_name] = {"default": default, "all": all_feats}
         return out
 
-    # Unix-family target_os values the project would build on a unix leg.
-    # `#[cfg(unix)]` code compiles on any of these, so it is covered if the
-    # matrix has a leg for any one of them.
-    _UNIX_TARGET_OS = frozenset({"linux", "macos"})
+    @classmethod
+    def _parse_non_default_features(cls) -> dict[str, list[str]]:
+        """Return {crate_name: [non_default_feature, ...]} for the workspace.
+
+        Thin wrapper around :func:`_parse_workspace_features` kept for the
+        H4b assertion's pre-existing shape.
+        """
+        out: dict[str, list[str]] = {}
+        for crate, feats in cls._parse_workspace_features().items():
+            non_default = sorted(feats["all"] - feats["default"])
+            if non_default:
+                out[crate] = non_default
+        return out
+
+    @staticmethod
+    def _file_crate(rel: str) -> str | None:
+        """Return the crate name for a `crates/<crate>/...` repo-relative path."""
+        parts = rel.split("/", 3)
+        if len(parts) >= 2 and parts[0] == "crates":
+            return parts[1]
+        return None
+
+    # Rust `cfg` shorthand → expanded predicate. `target_os = "linux"` /
+    # `target_os = "macos"` etc. each imply target_family = "unix"; Windows
+    # implies target_family = "windows". The mapping is used to compute the
+    # "active names" set for each matrix leg.
+    _UNIX_TARGET_OS = frozenset({"linux", "macos", "freebsd", "netbsd", "openbsd"})
+
+    # Atom names whose meaning is "always true under cargo test" — these are
+    # active in EVERY matrix-leg environment, so a trust-boundary cfg of, say,
+    # `#[cfg(test)]` is automatically covered.
+    _ALWAYS_ACTIVE = frozenset({"test", "debug_assertions"})
+
+    @classmethod
+    def _leg_env(
+        cls,
+        leg: dict[str, str],
+        ci_features: frozenset[str],
+        workspace_features: dict[str, dict[str, set[str]]],
+    ) -> dict[str, object]:
+        """Build a cfg-evaluation environment for one matrix leg.
+
+        Returns a dict with the scalar target keys, an ``active_features``
+        map ``{crate: frozenset[bare_feature_name]}`` of every feature
+        cargo activates for that crate under this leg (the crate's defaults
+        unioned with anything ``ci_features`` explicitly enables via
+        ``<crate>/<feature>``), and the ``names`` set of atom cfg names
+        active in this leg (``test``, ``debug_assertions``, ``unix`` /
+        ``windows``, etc.). Predicates the parser does not understand fail
+        closed at the caller.
+        """
+        target_os = leg.get("target_os", "")
+        target_arch = leg.get("target_arch", "")
+        if target_os in cls._UNIX_TARGET_OS:
+            family = "unix"
+        elif target_os == "windows":
+            family = "windows"
+        else:
+            family = ""
+        names = set(cls._ALWAYS_ACTIVE)
+        if family:
+            names.add(family)
+        active_features: dict[str, frozenset[str]] = {}
+        for crate, feats in workspace_features.items():
+            crate_active = set(feats["default"])
+            for spec in ci_features:
+                # `<crate>/<feature>` enables `<feature>` on `<crate>`.
+                if "/" in spec:
+                    c, name = spec.split("/", 1)
+                    if c == crate:
+                        crate_active.add(name)
+                else:
+                    # A bare feature without a `<crate>/` qualifier in a
+                    # workspace `--features` invocation is rejected by cargo,
+                    # so this branch represents a malformed CI command. The
+                    # H4b parser would already have rejected it; defensively
+                    # ignore here.
+                    continue
+            active_features[crate] = frozenset(crate_active)
+        return {
+            "target_os": target_os,
+            "target_arch": target_arch,
+            "target_family": family,
+            "active_features": active_features,
+            "names": frozenset(names),
+        }
+
+    # --- structural cfg parser ----------------------------------------------
+    #
+    # Replaces the regex scan that motivated H4a. Tokenizer + recursive
+    # descent parser handle inner cfg attributes, multi-line forms, `any` /
+    # `all` / `not` combinators, `target_*` predicates including
+    # `target_pointer_width` / `target_feature` / `target_endian` /
+    # `target_has_atomic`, the `feature` predicate, and atom shorthands like
+    # `unix` / `windows` / `test`. `cfg_attr(P, attr)` is recognized: if the
+    # nested attribute is itself a cfg gate (`cfg(...)`) or a `path = ...`
+    # selector, the cfg_attr is treated as a coverage gate; otherwise it is
+    # not (cfg_attr does not remove code from the build by itself). Any form
+    # the parser cannot structurally handle raises CfgParseError, which the
+    # caller treats as a fail-closed offender.
+
+    @staticmethod
+    def _tokenize_cfg(src: str) -> list[tuple[str, str]]:
+        tokens: list[tuple[str, str]] = []
+        i = 0
+        n = len(src)
+        while i < n:
+            ch = src[i]
+            if ch.isspace():
+                i += 1
+                continue
+            if ch in "(),=":
+                tokens.append((ch, ch))
+                i += 1
+                continue
+            if ch == '"':
+                j = src.find('"', i + 1)
+                if j < 0:
+                    raise _CfgParseError(f"unterminated string at offset {i}")
+                tokens.append(("STR", src[i + 1 : j]))
+                i = j + 1
+                continue
+            if ch.isalpha() or ch == "_":
+                j = i
+                while j < n and (src[j].isalnum() or src[j] == "_"):
+                    j += 1
+                tokens.append(("NAME", src[i:j]))
+                i = j
+                continue
+            raise _CfgParseError(f"unexpected character {ch!r} at offset {i}")
+        return tokens
+
+    @classmethod
+    def _parse_cfg(cls, src: str) -> "_CfgPred":
+        """Parse the inside of `cfg(...)` into an AST. Raises CfgParseError on
+        any form the grammar does not accept (so the H4a guard fails closed)."""
+        tokens = cls._tokenize_cfg(src)
+        pred, i = cls._parse_pred(tokens, 0)
+        if i != len(tokens):
+            raise _CfgParseError(
+                f"trailing tokens after predicate: {tokens[i:]!r}"
+            )
+        return pred
+
+    @classmethod
+    def _parse_pred(cls, tokens: list[tuple[str, str]], i: int) -> tuple["_CfgPred", int]:
+        if i >= len(tokens) or tokens[i][0] != "NAME":
+            raise _CfgParseError(f"expected NAME at token {i}, got {tokens[i:]!r}")
+        name = tokens[i][1]
+        i += 1
+        if i < len(tokens) and tokens[i][0] == "=":
+            i += 1
+            if i >= len(tokens) or tokens[i][0] != "STR":
+                raise _CfgParseError(f"expected STR after `=` at token {i}")
+            value = tokens[i][1]
+            return _CfgEquals(name, value), i + 1
+        if i < len(tokens) and tokens[i][0] == "(":
+            i += 1
+            args: list[_CfgPred] = []
+            while True:
+                if i < len(tokens) and tokens[i][0] == ")":
+                    break
+                arg, i = cls._parse_pred(tokens, i)
+                args.append(arg)
+                if i < len(tokens) and tokens[i][0] == ",":
+                    i += 1
+                    continue
+                if i < len(tokens) and tokens[i][0] == ")":
+                    break
+                raise _CfgParseError(
+                    f"expected `,` or `)` at token {i}, got {tokens[i:]!r}"
+                )
+            if i >= len(tokens) or tokens[i][0] != ")":
+                raise _CfgParseError(f"expected `)` at token {i}")
+            i += 1
+            if name == "any":
+                return _CfgAny(args), i
+            if name == "all":
+                return _CfgAll(args), i
+            if name == "not":
+                if len(args) != 1:
+                    raise _CfgParseError(
+                        f"`not` takes exactly 1 argument, got {len(args)}"
+                    )
+                return _CfgNot(args[0]), i
+            if name == "cfg":
+                # Inner cfg: `#[cfg(cfg(P))]` is unusual but legal. The inner
+                # predicate is the gate; lift it.
+                if len(args) != 1:
+                    raise _CfgParseError(
+                        f"`cfg` wrapper takes 1 argument, got {len(args)}"
+                    )
+                return args[0], i
+            raise _CfgParseError(f"unknown combinator {name!r}")
+        return _CfgLiteral(name), i
+
+    @classmethod
+    def _eval_cfg(
+        cls, pred: "_CfgPred", env: dict[str, object], crate: str | None
+    ) -> bool:
+        """Evaluate a parsed cfg predicate against a per-leg env + file crate.
+
+        ``crate`` is the workspace crate the file belongs to (e.g.
+        ``chaffra-telemetry``); needed to resolve `feature = "x"` against
+        the crate's own active feature set, since `--features <crate>/<x>`
+        only enables `x` on `<crate>`.
+        """
+        if isinstance(pred, _CfgEquals):
+            if pred.key == "feature":
+                if crate is None:
+                    # No crate context (path outside `crates/`) — cannot
+                    # resolve a feature reference; fail closed.
+                    return False
+                active_features = env["active_features"]
+                assert isinstance(active_features, dict)
+                return pred.value in active_features.get(crate, frozenset())
+            return env.get(pred.key) == pred.value
+        if isinstance(pred, _CfgLiteral):
+            names = env["names"]
+            assert isinstance(names, frozenset)
+            return pred.name in names
+        if isinstance(pred, _CfgNot):
+            return not cls._eval_cfg(pred.child, env, crate)
+        if isinstance(pred, _CfgAny):
+            return any(cls._eval_cfg(c, env, crate) for c in pred.children)
+        if isinstance(pred, _CfgAll):
+            return all(cls._eval_cfg(c, env, crate) for c in pred.children)
+        raise _CfgParseError(f"unknown predicate node {pred!r}")
+
+    @staticmethod
+    def _scan_cfg_attributes(source: str) -> list[str]:
+        """Find every `#[cfg(...)]` and `#[cfg_attr(P, inner)]` attribute.
+
+        Returns the inside of each attribute (between the outer `(` and `)`)
+        as a single string, suitable for :meth:`_parse_cfg`. Uses a
+        paren-balanced scan so nested parentheses cannot truncate the
+        capture the way the prior non-greedy regex did. `cfg_attr` returns
+        the FIRST argument (the gating predicate); a `cfg_attr(P, ...)`
+        applies its inner attribute only when P holds, so P is the effective
+        coverage gate.
+        """
+        # Look for both `#[cfg(` and `#[cfg_attr(` at top level only — we do
+        # not need to recurse into nested attributes since the parser handles
+        # combinator nesting.
+        out: list[str] = []
+        n = len(source)
+        i = 0
+        marker_cfg = "#[cfg("
+        marker_cfg_attr = "#[cfg_attr("
+        while i < n:
+            j_cfg = source.find(marker_cfg, i)
+            j_attr = source.find(marker_cfg_attr, i)
+            if j_cfg < 0 and j_attr < 0:
+                break
+            if j_attr >= 0 and (j_cfg < 0 or j_attr < j_cfg):
+                start = j_attr
+                inside_offset = len(marker_cfg_attr)
+                is_attr = True
+            else:
+                start = j_cfg
+                inside_offset = len(marker_cfg)
+                is_attr = False
+            # Scan forward to the matching close-paren, respecting strings.
+            depth = 1
+            k = start + inside_offset
+            in_str = False
+            while k < n and depth > 0:
+                ch = source[k]
+                if in_str:
+                    if ch == "\\" and k + 1 < n:
+                        k += 2
+                        continue
+                    if ch == '"':
+                        in_str = False
+                elif ch == '"':
+                    in_str = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if depth != 0:
+                # Unbalanced attribute → treat as fail-closed parse error so
+                # the caller flags this file.
+                raise _CfgParseError(
+                    f"unbalanced parens in attribute starting at offset {start}"
+                )
+            inside = source[start + inside_offset : k]
+            if is_attr:
+                # cfg_attr(P, ...) — take only P, the gating predicate.
+                pred_text, _ = _split_top_level_comma(inside)
+                out.append(pred_text)
+            else:
+                out.append(inside)
+            i = k + 1
+        return out
+
+    @classmethod
+    def _read_blobs(cls, paths: list[str]) -> dict[str, str]:
+        """Return ``{rel: blob_text}`` for ``paths`` at the immutable HEAD.
+
+        Batches every read through one ``git cat-file --batch`` invocation
+        — the same pattern the production helper :func:`get_source_line_counts`
+        uses — so the guard's cost stays O(1 git fork) regardless of how
+        many trust-boundary files the policy expands to, rather than the
+        O(N) shell-out the previous per-file ``git show HEAD:<rel>`` paid.
+        Paths missing from HEAD are omitted from the result.
+        """
+        if not paths:
+            return {}
+        request = "".join(f"HEAD:{p}\n" for p in paths).encode("utf-8")
+        try:
+            proc = subprocess.run(
+                ["git", "cat-file", "--batch"],
+                input=request,
+                cwd=cls.WORKSPACE,
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
+            return {}
+        if proc.returncode != 0:
+            return {}
+        out = proc.stdout
+        blobs: dict[str, str] = {}
+        pos = 0
+        for path in paths:
+            nl = out.find(b"\n", pos)
+            if nl < 0:
+                break
+            header = out[pos:nl].decode("utf-8", "replace")
+            pos = nl + 1
+            if header.endswith(" missing"):
+                continue
+            parts = header.split()
+            if len(parts) != 3 or parts[1] != "blob":
+                # Skip non-blob entries; this should not occur because the
+                # caller filters to .rs files, but the offset must still
+                # advance past the body so subsequent paths align.
+                size = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else 0
+                pos += size + 1
+                continue
+            size = int(parts[2])
+            blobs[path] = out[pos : pos + size].decode("utf-8", "replace")
+            pos += size + 1
+        return blobs
 
     def test_trust_boundary_target_cfg_is_covered_by_matrix(self) -> None:
-        # H4 closure guard: a trust-boundary file MAY gate code on a target
-        # `cfg`, but only on a target the coverage matrix builds — otherwise
-        # the gated code reaches no LCOV and the 100% gate cannot see it.
-        # For each `#[cfg(...)]` attribute we collect the target predicates it
-        # names and require the matrix to cover them. `target_X = "..."` tokens
-        # in one attribute must be covered by ONE leg together (conservative:
-        # an `any(...)` of two targets is treated like `all(...)`, so the worst
-        # case is a build failure saying "widen the matrix or split the cfg" —
-        # never a silently un-instrumented line). The `windows` / `unix`
-        # shorthands are also recognized, since they gate compilation just like
-        # the explicit `target_os` form.
+        """H4a (fail-closed structural variant): every `cfg` / `cfg_attr`
+        in a trust-boundary file must be satisfiable by some matrix leg.
+
+        Differs from the prior regex scan in three durable ways:
+
+          * **Policy globs are expanded.** Uses the checker's own glob
+            expansion against the immutable head tree, so a sanctioned
+            wildcard pattern is not silently dropped.
+          * **Structural cfg parsing.** Tokenizer + recursive-descent
+            parser handles any/all/not, inner cfg, `cfg_attr`, multi-line
+            forms, and every `target_*` predicate (not just os/arch).
+            Anything the grammar doesn't understand fails closed.
+          * **Immutable source.** Reads each file from ``git show HEAD:<rel>``
+            rather than the worktree, so dirty in-progress edits cannot
+            falsify the guard.
+        """
         legs = self._matrix_legs()
         self.assertTrue(legs, "no coverage matrix legs parsed from ci.yml")
-        covered_os = {
-            tok.split("=", 1)[1] for leg in legs for tok in leg if tok.startswith("target_os=")
-        }
-        tb_paths = self._read_policy_paths()
+        ci_features = self._extract_features_arg(
+            (self.WORKSPACE / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        workspace_features = self._parse_workspace_features()
+        # Each matrix leg runs `cargo llvm-cov` TWICE — once with the explicit
+        # `--features` set and once with no non-default features — so both
+        # `cfg(feature = "x")` and `cfg(not(feature = "x"))` branches reach
+        # LCOV. The H4a guard mirrors that by considering BOTH profiles per
+        # leg when evaluating whether the matrix can instrument a predicate.
+        leg_envs: list[dict[str, object]] = []
+        for leg in legs:
+            leg_envs.append(self._leg_env(leg, frozenset(ci_features), workspace_features))
+            leg_envs.append(self._leg_env(leg, frozenset(), workspace_features))
+
+        tb_paths = self._expand_policy_paths()
         self.assertTrue(tb_paths, "policy paths set is empty — parser regression")
-        # Match a whole `#[cfg(...)]` attribute. DOTALL so a rustfmt-wrapped
-        # multi-line cfg is scanned too; non-greedy so each attribute is
-        # captured minimally. `cfg_attr` is intentionally NOT matched: it
-        # conditionally applies an attribute, it does not remove code from the
-        # build, so it is never a coverage gap.
-        cfg_attr = re.compile(r"#\[cfg\((.*?)\)\]", re.DOTALL)
-        target_tok = re.compile(r'target_(os|arch|family|env|vendor)\s*=\s*"([^"]+)"')
-        # Bare platform shorthands appearing as a cfg predicate (a whole word
-        # not part of a `target_* = "..."` literal).
-        shorthand = re.compile(r"\b(windows|unix)\b")
-        offenders: list[tuple[str, list[str]]] = []
+        # Batched read of every trust-boundary blob in one `cat-file --batch`
+        # invocation — see `_read_blobs` for rationale.
+        blobs = self._read_blobs(sorted(tb_paths))
+
+        offenders: list[tuple[str, str]] = []
         for rel in sorted(tb_paths):
-            f = self.WORKSPACE / rel
-            if not f.is_file():
+            source = blobs.get(rel)
+            if source is None:
+                # The path resolved through the policy but is not present at
+                # HEAD — this is a separate fail mode (the unmatched-glob
+                # check would have already fired), but be defensive.
+                offenders.append((rel, "missing from head tree"))
                 continue
-            for attr in cfg_attr.findall(f.read_text(encoding="utf-8")):
-                tokens = {f"target_{k}={v}" for k, v in target_tok.findall(attr)}
-                unmet = sorted(tokens) if tokens and not any(tokens <= leg for leg in legs) else []
-                # Strip the explicit `target_* = "..."` literals before looking
-                # for bare shorthands so e.g. `target_os = "windows"` is not
-                # double-counted as the `windows` shorthand.
-                bare = target_tok.sub("", attr)
-                for word in set(shorthand.findall(bare)):
-                    if word == "windows" and "windows" not in covered_os:
-                        unmet.append("cfg(windows)")
-                    elif word == "unix" and not (self._UNIX_TARGET_OS & covered_os):
-                        unmet.append("cfg(unix)")
-                if unmet:
-                    offenders.append((rel, sorted(unmet)))
+            crate = self._file_crate(rel)
+            try:
+                attrs = self._scan_cfg_attributes(source)
+            except _CfgParseError as exc:
+                offenders.append((rel, f"attribute scan: {exc}"))
+                continue
+            for attr_src in attrs:
+                try:
+                    pred = self._parse_cfg(attr_src)
+                except _CfgParseError as exc:
+                    offenders.append((rel, f"cfg({attr_src}): {exc}"))
+                    continue
+                if not any(self._eval_cfg(pred, env, crate) for env in leg_envs):
+                    offenders.append((rel, f"cfg({attr_src}) not satisfied by any matrix leg"))
         self.assertEqual(
             offenders,
             [],
-            "trust-boundary file gates code on a target the coverage matrix "
-            "does not build, so its lines reach no LCOV. Add a matrix leg in "
-            ".github/workflows/ci.yml (with a matching `covers:` field) or "
-            f"split the cfg.\nOffenders: {offenders}",
+            "trust-boundary file contains a cfg the coverage matrix does not "
+            "build, or a conditional form this guard does not understand "
+            "(fail-closed). Either add a matrix leg in "
+            ".github/workflows/ci.yml (with a matching `covers:` field), "
+            "split the cfg, or remove the unsupported form.\n"
+            f"Offenders: {offenders}",
         )
 
+    @staticmethod
+    def _extract_features_arg(text: str) -> set[str]:
+        """Return the concrete set of features passed to the FIRST actual
+        `cargo llvm-cov` invocation in ``text``.
+
+        Comment lines (YAML `#`, Markdown prose, C-style `//`) are filtered
+        out before scanning so that a prose mention of the command in a
+        review comment or docstring cannot satisfy the check — the feature
+        argument must reach the literal invocation. The remaining lines are
+        joined across bash `\\`-newline continuations and tokenized with
+        ``shlex``; the value following ``--features`` (or ``--features=...``)
+        is then parsed as cargo's space- or comma-separated list. Returns
+        the empty set when no invocation is found so the caller can flag a
+        missing command rather than treating it as "no features required."
+        """
+        command_lines: list[str] = []
+        for raw in text.splitlines():
+            stripped = raw.lstrip()
+            if stripped.startswith("#") or stripped.startswith("//"):
+                continue
+            command_lines.append(raw)
+        joined = "\n".join(command_lines)
+        # `cargo llvm-cov --workspace` is the unique signature of the actual
+        # invocation in both ci.yml and CONTRIBUTING.md (prose mentions of
+        # the command in backticks lack `--workspace`), so this anchor is
+        # robust against backtick wrappings, headings, and other prose
+        # spellings of the bare command name.
+        start = joined.find("cargo llvm-cov --workspace")
+        if start < 0:
+            return set()
+        # Walk forward gluing bash `\`-newline continuations into one line.
+        invocation: list[str] = []
+        i = start
+        n = len(joined)
+        while i < n:
+            ch = joined[i]
+            if ch == "\n":
+                break
+            if ch == "\\" and i + 1 < n and joined[i + 1] == "\n":
+                invocation.append(" ")
+                i += 2
+                continue
+            invocation.append(ch)
+            i += 1
+        try:
+            tokens = shlex.split("".join(invocation))
+        except ValueError as exc:
+            raise AssertionError(
+                f"could not tokenize cargo invocation: {exc}\n"
+                f"line: {''.join(invocation)!r}"
+            ) from exc
+        features: set[str] = set()
+        j = 0
+        while j < len(tokens):
+            t = tokens[j]
+            if t == "--features" and j + 1 < len(tokens):
+                for f in tokens[j + 1].replace(",", " ").split():
+                    features.add(f)
+                j += 2
+                continue
+            if t.startswith("--features="):
+                for f in t.split("=", 1)[1].replace(",", " ").split():
+                    features.add(f)
+            j += 1
+        return features
+
     def test_ci_coverage_command_enumerates_every_non_default_feature(self) -> None:
-        # The H4 narrowing depends on `cargo llvm-cov` instrumenting
-        # every non-default feature in the workspace. CONTRIBUTING.md
-        # asks contributors to add new features to the CI command; this
-        # test enforces it.
+        # H4b: previously this test searched the entire YAML and Markdown
+        # texts for each `<crate>/<feature>` token, so a comment that
+        # mentioned the feature would satisfy the check even if the actual
+        # `--features` argument had dropped it. Here we parse the literal
+        # cargo invocation from both files, then compare the concrete
+        # feature set to the workspace manifests.
         non_default = self._parse_non_default_features()
+        expected = {
+            f"{crate}/{feat}"
+            for crate, feats in non_default.items()
+            for feat in feats
+        }
+
         ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
-        ci_text = ci_path.read_text(encoding="utf-8")
-        # Same check on the documented local command so docs and CI agree.
+        ci_features = self._extract_features_arg(ci_path.read_text(encoding="utf-8"))
+        self.assertTrue(
+            ci_features,
+            "could not find `cargo llvm-cov ... --features <set>` in ci.yml",
+        )
+
         contrib_path = TestPolicyAndCiInvariants.WORKSPACE / "CONTRIBUTING.md"
-        contrib_text = contrib_path.read_text(encoding="utf-8")
-        missing_ci: list[str] = []
-        missing_contrib: list[str] = []
-        for crate, features in non_default.items():
-            for feat in features:
-                token = f"{crate}/{feat}"
-                if token not in ci_text:
-                    missing_ci.append(token)
-                if token not in contrib_text:
-                    missing_contrib.append(token)
+        contrib_features = self._extract_features_arg(contrib_path.read_text(encoding="utf-8"))
+        self.assertTrue(
+            contrib_features,
+            "could not find `cargo llvm-cov ... --features <set>` in CONTRIBUTING.md",
+        )
+
         self.assertEqual(
-            missing_ci,
-            [],
-            f"non-default features missing from CI --features: {missing_ci}. "
-            "Add them to .github/workflows/ci.yml's `cargo llvm-cov` "
-            "invocation so their executable code reaches the LCOV DA records.",
+            ci_features,
+            expected,
+            f"CI `--features` argument {sorted(ci_features)} does not match the "
+            f"workspace non-default feature set {sorted(expected)}. Update "
+            ".github/workflows/ci.yml's `cargo llvm-cov` invocation in lockstep "
+            "with new non-default features so their executable code reaches LCOV.",
         )
         self.assertEqual(
-            missing_contrib,
-            [],
-            f"non-default features missing from CONTRIBUTING.md: {missing_contrib}. "
-            "Add them to the documented local command.",
+            contrib_features,
+            expected,
+            f"CONTRIBUTING.md local command `--features` argument "
+            f"{sorted(contrib_features)} does not match the workspace non-default "
+            f"feature set {sorted(expected)}. Update CONTRIBUTING.md alongside "
+            "ci.yml so the documented reproduction matches CI.",
         )
 
 

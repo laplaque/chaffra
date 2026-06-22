@@ -33,17 +33,23 @@ policy_version = 1
 # build, so it never reaches the LCOV DA records. Previously this was a
 # documented carve-out from the 100% trust-boundary gate. It is no longer.
 #
-# The `coverage-instrument` matrix in .github/workflows/ci.yml now runs
-# `cargo llvm-cov` once per target OS/arch (linux+x86_64, macos+aarch64,
-# windows+x86_64) and the `coverage` job merges the per-target LCOV before
-# the gate. A line is instrumented in the merge if ANY target compiled it, so
+# The `coverage-instrument` matrix in .github/workflows/ci.yml runs
+# `cargo llvm-cov` once per target the workspace actually compiles on —
+# `linux/x86_64` (`ubuntu-latest`) and `macos/aarch64` (`macos-latest`) — and
+# the `coverage` job merges the per-target LCOV before the gate. A line is
+# instrumented in the merge if ANY built target compiled it, so
 # target-`cfg`-gated trust-boundary code IS enforced on the leg whose target
-# matches. The only residual is a target the matrix does not build; the test
-# `test_trust_boundary_target_cfg_is_covered_by_matrix` in
-# scripts/tests/test_coverage_check.py fails the build if a trust-boundary
-# file gates code on such a target, forcing the matrix to be widened (or the
-# `covers` declaration updated) in the same PR. Feature-gated code is likewise
-# enforced: the coverage build enumerates every non-default feature by name.
+# matches. Windows is intentionally NOT in the matrix: `chaffra-autofix`
+# uses `std::os::unix` unconditionally, so a `windows-latest` leg would fail
+# to compile and produce no LCOV. The H4 guard
+# (`test_trust_boundary_target_cfg_is_covered_by_matrix`) structurally
+# parses every `#[cfg(...)]` predicate in a trust-boundary file against the
+# per-leg target environment plus the explicit feature set; a trust-boundary
+# file that gates code on `target_os = "windows"` (or any other target no leg
+# builds, or any cfg form the guard cannot structurally validate) fails the
+# build. Feature-gated code is likewise enforced: the coverage build
+# enumerates every non-default feature by name and the guard parses the
+# concrete `--features` argument from the workflow.
 #
 # Full detail: CONTRIBUTING.md > Coverage > Multi-target instrumentation.
 # ---------------------------------------------------------------------------
