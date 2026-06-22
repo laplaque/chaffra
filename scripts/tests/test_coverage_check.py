@@ -584,10 +584,39 @@ class TestMalformedPolicyTable(CheckerTestCase):
         """
     )
 
+    _BASE_THRESHOLDS = (
+        "[thresholds]\noverall = 85.0\naggregate_changed = 95.0\n"
+        "per_file_changed = 90.0\ntrust_boundary_changed = 100.0\n"
+    )
+
     def cases(self) -> list[tuple[str, str]]:
+        tb = '[[trust_boundaries]]\npurpose = "x"\npatterns = ["a.rs"]\n'
         return [
             ("threshold out of range", basic_policy({"overall": 150.0})),
             ("missing trust-boundary group", self._MISSING_TB_GROUP),
+            ("non-integer policy_version", 'policy_version = "x"\n' + self._BASE_THRESHOLDS + tb),
+            ("missing [thresholds] table", "policy_version = 1\n" + tb),
+            (
+                "non-numeric threshold value",
+                'policy_version = 1\n[thresholds]\noverall = "x"\n'
+                "aggregate_changed = 95.0\nper_file_changed = 90.0\n"
+                "trust_boundary_changed = 100.0\n" + tb,
+            ),
+            (
+                "trust_boundaries not an array",
+                "policy_version = 1\n" + self._BASE_THRESHOLDS + 'trust_boundaries = "x"\n',
+            ),
+            (
+                "trust_boundary entry missing purpose",
+                "policy_version = 1\n" + self._BASE_THRESHOLDS
+                + '[[trust_boundaries]]\npatterns = ["a.rs"]\n',
+            ),
+            (
+                "trust_boundary patterns not a list",
+                "policy_version = 1\n" + self._BASE_THRESHOLDS
+                + '[[trust_boundaries]]\npurpose = "x"\npatterns = "a.rs"\n',
+            ),
+            ("not valid TOML", "this is = = not toml [[[\n"),
         ]
 
     def test_every_invalid_policy_exits_2(self) -> None:
@@ -1007,6 +1036,121 @@ class TestExactHeadValidation(RealGitTestCase):
         # Detail must name the actual HEAD so the mismatch is auditable.
         self.assertIn(head_sha, payload["detail"])
         self.assertIn("MALFORMED INPUT", (self.tmp / "out.md").read_text(encoding="utf-8"))
+
+
+class TestMalformedDiffTable(CheckerTestCase):
+    """Table-driven: malformed unified-diff inputs exit 2."""
+
+    CASES: list[tuple[str, str]] = [
+        ("bad diff --git header", "diff --git garbage\n"),
+        ("bad +++ line", "diff --git a/x.rs b/x.rs\n+++ nonsense\n"),
+        (
+            "bad hunk header",
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ broken @@\n",
+        ),
+        (
+            "hunk before any file header",
+            "@@ -0,0 +1,2 @@\n",
+        ),
+    ]
+
+    def test_every_malformed_diff_exits_2(self) -> None:
+        lcov = lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        for name, diff in self.CASES:
+            with self.subTest(case=name):
+                rc, _, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+                self.assertEqual(rc, coverage_check.EXIT_MALFORMED, name)
+
+
+class TestMainIoErrorPaths(CheckerTestCase):
+    """The main() error branches each produce a failure artifact and exit 2.
+
+    These drive the production argument-handling paths (unreadable lcov,
+    policy, diff, repo-files) that the synthetic happy-path tests do not."""
+
+    def _argv(self, **overrides: str) -> list[str]:
+        lcov_path = write(self.tmp / "lcov.info", lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])]))
+        policy_path = write(self.tmp / "policy.toml", basic_policy())
+        diff_path = write(self.tmp / "diff.txt", diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]))
+        argv = {
+            "--lcov": str(lcov_path),
+            "--policy": str(policy_path),
+            "--diff": str(diff_path),
+            "--base-sha": "aaaa",
+            "--head-sha": "bbbb",
+            "--repo-files": str(self.repo_files_path),
+            "--repo-root": str(self.tmp),
+            "--json-out": str(self.tmp / "out.json"),
+            "--markdown-out": str(self.tmp / "out.md"),
+            "--mode": "pr",
+        }
+        argv.update(overrides)
+        out: list[str] = ["--allow-head-drift"]
+        for k, v in argv.items():
+            out += [k, v]
+        return out
+
+    def test_unreadable_lcov_exits_2(self) -> None:
+        rc = coverage_check.main(self._argv(**{"--lcov": str(self.tmp / "nope.info")}))
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        payload = json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+        self.assertIn("cannot read lcov", payload["detail"])
+
+    def test_unreadable_diff_exits_2(self) -> None:
+        rc = coverage_check.main(self._argv(**{"--diff": str(self.tmp / "nope.txt")}))
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("cannot read diff", json.loads(
+            (self.tmp / "out.json").read_text(encoding="utf-8"))["detail"])
+
+    def test_unreadable_policy_exits_2(self) -> None:
+        rc = coverage_check.main(self._argv(**{"--policy": str(self.tmp / "nope.toml")}))
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("invalid policy", json.loads(
+            (self.tmp / "out.json").read_text(encoding="utf-8"))["detail"])
+
+    def test_unreadable_repo_files_exits_2(self) -> None:
+        rc = coverage_check.main(self._argv(**{"--repo-files": str(self.tmp / "nope.txt")}))
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("cannot read repo-files", json.loads(
+            (self.tmp / "out.json").read_text(encoding="utf-8"))["detail"])
+
+
+class TestShortListTruncation(CheckerTestCase):
+    def test_more_than_20_uncovered_lines_truncated_in_output(self) -> None:
+        # 25 changed lines, all uncovered → _short_list truncates to 20 + "(+5)".
+        lines = [(n, 0) for n in range(10, 35)]
+        lcov = lcov_text(
+            [(NON_TRUST_BOUNDARY_FILE, lines), (BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])]
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(10, 25)])])
+        rc, _report, md = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertIn("(+5)", md)
+
+
+class TestGitAcquisitionFailures(RealGitTestCase):
+    """The production git paths (ls-tree, diff) raise MalformedInput → exit 2
+    with a failure artifact when run outside a usable repo state."""
+
+    def test_missing_repo_files_and_diff_uses_git_and_can_fail(self) -> None:
+        # A real repo, but request a base SHA that does not exist → the
+        # `git diff base...head` acquisition path raises MalformedInput.
+        base_sha, head_sha = self.build_fixture_repo()
+        rc = coverage_check.main(
+            [
+                "--lcov", str(self.tmp / "lcov.info"),
+                "--policy", str(self.tmp / "policy.toml"),
+                "--repo-root", str(self.tmp),
+                "--base-sha", "0" * 40,  # nonexistent base → git diff fails
+                "--head-sha", head_sha,
+                "--json-out", str(self.tmp / "out.json"),
+                "--markdown-out", str(self.tmp / "out.md"),
+                "--mode", "pr",
+                # No --diff and no --repo-files: exercise both git paths.
+            ]
+        )
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertEqual(self.report()["status"], "malformed_input")
 
 
 class TestPolicyAndCiInvariants(unittest.TestCase):

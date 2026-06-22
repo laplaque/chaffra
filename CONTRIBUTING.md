@@ -76,12 +76,26 @@ python3 scripts/coverage_check.py \
 
 # 3. Run the checker test suite:
 python3 -m unittest discover -s scripts/tests
+
+# 4. Enforce the checker's own coverage (the Rust `coverage` job is
+#    Rust-only and does not measure this Python tool):
+python3 -m pip install --no-deps "coverage==7.14.2"
+python3 -m coverage run --rcfile=scripts/tests/.coveragerc \
+    -m unittest discover -s scripts/tests
+python3 -m coverage report --rcfile=scripts/tests/.coveragerc   # fails under 95%
 ```
 
 The CI job uploads `coverage/lcov.info`, `coverage/result.json`, and
 `coverage/result.md` as the `coverage-<head-sha>` artifact on every run,
 including failed runs. The Markdown summary is also appended to the
 workflow's `GITHUB_STEP_SUMMARY`.
+
+**The checker is gated on its own coverage.** `scripts/coverage_check.py`
+is the security-critical code of this tooling, and the Rust `coverage` job
+does not measure Python, so the `coverage-checker-tests` job runs
+`coverage.py` over the checker and fails below **95%** (the same new-code
+threshold the Rust gate enforces). The configuration and threshold live in
+[`scripts/tests/.coveragerc`](scripts/tests/.coveragerc).
 
 ### Style
 

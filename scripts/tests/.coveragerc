@@ -1,0 +1,19 @@
+# Coverage configuration for the Python checker (scripts/coverage_check.py).
+# Used by the `coverage-checker-tests` CI job and locally:
+#   python3 -m coverage run --branch --include='*/coverage_check.py' \
+#       -m unittest discover -s scripts/tests
+#   python3 -m coverage report --fail-under=95 --show-missing
+[run]
+branch = true
+# Only the checker itself is gated; the test file is the harness.
+include = */coverage_check.py
+
+[report]
+# The `if __name__ == "__main__":` shim only runs when the script is invoked
+# as a process (it is, in CI; tests call main(argv) directly). Excluding the
+# guard line is the standard coverage.py idiom and is not an inline source
+# suppression.
+exclude_also =
+    if __name__ == .__main__.:
+show_missing = true
+fail_under = 95

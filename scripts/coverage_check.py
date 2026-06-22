@@ -85,12 +85,6 @@ class Policy:
     thresholds: Thresholds
     trust_boundaries: list[TrustBoundaryGroup]
 
-    def all_patterns(self) -> list[str]:
-        out: list[str] = []
-        for group in self.trust_boundaries:
-            out.extend(group.patterns)
-        return out
-
 
 @dataclass
 class FileCoverage:
