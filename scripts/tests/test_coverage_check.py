@@ -265,6 +265,91 @@ class TestNoExecutableLinesBlock(CheckerTestCase):
         self.assertEqual(report["overall"]["covered_lines"], 2)
 
 
+class TestMultiTargetMerge(CheckerTestCase):
+    """The multi-target matrix passes one LCOV per target OS/arch; the checker
+    merges them so a line is instrumented if ANY target compiled it and
+    covered if ANY target exercised it. This is what lets the single 100%
+    trust-boundary gate enforce coverage on `#[cfg(target_os = "...")]`-gated
+    code (chaffra#49 / H4): no one build instruments every target, but the
+    union of the per-target builds does."""
+
+    def run_check_multi(
+        self, *, lcovs: list[str], policy: str, diff: str
+    ) -> tuple[int, dict, str]:
+        policy_path = write(self.tmp / "coverage-policy.toml", policy)
+        diff_path = write(self.tmp / "diff.txt", diff)
+        json_out = self.tmp / "out.json"
+        md_out = self.tmp / "out.md"
+        lcov_args: list[str] = []
+        for i, text in enumerate(lcovs):
+            lcov_args += [str(write(self.tmp / f"lcov-{i}.info", text))]
+        rc = coverage_check.main(
+            [
+                "--lcov", *lcov_args,
+                "--policy", str(policy_path),
+                "--diff", str(diff_path),
+                "--base-sha", "aaaaaaa",
+                "--head-sha", "bbbbbbb",
+                "--json-out", str(json_out),
+                "--markdown-out", str(md_out),
+                "--repo-files", str(self.repo_files_path),
+                "--repo-root", str(self.tmp),
+                "--mode", "pr",
+                "--allow-head-drift",
+            ]
+        )
+        report = json.loads(json_out.read_text(encoding="utf-8")) if json_out.exists() else {}
+        md = md_out.read_text(encoding="utf-8") if md_out.exists() else ""
+        return rc, report, md
+
+    def test_line_covered_on_any_target_is_covered_in_merge(self) -> None:
+        # Target A instruments config.rs lines 1-3 with only line 1 covered;
+        # target B with only lines 2-3 covered. Each line is covered on some
+        # target, so the merged trust-boundary file is 100% — the gate passes.
+        # Exercises every merge branch: first-map insert (existing is None),
+        # same-path remerge with a smaller hit (line 1: 1 then 0 → max stays
+        # 1) and a larger hit (lines 2,3: 0 then 1 → max becomes 1).
+        target_a = lcov_text(
+            [
+                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 0), (3, 0)]),
+                (NON_TRUST_BOUNDARY_FILE, [(n, 1) for n in range(10, 20)]),
+            ]
+        )
+        target_b = lcov_text(
+            [(BASIC_TRUST_BOUNDARY_FILE, [(1, 0), (2, 1), (3, 1)])]
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 3)])])
+        rc, report, _ = self.run_check_multi(
+            lcovs=[target_a, target_b], policy=basic_policy(), diff=diff
+        )
+        self.assertEqual(rc, coverage_check.EXIT_OK, report.get("gates"))
+        tb = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertTrue(tb["passed"], tb)
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["changed_instrumented"], 3)
+        self.assertEqual(block["changed_covered"], 3)
+
+    def test_line_uncovered_on_all_targets_stays_uncovered(self) -> None:
+        # The union must not fabricate coverage: a changed line that is
+        # uncovered on every target stays uncovered, so the trust-boundary
+        # gate fails. Line 2 is 0 on both targets.
+        both = lcov_text(
+            [
+                (BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 0)]),
+                (NON_TRUST_BOUNDARY_FILE, [(n, 1) for n in range(10, 30)]),
+            ]
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 2)])])
+        rc, report, _ = self.run_check_multi(
+            lcovs=[both, both], policy=basic_policy(), diff=diff
+        )
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        tb = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertFalse(tb["passed"], tb)
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["uncovered_lines"], [2])
+
+
 class TestDeclaredSummaryCannotInflateOverall(CheckerTestCase):
     """Overall is the DA-coherent metric Σ(covered DA) / Σ(unique DA): both
     sides come from the concrete DA records, so a declared summary that
@@ -1201,6 +1286,23 @@ class TestSecurityBranchCoverage(CheckerTestCase):
         # is an eligible file (2 instrumented lines counted).
         self.assertEqual(report["overall"]["instrumented_lines"], 3)
 
+    def test_backslash_sf_path_normalizes_to_posix_key(self) -> None:
+        # cargo-llvm-cov on Windows emits SF paths with backslash separators.
+        # _normalize_path converts them so the block keys to the same
+        # repo-relative POSIX path the policy and diff use, rather than a
+        # single opaque filename that would be dropped.
+        lcov = (
+            "SF:crates\\chaffra-core\\src\\config.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:2\nend_of_record\n"
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 2)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        # The backslash path matched config.rs, so its 2 lines count and the
+        # trust-boundary changed lines are fully covered.
+        self.assertEqual(report["overall"]["instrumented_lines"], 2)
+        block = next(f for f in report["files"] if f["path"] == BASIC_TRUST_BOUNDARY_FILE)
+        self.assertEqual(block["changed_covered"], 2)
+        self.assertEqual(rc, coverage_check.EXIT_OK)
+
     def test_sf_path_with_null_byte_is_dropped(self) -> None:
         # A null byte makes Path.resolve() raise ValueError; _normalize_path
         # must return None (drop the block) rather than crash — the path
@@ -1399,12 +1501,19 @@ class TestMainGitFailurePaths(unittest.TestCase):
 
 
 class TestPolicyAndCiInvariants(unittest.TestCase):
-    """Regression guards for the documented residual (H4).
+    """Regression guards that keep the multi-target coverage mechanism honest
+    (chaffra#49 / H4).
 
-    The empty-scope inactive-target-`cfg` exception and the explicit
-    feature enumeration in CI are both documentation rules today. These
-    tests enforce them mechanically so a future PR cannot silently
-    erode the residual."""
+    H4 is closed by the `coverage-instrument` matrix: `cargo llvm-cov` runs
+    once per target OS/arch and the per-leg LCOV is merged before the gate, so
+    `#[cfg(target_os = "...")]`-gated trust-boundary code is instrumented on
+    the matching leg. Two invariants keep that real, enforced mechanically so
+    a future PR cannot silently re-open the gap:
+
+      * every target-`cfg` in a trust-boundary file must name a target the
+        matrix actually builds (else its code reaches no LCOV), and
+      * the coverage build must enumerate every non-default feature by name.
+    """
 
     WORKSPACE = Path(__file__).resolve().parents[2]
 
@@ -1414,6 +1523,23 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
         text = policy_path.read_text(encoding="utf-8")
         # Extract every literal path token from `patterns = [...]` blocks.
         return set(re.findall(r'"((?:crates|docs)[^"]+\.rs)"', text))
+
+    @staticmethod
+    def _matrix_legs() -> list[set[str]]:
+        """Per-leg sets of cfg target tokens the coverage matrix builds.
+
+        Parsed from the `covers: "..."` field on each `coverage-instrument`
+        matrix entry in ci.yml. Each returned set is one leg's tokens (e.g.
+        ``{"target_os=linux", "target_arch=x86_64"}``), so a multi-token cfg
+        can be checked for co-location on a single leg rather than merely
+        token-by-token across different legs.
+        """
+        ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
+        text = ci_path.read_text(encoding="utf-8")
+        return [
+            set(m.group(1).split())
+            for m in re.finditer(r'covers:\s*"([^"]*)"', text)
+        ]
 
     @staticmethod
     def _parse_non_default_features() -> dict[str, list[str]]:
@@ -1436,26 +1562,66 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 out[crate_name] = sorted(non_default)
         return out
 
-    def test_no_trust_boundary_file_has_target_cfg(self) -> None:
-        # The residual exception in coverage-policy.toml claims the
-        # inactive-target-`cfg` scope is empty today. Pin that claim.
+    # Unix-family target_os values the project would build on a unix leg.
+    # `#[cfg(unix)]` code compiles on any of these, so it is covered if the
+    # matrix has a leg for any one of them.
+    _UNIX_TARGET_OS = frozenset({"linux", "macos"})
+
+    def test_trust_boundary_target_cfg_is_covered_by_matrix(self) -> None:
+        # H4 closure guard: a trust-boundary file MAY gate code on a target
+        # `cfg`, but only on a target the coverage matrix builds — otherwise
+        # the gated code reaches no LCOV and the 100% gate cannot see it.
+        # For each `#[cfg(...)]` attribute we collect the target predicates it
+        # names and require the matrix to cover them. `target_X = "..."` tokens
+        # in one attribute must be covered by ONE leg together (conservative:
+        # an `any(...)` of two targets is treated like `all(...)`, so the worst
+        # case is a build failure saying "widen the matrix or split the cfg" —
+        # never a silently un-instrumented line). The `windows` / `unix`
+        # shorthands are also recognized, since they gate compilation just like
+        # the explicit `target_os` form.
+        legs = self._matrix_legs()
+        self.assertTrue(legs, "no coverage matrix legs parsed from ci.yml")
+        covered_os = {
+            tok.split("=", 1)[1] for leg in legs for tok in leg if tok.startswith("target_os=")
+        }
         tb_paths = self._read_policy_paths()
         self.assertTrue(tb_paths, "policy paths set is empty — parser regression")
-        target_cfg = re.compile(r"#\[cfg\(target_(?:os|arch|family|env|vendor)")
-        offenders: list[tuple[str, int, str]] = []
+        # Match a whole `#[cfg(...)]` attribute. DOTALL so a rustfmt-wrapped
+        # multi-line cfg is scanned too; non-greedy so each attribute is
+        # captured minimally. `cfg_attr` is intentionally NOT matched: it
+        # conditionally applies an attribute, it does not remove code from the
+        # build, so it is never a coverage gap.
+        cfg_attr = re.compile(r"#\[cfg\((.*?)\)\]", re.DOTALL)
+        target_tok = re.compile(r'target_(os|arch|family|env|vendor)\s*=\s*"([^"]+)"')
+        # Bare platform shorthands appearing as a cfg predicate (a whole word
+        # not part of a `target_* = "..."` literal).
+        shorthand = re.compile(r"\b(windows|unix)\b")
+        offenders: list[tuple[str, list[str]]] = []
         for rel in sorted(tb_paths):
             f = self.WORKSPACE / rel
             if not f.is_file():
                 continue
-            for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
-                if target_cfg.search(line):
-                    offenders.append((rel, i, line.strip()))
+            for attr in cfg_attr.findall(f.read_text(encoding="utf-8")):
+                tokens = {f"target_{k}={v}" for k, v in target_tok.findall(attr)}
+                unmet = sorted(tokens) if tokens and not any(tokens <= leg for leg in legs) else []
+                # Strip the explicit `target_* = "..."` literals before looking
+                # for bare shorthands so e.g. `target_os = "windows"` is not
+                # double-counted as the `windows` shorthand.
+                bare = target_tok.sub("", attr)
+                for word in set(shorthand.findall(bare)):
+                    if word == "windows" and "windows" not in covered_os:
+                        unmet.append("cfg(windows)")
+                    elif word == "unix" and not (self._UNIX_TARGET_OS & covered_os):
+                        unmet.append("cfg(unix)")
+                if unmet:
+                    offenders.append((rel, sorted(unmet)))
         self.assertEqual(
             offenders,
             [],
-            "trust-boundary file added a target-`cfg` gate; update "
-            "coverage-policy.toml's exception scope or close chaffra#49 "
-            f"before merging.\nOffenders: {offenders}",
+            "trust-boundary file gates code on a target the coverage matrix "
+            "does not build, so its lines reach no LCOV. Add a matrix leg in "
+            ".github/workflows/ci.yml (with a matching `covers:` field) or "
+            f"split the cfg.\nOffenders: {offenders}",
         )
 
     def test_ci_coverage_command_enumerates_every_non_default_feature(self) -> None:

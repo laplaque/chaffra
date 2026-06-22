@@ -26,39 +26,26 @@
 policy_version = 1
 
 # ---------------------------------------------------------------------------
-# Tracked exception (per the carve-out rules above: owner + removal issue
-# inline, does not lower any threshold).
+# Inactive target-`cfg` code (chaffra#49) — RESOLVED, no carve-out.
 #
-# Exception:   inactive-cfg-gated executable code on trust-boundary files.
-# Reason:      a `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]`
-#              attribute that is FALSE on the coverage runner cannot be
-#              instrumented in a single build, so the 100% trust-boundary
-#              gate cannot enforce coverage on a TB change whose only added
-#              lines are so gated. Feature-gated code is NOT in this
-#              exception: the coverage job now enumerates every non-default
-#              feature in the workspace by name (currently only
-#              `chaffra-telemetry/cloudwatch`); when a new non-default
-#              feature is added, the CI command MUST list it and reviewers
-#              MUST verify this in the PR.
-# Scope:       (1) only files matching `cfg(target_*)` attributes whose
-#              condition is false on `ubuntu-latest` x86_64;
-#              (2) does NOT lower any threshold;
-#              (3) reviewers must flag such changes in code review until
-#              the removal issue closes.
-# Affected:    no trust-boundary file currently contains a target-`cfg`
-#              gate (`grep -r 'cfg(target_' crates/chaffra-{cli,core,
-#              telemetry,plugin,mcp,parse,audit,impact,management}/src/`
-#              returns no matches). The exception is empty in scope today;
-#              it is retained as the documented mechanism for the next time
-#              such a gate is introduced.
-# Owner:       @iamclaude697 (accountable for tracking + removal).
-# Removal:     https://github.com/laplaque/chaffra/issues/49 (multi-target
-#              coverage matrix or tree-sitter classifier).
-# Adjacent:    https://github.com/laplaque/chaffra/issues/51 (test cwd race)
-#              must close before `--all-features` can replace the explicit
-#              enumeration in the coverage job.
-# Acceptance:  pending maintainer (@laplaque) sign-off on this PR.
-# Full detail: CONTRIBUTING.md > Coverage > Documented residual.
+# A `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]` attribute that
+# is false on a single coverage runner removes the gated code from that
+# build, so it never reaches the LCOV DA records. Previously this was a
+# documented carve-out from the 100% trust-boundary gate. It is no longer.
+#
+# The `coverage-instrument` matrix in .github/workflows/ci.yml now runs
+# `cargo llvm-cov` once per target OS/arch (linux+x86_64, macos+aarch64,
+# windows+x86_64) and the `coverage` job merges the per-target LCOV before
+# the gate. A line is instrumented in the merge if ANY target compiled it, so
+# target-`cfg`-gated trust-boundary code IS enforced on the leg whose target
+# matches. The only residual is a target the matrix does not build; the test
+# `test_trust_boundary_target_cfg_is_covered_by_matrix` in
+# scripts/tests/test_coverage_check.py fails the build if a trust-boundary
+# file gates code on such a target, forcing the matrix to be widened (or the
+# `covers` declaration updated) in the same PR. Feature-gated code is likewise
+# enforced: the coverage build enumerates every non-default feature by name.
+#
+# Full detail: CONTRIBUTING.md > Coverage > Multi-target instrumentation.
 # ---------------------------------------------------------------------------
 
 [thresholds]

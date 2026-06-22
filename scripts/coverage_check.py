@@ -430,6 +430,14 @@ def _normalize_path(path: str, repo_root: Path) -> str | None:
     cannot contribute to overall or changed-line gates.
     """
 
+    # cargo-llvm-cov on Windows emits SF paths with backslash separators. The
+    # CI matrix relativizes each leg's LCOV on its own runner before upload,
+    # but normalize here too so a backslash relative path (e.g. a hand-written
+    # fixture or a producer the workflow did not pre-clean) still keys to the
+    # same repository-relative POSIX path rather than a single opaque
+    # filename. Backslash is not a legal path separator on POSIX and does not
+    # occur in the repository's tracked names, so this rewrite is loss-free.
+    path = path.replace("\\", "/")
     p = Path(path)
     repo_real = repo_root.resolve()
     if p.is_absolute():
@@ -447,6 +455,57 @@ def _normalize_path(path: str, repo_root: Path) -> str | None:
     except (OSError, ValueError):
         return None
     return rel.as_posix()
+
+
+def merge_lcov(maps: list[dict[str, FileCoverage]]) -> dict[str, FileCoverage]:
+    """Merge per-target LCOV maps into one with union/best-hit semantics.
+
+    The multi-target coverage matrix runs ``cargo llvm-cov`` once per runner
+    OS, so trust-boundary code gated behind ``#[cfg(target_os = "windows")]``
+    is instrumented only in the Windows map, code behind
+    ``#[cfg(target_os = "linux")]`` only in the Linux map, and so on. Merging
+    is what lets the single 100% trust-boundary gate see all of it: no single
+    build can instrument every target's code, but the union of the per-target
+    builds can.
+
+    Merge rules, applied per repository-relative path:
+
+      * **Instrumented lines are unioned.** A line present in any target's DA
+        records is instrumented in the merge — that is the whole point: a
+        line only one target compiles is still an executable line.
+      * **A line is covered if it is covered on any target** (merged hit count
+        is the max across targets). A line hit on Linux but compiled-and-cold
+        on macOS counts as covered, which matches the gate's question — "is
+        this changed line exercised by *some* part of the test suite?" — not
+        "is it exercised on every OS".
+
+    Within a single map, :func:`parse_lcov` has already rejected a duplicate
+    SF block. Across maps the same path is the merge point, not a collision.
+    A single-element ``maps`` list returns the equivalent of that one map, so
+    the non-matrix (single ``--lcov``) caller is unaffected.
+
+    The merged ``declared_lf`` / ``declared_lh`` are recomputed from the
+    unioned DA records (they are summaries of the merged detail, not of any
+    one producer's run). Downstream arithmetic reads the DA records directly
+    via :meth:`FileCoverage.instrumented_lines` / ``covered_lines`` and never
+    the declared summary, so this only keeps the dataclass self-consistent.
+    """
+
+    merged: dict[str, FileCoverage] = {}
+    for one in maps:
+        for path, fc in one.items():
+            existing = merged.get(path)
+            if existing is None:
+                # Fresh FileCoverage so the caller's objects are never mutated.
+                existing = FileCoverage(path=path)
+                merged[path] = existing
+            for ln, hits in fc.lines.items():
+                prev = existing.lines.get(ln)
+                existing.lines[ln] = hits if prev is None else max(prev, hits)
+    for fc in merged.values():
+        fc.declared_lf = len(fc.lines)
+        fc.declared_lh = len(fc.covered_lines())
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +1050,19 @@ def _short_list(items: list[int], limit: int = 20) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="chaffra coverage checker")
-    parser.add_argument("--lcov", required=True, help="Path to lcov.info")
+    parser.add_argument(
+        "--lcov",
+        required=True,
+        nargs="+",
+        metavar="LCOV",
+        help=(
+            "Path(s) to lcov.info. Pass one file for a single-target run, or "
+            "several (one per target OS/arch from the coverage matrix) to merge "
+            "them: a line is instrumented if any target instrumented it and "
+            "covered if any target covered it. Merging is how inactive-target "
+            "cfg code reaches the trust-boundary gate."
+        ),
+    )
     parser.add_argument("--policy", required=True, help="Path to coverage-policy.toml")
     parser.add_argument("--repo-root", default=".", help="Repository root (default: cwd)")
     parser.add_argument("--base-sha", required=True, help="Base commit SHA")
@@ -1109,20 +1180,22 @@ def main(argv: list[str] | None = None) -> int:
                 f"worktree HEAD ({current_head}) != --head-sha ({args.head_sha}); "
                 "classification would read the wrong tree"
             )
-    try:
-        lcov_text = Path(args.lcov).read_text(encoding="utf-8")
-    except OSError as exc:
-        return fail_malformed(f"cannot read lcov: {exc}")
+    lcov_maps: list[dict[str, FileCoverage]] = []
+    for lcov_path in args.lcov:
+        try:
+            lcov_text = Path(lcov_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            return fail_malformed(f"cannot read lcov {lcov_path}: {exc}")
+        try:
+            lcov_maps.append(parse_lcov(lcov_text, repo_root))
+        except MalformedInput as exc:
+            return fail_malformed(f"malformed lcov {lcov_path}: {exc}")
+    lcov = merge_lcov(lcov_maps)
 
     try:
         policy = load_policy(Path(args.policy))
     except InvalidPolicy as exc:
         return fail_malformed(f"invalid policy: {exc}")
-
-    try:
-        lcov = parse_lcov(lcov_text, repo_root)
-    except MalformedInput as exc:
-        return fail_malformed(f"malformed lcov: {exc}")
 
     if args.diff is not None:
         try:

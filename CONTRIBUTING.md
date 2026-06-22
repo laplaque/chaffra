@@ -32,39 +32,51 @@ a configured glob matches no current file. Carve-outs must never lower a
 threshold; document an owner and removal issue inline if a temporary
 exclusion is unavoidable.
 
-#### Documented residual
+#### Multi-target instrumentation
 
 The checker treats the LCOV DA records as the authority on which changed lines
 are executable, so code the coverage build does not compile is not enforced by
-the changed-line gates. To minimise this gap:
+the changed-line gates. Two mechanisms close that gap:
 
-- **Feature gates are enumerated by name in CI.** The `coverage` job passes
+- **Feature gates are enumerated by name in CI.** The coverage build passes
   `--features` listing every non-default feature in the workspace (today only
   `chaffra-telemetry/cloudwatch`) so feature-gated executable code does reach
   the DA records. When a new non-default feature is added, the contributor
-  MUST add it to both the local command and the CI command in the same PR; the
-  reviewer verifies it. We do not pass `--all-features` because the workspace
-  test suite is not `--all-features`-clean (see
+  MUST add it to both the local command and the CI command in the same PR; a
+  test (`test_ci_coverage_command_enumerates_every_non_default_feature`)
+  enforces it. We do not pass `--all-features` because the workspace test
+  suite is not `--all-features`-clean (see
   [chaffra#51](https://github.com/laplaque/chaffra/issues/51)).
-- **Inactive target `cfg` is the one residual.** Code reachable only under a
-  non-active `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]` on
-  the coverage runner cannot be instrumented by any single build. No
-  trust-boundary file currently contains such a gate; the exception in
-  `.github/coverage-policy.toml` is the documented mechanism for the next
-  time one is introduced. Tracked in
-  [chaffra#49](https://github.com/laplaque/chaffra/issues/49), which proposes
-  a multi-target coverage matrix or a tree-sitter-rust classifier.
-
-Reviewers must flag any trust-boundary change whose only added lines are
-gated by an inactive target `cfg`, until #49 closes.
+- **Target `cfg` gates are covered by a per-target matrix.** Code reachable
+  only under a `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]`
+  attribute cannot be instrumented by any single build. The
+  `coverage-instrument` matrix in `.github/workflows/ci.yml` therefore runs
+  `cargo llvm-cov` once per target — linux+x86_64 (`ubuntu-latest`),
+  macos+aarch64 (`macos-latest`), windows+x86_64 (`windows-latest`) — and the
+  `coverage` job merges the per-target LCOV before the gate (a line is
+  instrumented if any target compiled it and covered if any target exercised
+  it). Target-`cfg`-gated trust-boundary code is thus enforced on the leg
+  whose target matches. Each matrix leg declares the target tokens it builds
+  in a `covers:` field; the test
+  `test_trust_boundary_target_cfg_is_covered_by_matrix` fails the build if a
+  trust-boundary file gates code on a target NO leg builds, forcing the matrix
+  to be widened (or the `cfg` split) in the same PR. This resolves
+  [chaffra#49](https://github.com/laplaque/chaffra/issues/49); there is no
+  longer an inactive-`cfg` carve-out in the policy.
 
 #### Running coverage locally
 
+A local run uses a single LCOV from your own platform; CI runs the full
+per-target matrix and merges the results. The checker accepts one or more
+`--lcov` files and merges them, so you can reproduce the matrix locally by
+generating an LCOV per target you can build and passing them all.
+
 ```bash
-# 1. Generate the same LCOV file the CI job uses:
+# 1. Generate the same LCOV the CI matrix uses (your host target):
 cargo llvm-cov --workspace --features chaffra-telemetry/cloudwatch --lcov --output-path coverage/lcov.info
 
-# 2. Reproduce a PR comparison against an explicit base/head SHA pair:
+# 2. Reproduce a PR comparison against an explicit base/head SHA pair. Pass
+#    multiple --lcov files (one per target) to mirror the CI merge:
 python3 scripts/coverage_check.py \
     --lcov coverage/lcov.info \
     --policy .github/coverage-policy.toml \
@@ -82,13 +94,13 @@ python3 -m unittest discover -s scripts/tests
 python3 -m pip install --no-deps "coverage==7.14.2"
 python3 -m coverage run --rcfile=scripts/tests/.coveragerc \
     -m unittest discover -s scripts/tests
-python3 -m coverage report --rcfile=scripts/tests/.coveragerc   # fails under 95%
+python3 -m coverage report --rcfile=scripts/tests/.coveragerc   # fails under 100%
 ```
 
-The CI job uploads `coverage/lcov.info`, `coverage/result.json`, and
-`coverage/result.md` as the `coverage-<head-sha>` artifact on every run,
-including failed runs. The Markdown summary is also appended to the
-workflow's `GITHUB_STEP_SUMMARY`.
+The `coverage` job uploads each target's `lcov.info`, plus `result.json` and
+`result.md`, as the `coverage-<head-sha>` artifact on every run, including
+failed runs. The Markdown summary is also appended to the workflow's
+`GITHUB_STEP_SUMMARY`.
 
 **The checker is gated on its own coverage at 100%.**
 `scripts/coverage_check.py` is security/validation/trust-boundary code in
