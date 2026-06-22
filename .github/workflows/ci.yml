@@ -130,11 +130,12 @@ jobs:
         # Pinned exact version for reproducibility; coverage.py has no runtime
         # deps so --no-deps keeps the install closed.
         run: python3 -m pip install --no-deps "coverage==7.14.2"
-      - name: Enforce checker self-coverage (>=95%, matching the delta gate)
+      - name: Enforce checker self-coverage (100%, trust-boundary standard)
         # The Rust `coverage` job below does not measure this Python checker
-        # (it is Rust-only). Gate the checker's own coverage here so the tool
-        # that enforces coverage is itself held to the project's 95% new-code
-        # standard. Config + threshold live in scripts/tests/.coveragerc.
+        # (it is Rust-only). The checker is security/validation/trust-boundary
+        # code in its entirety, so it is held to the policy's 100% rule, not
+        # the 95% delta rule. Config + threshold live in
+        # scripts/tests/.coveragerc (fail_under = 100, line + branch).
         run: |
           set -euo pipefail
           python3 -m coverage run --rcfile=scripts/tests/.coveragerc \

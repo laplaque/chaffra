@@ -16,4 +16,7 @@ include = */coverage_check.py
 exclude_also =
     if __name__ == .__main__.:
 show_missing = true
-fail_under = 95
+# 100%, not 95%: the checker is security/validation/trust-boundary code in
+# its entirety, so the policy's 100% trust-boundary rule applies to it — not
+# the 95% delta rule that covers ordinary new code.
+fail_under = 100

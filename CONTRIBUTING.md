@@ -90,11 +90,13 @@ The CI job uploads `coverage/lcov.info`, `coverage/result.json`, and
 including failed runs. The Markdown summary is also appended to the
 workflow's `GITHUB_STEP_SUMMARY`.
 
-**The checker is gated on its own coverage.** `scripts/coverage_check.py`
-is the security-critical code of this tooling, and the Rust `coverage` job
-does not measure Python, so the `coverage-checker-tests` job runs
-`coverage.py` over the checker and fails below **95%** (the same new-code
-threshold the Rust gate enforces). The configuration and threshold live in
+**The checker is gated on its own coverage at 100%.**
+`scripts/coverage_check.py` is security/validation/trust-boundary code in
+its entirety, so the policy's **100%** trust-boundary rule applies to it —
+not the 95% delta rule for ordinary new code. The Rust `coverage` job does
+not measure Python, so the `coverage-checker-tests` job runs `coverage.py`
+(line + branch) over the checker and fails below 100%. The configuration
+and threshold live in
 [`scripts/tests/.coveragerc`](scripts/tests/.coveragerc).
 
 ### Style

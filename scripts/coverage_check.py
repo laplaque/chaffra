@@ -723,9 +723,9 @@ def _trust_boundary_gate(
         if fr.changed_instrumented == 0:
             # Only non-instrumented (brace/decl/comment) lines changed.
             continue
+        # changed_instrumented > 0 here, so fr.percent is never None.
         percent = fr.percent
-        if percent is None:
-            continue
+        assert percent is not None
         if worst is None or percent < worst:
             worst = percent
         if percent < thresholds.trust_boundary_changed:

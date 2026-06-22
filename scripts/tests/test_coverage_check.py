@@ -1153,6 +1153,251 @@ class TestGitAcquisitionFailures(RealGitTestCase):
         self.assertEqual(self.report()["status"], "malformed_input")
 
 
+class TestSecurityBranchCoverage(CheckerTestCase):
+    """Drives the remaining input-validation / path-safety / integrity
+    branches of the checker so its security-relevant code reaches 100%.
+    Every case uses a real input (no mocks)."""
+
+    def test_blank_line_in_lcov_is_skipped(self) -> None:
+        lcov = (
+            "\n\nSF:crates/chaffra-core/src/config.rs\n\nDA:1,1\n\n"
+            "LF:1\nLH:1\nend_of_record\n\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, _r, _m = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        # config.rs fully covered (1/1); overall passes, no TB change.
+        self.assertEqual(rc, coverage_check.EXIT_OK)
+
+    def test_end_of_record_outside_sf_block_is_malformed(self) -> None:
+        rc, report, _ = self.run_check(
+            lcov="end_of_record\n", policy=basic_policy(),
+            diff=diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]),
+        )
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("end_of_record outside SF block", report["detail"])
+
+    def test_lf_below_unique_da_lines_is_malformed(self) -> None:
+        # LF=1 < 2 unique DA lines, with LH=1<=LF and LH>=unique hit (1) so
+        # the LF<unique-DA branch is the one that fires.
+        lcov = "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nDA:2,0\nLF:1\nLH:1\nend_of_record\n"
+        rc, report, _ = self.run_check(
+            lcov=lcov, policy=basic_policy(),
+            diff=diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]),
+        )
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("below", report["detail"])
+
+    def test_absolute_in_repo_sf_path_is_normalized(self) -> None:
+        # An absolute SF path inside repo_root exercises the absolute-path
+        # branch of _normalize_path (resolve + relative_to + as_posix).
+        abs_path = str(self.tmp / NON_TRUST_BOUNDARY_FILE)
+        lcov = (
+            f"SF:{abs_path}\nDA:1,1\nDA:2,0\nLF:2\nLH:1\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(10, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        # The absolute path normalized to the repo-relative key, so main.rs
+        # is an eligible file (2 instrumented lines counted).
+        self.assertEqual(report["overall"]["instrumented_lines"], 3)
+
+    def test_sf_path_with_null_byte_is_dropped(self) -> None:
+        # A null byte makes Path.resolve() raise ValueError; _normalize_path
+        # must return None (drop the block) rather than crash — the path
+        # below also keeps a valid block so total_lf != 0.
+        lcov = (
+            "SF:crates/chaffra-core/src/bad\x00name.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
+            "SF:crates/chaffra-core/src/config.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        # Only the valid config.rs block contributes.
+        self.assertEqual(report["overall"]["instrumented_lines"], 1)
+
+    # NB: top-level keys (`trust_boundaries`) must precede the [thresholds]
+    # table header, else TOML scopes them inside that table.
+    def test_trust_boundaries_not_an_array_is_invalid(self) -> None:
+        policy = (
+            'policy_version = 1\ntrust_boundaries = "x"\n'
+            "[thresholds]\noverall = 85.0\naggregate_changed = 95.0\n"
+            "per_file_changed = 90.0\ntrust_boundary_changed = 100.0\n"
+        )
+        rc, report, _ = self.run_check(
+            lcov=lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])]),
+            policy=policy, diff=diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]),
+        )
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("must be an array", report["detail"])
+
+    def test_trust_boundary_entry_not_a_table_is_invalid(self) -> None:
+        policy = (
+            'policy_version = 1\ntrust_boundaries = ["x"]\n'
+            "[thresholds]\noverall = 85.0\naggregate_changed = 95.0\n"
+            "per_file_changed = 90.0\ntrust_boundary_changed = 100.0\n"
+        )
+        rc, report, _ = self.run_check(
+            lcov=lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])]),
+            policy=policy, diff=diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]),
+        )
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        self.assertIn("must be a table", report["detail"])
+
+
+class TestBranchCompleteness(CheckerTestCase):
+    """Closes the remaining benign fall-through branches so the checker
+    reaches 100% line+branch coverage (it is security/validation code, held
+    to the 100% trust-boundary standard, not the 95% delta standard)."""
+
+    def test_ignored_lcov_records_fall_through(self) -> None:
+        # FN/FNDA/BRDA records inside an active block are ignored — exercise
+        # the "other record" fall-through that real cargo-llvm-cov emits.
+        lcov = (
+            "SF:crates/chaffra-core/src/config.rs\n"
+            "FN:1,some_fn\nFNDA:1,some_fn\nBRDA:1,0,0,1\n"
+            "DA:1,1\nLF:1\nLH:1\nend_of_record\n"
+        )
+        diff = diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, _r, _m = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertEqual(rc, coverage_check.EXIT_OK)
+
+    def test_empty_rename_target_falls_through(self) -> None:
+        # `rename to ` with no target does not match the rename regex; the
+        # parser must fall through without recording a rename.
+        diff = (
+            "diff --git a/old.rs b/new.rs\n"
+            "rename from old.rs\n"
+            "rename to \n"  # empty target → no regex match
+            "diff --git a/crates/chaffra-cli/src/main.rs b/crates/chaffra-cli/src/main.rs\n"
+            "--- a/crates/chaffra-cli/src/main.rs\n"
+            "+++ b/crates/chaffra-cli/src/main.rs\n"
+            "@@ -0,0 +1 @@\n"
+        )
+        lcov = lcov_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)]), (BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])])
+        rc, _r, _m = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertEqual(rc, coverage_check.EXIT_OK)
+
+    def test_second_trust_boundary_file_does_not_lower_worst(self) -> None:
+        # Two changed TB files: the first is below 100%, the second is fully
+        # covered, exercising the `worst is None or percent < worst` false
+        # branch (second file's percent does not lower the worst).
+        policy = basic_policy()
+        # Override the policy to make both files trust boundaries.
+        policy = policy.replace(
+            'patterns = ["crates/chaffra-core/src/config.rs"]',
+            'patterns = ["crates/chaffra-core/src/config.rs", '
+            '"crates/chaffra-cli/src/main.rs"]',
+        )
+        # file_results is sorted by path: `chaffra-cli/...main.rs` sorts
+        # before `chaffra-core/...config.rs`, so the FIRST-iterated TB file
+        # must be the worst to reach the `percent < worst` false branch on
+        # the second file.
+        lcov = lcov_text(
+            [
+                (NON_TRUST_BOUNDARY_FILE, [(20, 0), (21, 1)]),    # cli/main.rs: 50%, worst, first
+                (BASIC_TRUST_BOUNDARY_FILE, [(10, 1), (11, 1)]),  # core/config.rs: 100%, second
+            ]
+        )
+        diff = diff_text(
+            [
+                (BASIC_TRUST_BOUNDARY_FILE, [(10, 2)]),
+                (NON_TRUST_BOUNDARY_FILE, [(20, 2)]),
+            ]
+        )
+        rc, report, _ = self.run_check(lcov=lcov, policy=policy, diff=diff)
+        gate = next(g for g in report["gates"] if g["name"] == "trust_boundary_changed")
+        self.assertEqual(rc, coverage_check.EXIT_GATE_FAIL)
+        self.assertEqual(gate["measured"], 50.0)  # worst stayed at the first file
+
+    def test_runs_without_optional_output_paths(self) -> None:
+        # Success path and the malformed path with neither --json-out nor
+        # --markdown-out — exercises the optional-output None branches.
+        lcov_path = write(self.tmp / "lcov.info", lcov_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1)])]))
+        policy_path = write(self.tmp / "policy.toml", basic_policy())
+        diff_path = write(self.tmp / "diff.txt", diff_text([(NON_TRUST_BOUNDARY_FILE, [(1, 1)])]))
+        common = [
+            "--lcov", str(lcov_path), "--policy", str(policy_path),
+            "--base-sha", "aaaa", "--head-sha", "bbbb",
+            "--repo-files", str(self.repo_files_path), "--repo-root", str(self.tmp),
+            "--mode", "pr", "--allow-head-drift",
+        ]
+        # Success, no output files requested.
+        rc_ok = coverage_check.main(common + ["--diff", str(diff_path)])
+        self.assertEqual(rc_ok, coverage_check.EXIT_OK)
+        # Malformed, no output files requested (fail_malformed None branches).
+        rc_bad = coverage_check.main(
+            ["--lcov", str(self.tmp / "missing.info")] + common[2:] + ["--diff", str(diff_path)]
+        )
+        self.assertEqual(rc_bad, coverage_check.EXIT_MALFORMED)
+
+
+class TestMainGitFailurePaths(unittest.TestCase):
+    """The git-acquisition and artifact-write failure branches in main(),
+    driven with real broken states (a non-git directory, an unwritable
+    output path) — no mocks."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cov-fail-"))
+        self.lcov = write(self.tmp / "lcov.info", "SF:a.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n")
+        self.policy = write(
+            self.tmp / "p.toml",
+            "policy_version = 1\n[thresholds]\noverall = 85.0\n"
+            "aggregate_changed = 95.0\nper_file_changed = 90.0\n"
+            'trust_boundary_changed = 100.0\n[[trust_boundaries]]\n'
+            'purpose = "x"\npatterns = ["a.rs"]\n',
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _base_argv(self) -> list[str]:
+        return [
+            "--lcov", str(self.lcov),
+            "--policy", str(self.policy),
+            "--repo-root", str(self.tmp),
+            "--base-sha", "aaaa",
+            "--head-sha", "bbbb",
+            "--json-out", str(self.tmp / "out.json"),
+            "--markdown-out", str(self.tmp / "out.md"),
+            "--mode", "pr",
+        ]
+
+    @unittest.skipUnless(shutil.which("git"), "git binary not available")
+    def test_ls_tree_failure_in_non_git_dir(self) -> None:
+        # No --repo-files and --allow-head-drift: list_tracked_rs_files runs
+        # `git ls-tree` in a non-git directory → CalledProcessError →
+        # MalformedInput → fail_malformed.
+        rc = coverage_check.main(self._base_argv() + ["--allow-head-drift", "--diff",
+                                                      str(write(self.tmp / "d.txt", ""))])
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        payload = json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+        self.assertIn("git ls-tree failed", payload["detail"])
+
+    @unittest.skipUnless(shutil.which("git"), "git binary not available")
+    def test_head_drift_check_fails_in_non_git_dir(self) -> None:
+        # Without --allow-head-drift, `git rev-parse HEAD` runs in a non-git
+        # directory and fails → fail_malformed.
+        rc = coverage_check.main(self._base_argv())
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+        payload = json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+        self.assertIn("cannot read repo HEAD", payload["detail"])
+
+    def test_failure_artifact_write_error_is_warned_not_fatal(self) -> None:
+        # A malformed input plus an unwritable --json-out path exercises the
+        # OSError handler in fail_malformed: the run still exits 2 (it does
+        # not crash on the secondary write failure).
+        argv = [
+            "--lcov", str(self.tmp / "missing.info"),  # malformed: unreadable
+            "--policy", str(self.policy),
+            "--repo-root", str(self.tmp),
+            "--base-sha", "aaaa", "--head-sha", "bbbb",
+            "--json-out", str(self.tmp / "no_such_dir" / "out.json"),  # unwritable
+            "--markdown-out", str(self.tmp / "no_such_dir" / "out.md"),
+            "--mode", "pr", "--allow-head-drift",
+        ]
+        rc = coverage_check.main(argv)
+        self.assertEqual(rc, coverage_check.EXIT_MALFORMED)
+
+
 class TestPolicyAndCiInvariants(unittest.TestCase):
     """Regression guards for the documented residual (H4).
 
