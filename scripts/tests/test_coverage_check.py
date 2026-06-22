@@ -2157,39 +2157,58 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
             return all(cls._eval_cfg(c, env, crate) for c in pred.children)
         raise _CfgParseError(f"unknown predicate node {pred!r}")
 
-    @staticmethod
-    def _scan_cfg_attributes(source: str) -> list[str]:
-        """Find every `#[cfg(...)]` and `#[cfg_attr(P, inner)]` attribute.
+    # Markers for the H4a scanner: outer (`#[...]`) and inner (`#![...]`)
+    # forms of `cfg(...)` and `cfg_attr(P, ...)`. The inner form gates an
+    # entire enclosing scope (module / crate) when it appears at the top of
+    # a file, so missing it would silently let `#![cfg(target_os = "x")]`
+    # block-gate a whole trust-boundary file past the guard.
+    _CFG_MARKERS: tuple[tuple[str, bool], ...] = (
+        ("#[cfg(", False),
+        ("#![cfg(", False),
+        ("#[cfg_attr(", True),
+        ("#![cfg_attr(", True),
+    )
 
-        Returns the inside of each attribute (between the outer `(` and `)`)
-        as a single string, suitable for :meth:`_parse_cfg`. Uses a
-        paren-balanced scan so nested parentheses cannot truncate the
-        capture the way the prior non-greedy regex did. `cfg_attr` returns
-        the FIRST argument (the gating predicate); a `cfg_attr(P, ...)`
-        applies its inner attribute only when P holds, so P is the effective
-        coverage gate.
+    @classmethod
+    def _scan_cfg_attributes(cls, source: str) -> list[str]:
+        """Find every `cfg(...)` and `cfg_attr(P, inner)` attribute.
+
+        Covers both outer (``#[...]``) and inner (``#![...]``) attribute
+        forms; the inner form gates the entire enclosing scope and would
+        otherwise let `#![cfg(target_os = "x")]` block-gate a whole
+        trust-boundary file invisibly to the guard. Returns the inside of
+        each attribute (between the outer ``(`` and ``)``) as a single
+        string, suitable for :meth:`_parse_cfg`. Uses a paren-balanced scan
+        so nested parentheses cannot truncate the capture the way the prior
+        non-greedy regex did. ``cfg_attr`` returns the FIRST argument (the
+        gating predicate); a ``cfg_attr(P, ...)`` applies its inner
+        attribute only when P holds, so P is the effective coverage gate.
         """
-        # Look for both `#[cfg(` and `#[cfg_attr(` at top level only — we do
-        # not need to recurse into nested attributes since the parser handles
-        # combinator nesting.
         out: list[str] = []
         n = len(source)
         i = 0
-        marker_cfg = "#[cfg("
-        marker_cfg_attr = "#[cfg_attr("
         while i < n:
-            j_cfg = source.find(marker_cfg, i)
-            j_attr = source.find(marker_cfg_attr, i)
-            if j_cfg < 0 and j_attr < 0:
+            best_start: int | None = None
+            best_marker: str | None = None
+            best_is_attr = False
+            for marker, is_attr in cls._CFG_MARKERS:
+                j = source.find(marker, i)
+                if j < 0:
+                    continue
+                # `#[cfg(` is a prefix of `#[cfg_attr(` and `#![cfg(` is a
+                # prefix of `#![cfg_attr(`, so for the same start offset the
+                # longer marker wins.
+                if best_start is None or j < best_start or (
+                    j == best_start and len(marker) > len(best_marker or "")
+                ):
+                    best_start = j
+                    best_marker = marker
+                    best_is_attr = is_attr
+            if best_start is None or best_marker is None:
                 break
-            if j_attr >= 0 and (j_cfg < 0 or j_attr < j_cfg):
-                start = j_attr
-                inside_offset = len(marker_cfg_attr)
-                is_attr = True
-            else:
-                start = j_cfg
-                inside_offset = len(marker_cfg)
-                is_attr = False
+            start = best_start
+            inside_offset = len(best_marker)
+            is_attr = best_is_attr
             # Scan forward to the matching close-paren, respecting strings.
             depth = 1
             k = start + inside_offset
@@ -2415,6 +2434,31 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                     features.add(f)
             j += 1
         return features
+
+    def test_scan_cfg_attributes_finds_inner_attribute_form(self) -> None:
+        # Regression guard: `#![cfg(...)]` (inner attribute) gates an entire
+        # enclosing module/crate. An earlier draft of the scanner looked only
+        # for `#[cfg(` / `#[cfg_attr(`, so a file beginning with
+        # `#![cfg(target_os = "freebsd")]` would have escaped the H4a guard
+        # entirely. Both outer and inner forms — and both `cfg` and
+        # `cfg_attr` — must now be recognized.
+        cases: list[tuple[str, list[str]]] = [
+            ('#[cfg(test)]\nfn x() {}', ['test']),
+            ('#![cfg(test)]\nfn x() {}', ['test']),
+            ('#[cfg_attr(test, derive(Debug))]', ['test']),
+            ('#![cfg_attr(test, allow(dead_code))]', ['test']),
+            # The inner-cfg gate at file top still must surface so the
+            # H4a evaluator can refuse a target the matrix does not build.
+            ('#![cfg(target_os = "freebsd")]', ['target_os = "freebsd"']),
+            # Outer + inner mixed in one file.
+            (
+                '#![cfg(unix)]\n#[cfg(target_os = "linux")] fn x() {}',
+                ['unix', 'target_os = "linux"'],
+            ),
+        ]
+        for src, expected in cases:
+            with self.subTest(src=src):
+                self.assertEqual(self._scan_cfg_attributes(src), expected)
 
     def test_ci_coverage_command_enumerates_every_non_default_feature(self) -> None:
         # H4b: previously this test searched the entire YAML and Markdown
