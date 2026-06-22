@@ -1961,6 +1961,27 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
     # `#[cfg(test)]` is automatically covered.
     _ALWAYS_ACTIVE = frozenset({"test", "debug_assertions"})
 
+    # Known per-(target_os, target_arch) target predicates that both GitHub
+    # runners populate. Populating these in the eval env keeps the structural
+    # parser from fail-closed-rejecting legitimate cfg forms the old regex
+    # accepted — e.g. `cfg(target_pointer_width = "64")` is true on both legs.
+    # Anything not in this table evaluates to False (fail closed), which the
+    # caller treats as an offender.
+    _TARGET_PROFILE: dict[tuple[str, str], dict[str, str]] = {
+        ("linux", "x86_64"): {
+            "target_env": "gnu",
+            "target_vendor": "unknown",
+            "target_pointer_width": "64",
+            "target_endian": "little",
+        },
+        ("macos", "aarch64"): {
+            "target_env": "",
+            "target_vendor": "apple",
+            "target_pointer_width": "64",
+            "target_endian": "little",
+        },
+    }
+
     @classmethod
     def _leg_env(
         cls,
@@ -1970,14 +1991,17 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
     ) -> dict[str, object]:
         """Build a cfg-evaluation environment for one matrix leg.
 
-        Returns a dict with the scalar target keys, an ``active_features``
-        map ``{crate: frozenset[bare_feature_name]}`` of every feature
-        cargo activates for that crate under this leg (the crate's defaults
+        Returns a dict with the scalar target keys (``target_os``,
+        ``target_arch``, ``target_family``, plus ``target_env``,
+        ``target_vendor``, ``target_pointer_width``, ``target_endian`` from
+        :attr:`_TARGET_PROFILE`), an ``active_features`` map
+        ``{crate: frozenset[bare_feature_name]}`` of every feature cargo
+        activates for that crate under this leg (the crate's defaults
         unioned with anything ``ci_features`` explicitly enables via
         ``<crate>/<feature>``), and the ``names`` set of atom cfg names
         active in this leg (``test``, ``debug_assertions``, ``unix`` /
-        ``windows``, etc.). Predicates the parser does not understand fail
-        closed at the caller.
+        ``windows``, etc.). Predicates the parser does not understand, or
+        whose key is not in the env, fail closed at the caller.
         """
         target_os = leg.get("target_os", "")
         target_arch = leg.get("target_arch", "")
@@ -1994,26 +2018,20 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
         for crate, feats in workspace_features.items():
             crate_active = set(feats["default"])
             for spec in ci_features:
-                # `<crate>/<feature>` enables `<feature>` on `<crate>`.
                 if "/" in spec:
                     c, name = spec.split("/", 1)
                     if c == crate:
                         crate_active.add(name)
-                else:
-                    # A bare feature without a `<crate>/` qualifier in a
-                    # workspace `--features` invocation is rejected by cargo,
-                    # so this branch represents a malformed CI command. The
-                    # H4b parser would already have rejected it; defensively
-                    # ignore here.
-                    continue
             active_features[crate] = frozenset(crate_active)
-        return {
+        env: dict[str, object] = {
             "target_os": target_os,
             "target_arch": target_arch,
             "target_family": family,
             "active_features": active_features,
             "names": frozenset(names),
         }
+        env.update(cls._TARGET_PROFILE.get((target_os, target_arch), {}))
+        return env
 
     # --- structural cfg parser ----------------------------------------------
     #
@@ -2238,9 +2256,23 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 )
             inside = source[start + inside_offset : k]
             if is_attr:
-                # cfg_attr(P, ...) — take only P, the gating predicate.
-                pred_text, _ = _split_top_level_comma(inside)
-                out.append(pred_text)
+                # `cfg_attr(P, attr)` only gates code from compilation when
+                # `attr` is itself a `cfg(...)` (effective predicate is
+                # `all(P, Q)` where Q is the inner cfg). For ANY other inner
+                # attribute (`inline`, `derive(Debug)`, `allow(...)`, etc.)
+                # cfg_attr just conditionally APPLIES the attribute — the
+                # code is compiled either way, so it is NOT a coverage gate
+                # and must not be a guard offender. Drop it. `path = "..."`
+                # is the other code-gating form (it swaps the source file);
+                # the practical effect on coverage is that the alternative
+                # file gets the gate, not the file containing the cfg_attr,
+                # so it remains out of scope for THIS guard.
+                p_text, rest = _split_top_level_comma(inside)
+                inner = rest.strip()
+                if inner.startswith("cfg(") and inner.endswith(")"):
+                    q_text = inner[len("cfg(") : -1]
+                    out.append(f"all({p_text}, {q_text})")
+                # else: cfg_attr is not a code-gate → drop it silently.
             else:
                 out.append(inside)
             i = k + 1
@@ -2370,19 +2402,19 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
         )
 
     @staticmethod
-    def _extract_features_arg(text: str) -> set[str]:
-        """Return the concrete set of features passed to the FIRST actual
-        `cargo llvm-cov` invocation in ``text``.
+    def _extract_all_features_args(text: str) -> list[set[str]]:
+        """Return the concrete `--features` set for EVERY actual
+        `cargo llvm-cov --workspace` invocation in ``text``, in order.
 
-        Comment lines (YAML `#`, Markdown prose, C-style `//`) are filtered
-        out before scanning so that a prose mention of the command in a
-        review comment or docstring cannot satisfy the check — the feature
-        argument must reach the literal invocation. The remaining lines are
-        joined across bash `\\`-newline continuations and tokenized with
-        ``shlex``; the value following ``--features`` (or ``--features=...``)
-        is then parsed as cargo's space- or comma-separated list. Returns
-        the empty set when no invocation is found so the caller can flag a
-        missing command rather than treating it as "no features required."
+        Each list entry is one invocation's feature set; an invocation with
+        no `--features` argument contributes an empty set. Comment lines
+        (YAML `#`, Markdown prose, C-style `//`) are filtered out before
+        scanning so a prose mention of the command cannot satisfy the
+        check. The remaining lines are joined across bash `\\`-newline
+        continuations and tokenized with ``shlex``; the value following
+        ``--features`` (or ``--features=...``) is parsed as cargo's space-
+        or comma-separated list. Returns the empty list when no invocation
+        is found.
         """
         command_lines: list[str] = []
         for raw in text.splitlines():
@@ -2391,62 +2423,83 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 continue
             command_lines.append(raw)
         joined = "\n".join(command_lines)
-        # `cargo llvm-cov --workspace` is the unique signature of the actual
-        # invocation in both ci.yml and CONTRIBUTING.md (prose mentions of
-        # the command in backticks lack `--workspace`), so this anchor is
-        # robust against backtick wrappings, headings, and other prose
-        # spellings of the bare command name.
-        start = joined.find("cargo llvm-cov --workspace")
-        if start < 0:
-            return set()
-        # Walk forward gluing bash `\`-newline continuations into one line.
-        invocation: list[str] = []
-        i = start
+        anchor = "cargo llvm-cov --workspace"
+        results: list[set[str]] = []
         n = len(joined)
-        while i < n:
-            ch = joined[i]
-            if ch == "\n":
+        pos = 0
+        while True:
+            start = joined.find(anchor, pos)
+            if start < 0:
                 break
-            if ch == "\\" and i + 1 < n and joined[i + 1] == "\n":
-                invocation.append(" ")
-                i += 2
-                continue
-            invocation.append(ch)
-            i += 1
-        try:
-            tokens = shlex.split("".join(invocation))
-        except ValueError as exc:
-            raise AssertionError(
-                f"could not tokenize cargo invocation: {exc}\n"
-                f"line: {''.join(invocation)!r}"
-            ) from exc
-        features: set[str] = set()
-        j = 0
-        while j < len(tokens):
-            t = tokens[j]
-            if t == "--features" and j + 1 < len(tokens):
-                for f in tokens[j + 1].replace(",", " ").split():
-                    features.add(f)
-                j += 2
-                continue
-            if t.startswith("--features="):
-                for f in t.split("=", 1)[1].replace(",", " ").split():
-                    features.add(f)
-            j += 1
-        return features
+            invocation: list[str] = []
+            i = start
+            while i < n:
+                ch = joined[i]
+                if ch == "\n":
+                    break
+                if ch == "\\" and i + 1 < n and joined[i + 1] == "\n":
+                    invocation.append(" ")
+                    i += 2
+                    continue
+                invocation.append(ch)
+                i += 1
+            try:
+                tokens = shlex.split("".join(invocation))
+            except ValueError as exc:
+                raise AssertionError(
+                    f"could not tokenize cargo invocation: {exc}\n"
+                    f"line: {''.join(invocation)!r}"
+                ) from exc
+            features: set[str] = set()
+            j = 0
+            while j < len(tokens):
+                t = tokens[j]
+                if t == "--features" and j + 1 < len(tokens):
+                    for f in tokens[j + 1].replace(",", " ").split():
+                        features.add(f)
+                    j += 2
+                    continue
+                if t.startswith("--features="):
+                    for f in t.split("=", 1)[1].replace(",", " ").split():
+                        features.add(f)
+                j += 1
+            results.append(features)
+            pos = i  # continue past this invocation's newline
+        return results
+
+    @classmethod
+    def _extract_features_arg(cls, text: str) -> set[str]:
+        """Return the feature set of the FIRST `cargo llvm-cov --workspace`
+        invocation in ``text``. Wrapper around
+        :meth:`_extract_all_features_args` for callers (the H4a leg-env
+        builder) that need the features-on profile specifically.
+        """
+        invocations = cls._extract_all_features_args(text)
+        return invocations[0] if invocations else set()
 
     def test_scan_cfg_attributes_finds_inner_attribute_form(self) -> None:
         # Regression guard: `#![cfg(...)]` (inner attribute) gates an entire
         # enclosing module/crate. An earlier draft of the scanner looked only
         # for `#[cfg(` / `#[cfg_attr(`, so a file beginning with
         # `#![cfg(target_os = "freebsd")]` would have escaped the H4a guard
-        # entirely. Both outer and inner forms — and both `cfg` and
-        # `cfg_attr` — must now be recognized.
+        # entirely. Both outer and inner forms — and the code-gating
+        # `cfg_attr(P, cfg(Q))` form — must now be recognized.
         cases: list[tuple[str, list[str]]] = [
             ('#[cfg(test)]\nfn x() {}', ['test']),
             ('#![cfg(test)]\nfn x() {}', ['test']),
-            ('#[cfg_attr(test, derive(Debug))]', ['test']),
-            ('#![cfg_attr(test, allow(dead_code))]', ['test']),
+            # cfg_attr with a non-cfg inner attribute does NOT gate code from
+            # compilation, so it must be DROPPED (otherwise the guard would
+            # fail-closed on legitimate benign cfg_attr like #[derive] /
+            # #[inline] / #[allow] — a false positive regression).
+            ('#[cfg_attr(test, derive(Debug))]', []),
+            ('#![cfg_attr(test, allow(dead_code))]', []),
+            ('#[cfg_attr(target_os = "windows", inline)]', []),
+            # cfg_attr with an inner cfg DOES gate; the effective predicate
+            # is `all(P, Q)` and that's what the scanner emits.
+            (
+                '#[cfg_attr(target_os = "linux", cfg(test))]',
+                ['all(target_os = "linux", test)'],
+            ),
             # The inner-cfg gate at file top still must surface so the
             # H4a evaluator can refuse a target the matrix does not build.
             ('#![cfg(target_os = "freebsd")]', ['target_os = "freebsd"']),
@@ -2462,48 +2515,54 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
 
     def test_ci_coverage_command_enumerates_every_non_default_feature(self) -> None:
         # H4b: previously this test searched the entire YAML and Markdown
-        # texts for each `<crate>/<feature>` token, so a comment that
+        # text for each `<crate>/<feature>` token, so a comment that
         # mentioned the feature would satisfy the check even if the actual
         # `--features` argument had dropped it. Here we parse the literal
-        # cargo invocation from both files, then compare the concrete
-        # feature set to the workspace manifests.
+        # cargo invocations (both, per the dual-profile design) from both
+        # files and compare each profile to the contract:
+        #   * features-on (the FIRST invocation)  must equal the workspace's
+        #     non-default feature set;
+        #   * features-off (the SECOND invocation) must pass NO features —
+        #     otherwise the `cfg(not(feature = "x"))` branches the dual-
+        #     profile design is meant to cover would still be missed.
         non_default = self._parse_non_default_features()
-        expected = {
+        expected_on = {
             f"{crate}/{feat}"
             for crate, feats in non_default.items()
             for feat in feats
         }
 
-        ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
-        ci_features = self._extract_features_arg(ci_path.read_text(encoding="utf-8"))
-        self.assertTrue(
-            ci_features,
-            "could not find `cargo llvm-cov ... --features <set>` in ci.yml",
-        )
-
-        contrib_path = TestPolicyAndCiInvariants.WORKSPACE / "CONTRIBUTING.md"
-        contrib_features = self._extract_features_arg(contrib_path.read_text(encoding="utf-8"))
-        self.assertTrue(
-            contrib_features,
-            "could not find `cargo llvm-cov ... --features <set>` in CONTRIBUTING.md",
-        )
-
-        self.assertEqual(
-            ci_features,
-            expected,
-            f"CI `--features` argument {sorted(ci_features)} does not match the "
-            f"workspace non-default feature set {sorted(expected)}. Update "
-            ".github/workflows/ci.yml's `cargo llvm-cov` invocation in lockstep "
-            "with new non-default features so their executable code reaches LCOV.",
-        )
-        self.assertEqual(
-            contrib_features,
-            expected,
-            f"CONTRIBUTING.md local command `--features` argument "
-            f"{sorted(contrib_features)} does not match the workspace non-default "
-            f"feature set {sorted(expected)}. Update CONTRIBUTING.md alongside "
-            "ci.yml so the documented reproduction matches CI.",
-        )
+        for path_rel, label in (
+            (".github/workflows/ci.yml", "ci.yml"),
+            ("CONTRIBUTING.md", "CONTRIBUTING.md"),
+        ):
+            invocations = self._extract_all_features_args(
+                (TestPolicyAndCiInvariants.WORKSPACE / path_rel).read_text(encoding="utf-8")
+            )
+            with self.subTest(file=label):
+                self.assertEqual(
+                    len(invocations),
+                    2,
+                    f"{label}: expected exactly TWO `cargo llvm-cov --workspace` "
+                    f"invocations (features-on + features-off), found {len(invocations)}.",
+                )
+                self.assertEqual(
+                    invocations[0],
+                    expected_on,
+                    f"{label}: features-on invocation `--features` argument "
+                    f"{sorted(invocations[0])} does not match the workspace "
+                    f"non-default feature set {sorted(expected_on)}. Update the "
+                    "invocation in lockstep with new non-default features so "
+                    "their executable code reaches LCOV.",
+                )
+                self.assertEqual(
+                    invocations[1],
+                    set(),
+                    f"{label}: features-off invocation must pass NO `--features` "
+                    f"so `cfg(not(feature = \"x\"))` branches reach LCOV. "
+                    f"Got {sorted(invocations[1])}. Drop the `--features` "
+                    "argument from this invocation.",
+                )
 
 
 if __name__ == "__main__":
