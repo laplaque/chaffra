@@ -239,14 +239,16 @@ jobs:
             # to enforce that no trust-boundary file gates code on a target
             # the matrix does not build (the mechanical replacement for the
             # old inactive-cfg carve-out). macos-latest is Apple-silicon
-            # (aarch64); ubuntu/windows runners are x86_64.
+            # (aarch64); ubuntu is x86_64. Windows is NOT in the matrix:
+            # chaffra-autofix uses `std::os::unix` unconditionally, so the
+            # workspace does not compile on Windows today — a windows-latest
+            # leg can never produce LCOV. Empirically verified by an earlier
+            # 3-leg attempt (laplaque/chaffra#52). If Windows support is ever
+            # added, this matrix gains a `windows-latest` leg in the same PR.
             covers: "target_os=linux target_arch=x86_64"
           - os: macos-latest
             label: macos
             covers: "target_os=macos target_arch=aarch64"
-          - os: windows-latest
-            label: windows
-            covers: "target_os=windows target_arch=x86_64"
     defaults:
       run:
         # GitHub's Windows runners ship Git Bash; forcing bash keeps the
