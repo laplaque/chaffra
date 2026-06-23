@@ -1818,15 +1818,18 @@ class _CfgAll(_CfgPred):
         self.children = children
 
 
-def _split_top_level_comma(text: str) -> tuple[str, str]:
-    """Split ``text`` at the FIRST top-level comma (outside string/paren).
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split ``text`` on EVERY top-level comma (outside strings and parens).
 
-    Returns ``(before, after)``. If no top-level comma exists, ``after`` is
-    the empty string. Used by the `cfg_attr(P, attr)` extractor to isolate
-    the gating predicate P from the conditionally-applied attribute.
+    Used by the `cfg_attr(P, attr1, attr2, ...)` extractor to separate the
+    gating predicate P from each conditionally-applied attribute, so a
+    code-selecting `path = "..."` is detected wherever it appears in the
+    applied-attribute list, not only in the first position.
     """
+    segments: list[str] = []
     depth = 0
     in_str = False
+    start = 0
     i = 0
     n = len(text)
     while i < n:
@@ -1844,9 +1847,11 @@ def _split_top_level_comma(text: str) -> tuple[str, str]:
         elif ch == ")":
             depth -= 1
         elif ch == "," and depth == 0:
-            return text[:i], text[i + 1 :]
+            segments.append(text[start:i])
+            start = i + 1
         i += 1
-    return text, ""
+    segments.append(text[start:])
+    return segments
 
 
 class TestPolicyAndCiInvariants(unittest.TestCase):
@@ -2251,23 +2256,40 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 )
             inside = source[start + inside_offset : k]
             if is_attr:
-                # `cfg_attr(P, attr)` only gates code from compilation when
-                # `attr` is itself a `cfg(...)` (effective predicate is
-                # `all(P, Q)` where Q is the inner cfg). For ANY other inner
-                # attribute (`inline`, `derive(Debug)`, `allow(...)`, etc.)
-                # cfg_attr just conditionally APPLIES the attribute — the
-                # code is compiled either way, so it is NOT a coverage gate
-                # and must not be a guard offender. Drop it. `path = "..."`
-                # is the other code-gating form (it swaps the source file);
-                # the practical effect on coverage is that the alternative
-                # file gets the gate, not the file containing the cfg_attr,
-                # so it remains out of scope for THIS guard.
-                p_text, rest = _split_top_level_comma(inside)
-                inner = rest.strip()
-                if inner.startswith("cfg(") and inner.endswith(")"):
-                    q_text = inner[len("cfg(") : -1]
-                    out.append(f"all({p_text}, {q_text})")
-                # else: cfg_attr is not a code-gate → drop it silently.
+                # `cfg_attr(P, attr1, attr2, ...)` conditionally applies the
+                # attrs when P holds. Three cases for each applied attr:
+                #   * `cfg(Q)` — a nested cfg gate; the effective predicate is
+                #     `all(P, Q)`, emitted for coverage reasoning.
+                #   * `path = "..."` — CODE SELECTION: when P holds, Rust
+                #     compiles a DIFFERENT module source file. That selected
+                #     file may be target-specific and is not expanded into the
+                #     trust-boundary policy nor built by any matrix leg, so the
+                #     guard cannot verify its coverage. FAIL CLOSED (raise) so
+                #     the file is flagged until the module is split out / added
+                #     to the policy, or path-cfg_attr support is built.
+                #   * anything else (`inline`, `derive(...)`, `allow(...)`,
+                #     etc.) just applies an attribute; the code compiles either
+                #     way, so it is not a coverage gate — drop it.
+                segments = _split_top_level_commas(inside)
+                p_text = segments[0]
+                for applied in segments[1:]:
+                    a = applied.strip()
+                    # Detect a `path = ...` selector anywhere in this applied
+                    # attribute — including nested forms like
+                    # `cfg_attr(Q, path = "x")` — but NOT inside a string
+                    # literal (e.g. `doc = "see path = here"`). Strip string
+                    # literals first, then search at any paren depth.
+                    a_nostr = re.sub(r'"(?:\\.|[^"\\])*"', "", a)
+                    if re.search(r"\bpath\s*=", a_nostr):
+                        raise _CfgParseError(
+                            f"path-selecting cfg_attr at offset {start} "
+                            "(`cfg_attr(P, path = ...)`) swaps the module "
+                            "source under a condition the guard cannot verify; "
+                            "split the module out and add it to the policy, or "
+                            "add path-cfg_attr support."
+                        )
+                    if a.startswith("cfg(") and a.endswith(")"):
+                        out.append(f"all({p_text}, {a[len('cfg('):-1]})")
             else:
                 out.append(inside)
             i = k + 1
@@ -2427,10 +2449,55 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 '#![cfg(unix)]\n#[cfg(target_os = "linux")] fn x() {}',
                 ['unix', 'target_os = "linux"'],
             ),
+            # A nested cfg is found even when it is NOT the first applied
+            # attribute (the scanner inspects every comma-separated attr).
+            (
+                '#[cfg_attr(unix, inline, cfg(test))]',
+                ['all(unix, test)'],
+            ),
+            # Multiple nested cfgs each surface as their own all(P, Q) — locks
+            # in the every-segment behavior against a first-segment-only
+            # regression.
+            (
+                '#[cfg_attr(unix, cfg(test), cfg(debug_assertions))]',
+                ['all(unix, test)', 'all(unix, debug_assertions)'],
+            ),
         ]
         for src, expected in cases:
             with self.subTest(src=src):
                 self.assertEqual(self._scan_cfg_attributes(src), expected)
+
+    def test_scan_cfg_attributes_fails_closed_on_path_selecting_cfg_attr(self) -> None:
+        # H4a (round 7): `cfg_attr(P, path = "...")` is CODE SELECTION — when P
+        # holds Rust compiles a different module file, which may be
+        # target-specific source not expanded into the trust-boundary policy
+        # nor built by any matrix leg. The scanner must FAIL CLOSED (raise) so
+        # the guard flags it, rather than dropping it as a benign attribute.
+        # Covers the `path` appearing first, later, and with/without spaces.
+        for src in (
+            '#[cfg_attr(unix, path = "unix.rs")]\nmod platform;',
+            '#[cfg_attr(target_os = "windows", path="win.rs")] mod p;',
+            '#![cfg_attr(unix, path = "u.rs")]',
+            '#[cfg_attr(unix, inline, path = "u.rs")] mod p;',
+            # Nested cfg_attr carrying the path must also fail closed.
+            '#[cfg_attr(unix, cfg_attr(target_arch = "x86_64", path = "u.rs"))] mod p;',
+        ):
+            with self.subTest(src=src):
+                with self.assertRaises(_CfgParseError) as ctx:
+                    self._scan_cfg_attributes(src)
+                self.assertIn("path-selecting cfg_attr", str(ctx.exception))
+
+    def test_scan_cfg_attributes_path_substring_in_string_is_not_path_select(self) -> None:
+        # A `path = ` appearing INSIDE a string literal (e.g. a doc attribute)
+        # is not a code-selecting `path` attribute and must NOT trip the
+        # fail-closed guard. `filepath = ` (no word boundary) likewise must not.
+        for src in (
+            '#[cfg_attr(unix, doc = "see path = elsewhere")] fn x() {}',
+            '#[cfg_attr(unix, my_attr(filepath = 1))] fn x() {}',
+        ):
+            with self.subTest(src=src):
+                # No raise, and no predicate emitted (benign applied attrs).
+                self.assertEqual(self._scan_cfg_attributes(src), [])
 
     def test_coverage_build_uses_feature_powerset(self) -> None:
         # H4b: feature exhaustiveness is delegated to `cargo hack

@@ -24,11 +24,14 @@ text — the LCOV DA records are the sole authority on which changed lines
 are executable and must be covered. A changed line absent from the DA
 records is a line the coverage build did not instrument (a brace,
 declaration, comment, blank line). Target-`cfg`-gated code reaches the DA
-records via the per-target instrumentation matrix in CI; non-default
-features reach them via the explicit ``--features`` argument. Both
-mechanisms are documented in CONTRIBUTING.md (Coverage > Multi-target
-instrumentation) and policed by ``scripts/tests/test_coverage_check.py``
-(see ``TestPolicyAndCiInvariants``).
+records via the per-target instrumentation matrix in CI; feature-`cfg`-gated
+code reaches them via ``cargo hack --feature-powerset``, which instruments
+EVERY feature combination of every workspace crate (so both
+``cfg(feature = "x")`` and ``cfg(not(feature = "x"))``, and all combinations
+for N≥2 features, are covered by construction). Both mechanisms are
+documented in CONTRIBUTING.md (Coverage > Multi-target instrumentation) and
+policed by ``scripts/tests/test_coverage_check.py`` (see
+``TestPolicyAndCiInvariants``).
 """
 
 from __future__ import annotations
@@ -861,10 +864,10 @@ def _trust_boundary_gate(
     comments, blank lines) are not failures: the coverage build is the
     authority on which lines are executable. Target-`cfg`-gated code is
     handled by the per-target matrix in CI (linux+macos legs, merged by
-    :func:`merge_lcov`); feature-gated code is handled by the explicit
-    ``--features`` argument the workflow passes to ``cargo llvm-cov``.
-    Both mechanisms are policed by ``TestPolicyAndCiInvariants`` so a future
-    addition cannot silently fall outside coverage.
+    :func:`merge_lcov`); feature-`cfg`-gated code is handled by
+    ``cargo hack --feature-powerset``, which instruments every feature
+    combination. Both mechanisms are policed by ``TestPolicyAndCiInvariants``
+    so a future addition cannot silently fall outside coverage.
 
     ``measured`` is the worst per-file changed-line percentage, or 0.0 when
     a file failed for lack of any records, so the value is a usable scalar.
@@ -1007,10 +1010,10 @@ def evaluate(
         covered_changed = instrumented_changed & covered_for_file
         uncovered = instrumented_changed - covered_for_file
         # Lines llvm did not instrument (DA-absent): closing braces, struct
-        # fields, comments, blank lines. Target-cfg and feature-gated code
-        # reach llvm via the matrix and `--features` respectively and so are
-        # NOT in this bucket. We defer the "is this line executable" judgment
-        # to llvm rather than re-deriving it from a hand-rolled Rust lexer
+        # fields, comments, blank lines. Target-cfg and feature-cfg code
+        # reach llvm via the matrix and the feature powerset respectively and
+        # so are NOT in this bucket. We defer the "is this line executable"
+        # judgment to llvm rather than re-deriving it from a hand-rolled lexer
         # (which was unsound in both directions). See the trust-boundary gate
         # below for how absence is treated.
         non_instrumented = changed_lines - instrumented_for_file
