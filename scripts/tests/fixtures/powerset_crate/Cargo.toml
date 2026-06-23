@@ -1,0 +1,18 @@
+# Standalone fixture crate (NOT a workspace member) for the powerset
+# accumulation regression test. It has one non-default feature `fa`, so
+# `cargo hack --feature-powerset` runs two combinations ({} and {fa}); the
+# merged LCOV must contain BOTH the `cfg(feature="fa")` and the
+# `cfg(not(feature="fa"))` function, proving cargo-llvm-cov accumulates
+# profraw across combos. A single-feature build would contain only one.
+[package]
+name = "powerset_fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+fa = []
+
+# Self-isolate: an empty [workspace] makes this fixture its own workspace
+# root, so the chaffra root workspace never tries to build it.
+[workspace]

@@ -1,0 +1,171 @@
+# Coverage policy for chaffra.
+#
+# This file is the single source of truth for coverage thresholds and the
+# list of trust-boundary paths whose changed lines must be fully covered.
+# The CI `coverage` job loads it via `scripts/coverage_check.py` on every
+# pull request and on every push to `main`. Feature-branch pushes do not
+# run the coverage gate; the PR run is authoritative.
+#
+# How to add a trust-boundary path
+# --------------------------------
+# 1. Add the repository-relative glob to the appropriate `[[trust_boundaries]]`
+#    group below, or create a new group with a descriptive `purpose`.
+# 2. Globs are matched against repository-relative paths via Python's
+#    `fnmatch.fnmatchcase` (shell wildcards `*`, `?`, `[seq]`). Note that
+#    `fnmatchcase` does NOT treat `/` as a path separator — `*` matches
+#    across directories. Use a literal path whenever possible; only reach
+#    for a wildcard when an entire subtree is in scope.
+# 3. Every glob must match at least one current file. The checker fails the
+#    build if it does not — this prevents a trust boundary from silently
+#    rotting when code moves.
+#
+# Removing a path requires the same review as code: trust-boundary carve-outs
+# must never lower a threshold or be used to make a coverage failure go away.
+# Time-bound exceptions document an owner and removal issue inline.
+
+policy_version = 1
+
+# ---------------------------------------------------------------------------
+# Inactive target-`cfg` code (chaffra#49) — RESOLVED, no carve-out.
+#
+# A `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]` attribute that
+# is false on a single coverage runner removes the gated code from that
+# build, so it never reaches the LCOV DA records. Previously this was a
+# documented carve-out from the 100% trust-boundary gate. It is no longer.
+#
+# The `coverage-instrument` matrix in .github/workflows/ci.yml runs
+# `cargo llvm-cov` once per target the workspace actually compiles on —
+# `x86_64-unknown-linux-gnu` (`ubuntu-latest`) and `aarch64-apple-darwin`
+# (`macos-latest`) — and the `coverage` job merges the per-target LCOV before
+# the gate. A line is instrumented in the merge if ANY built target compiled
+# it, so target-`cfg`-gated trust-boundary code IS enforced on the leg whose
+# target matches. Windows is intentionally NOT in the matrix: `chaffra-autofix`
+# uses `std::os::unix` unconditionally, so a `windows-latest` leg would fail
+# to compile and produce no LCOV. Feature-`cfg`-gated code is enforced by
+# instrumenting the FULL feature powerset per leg via
+# `cargo hack --feature-powerset`, so both `cfg(feature = "x")` and
+# `cfg(not(feature = "x"))` reach the DA records by construction. The H4 guard
+# (`test_trust_boundary_target_cfg_is_covered_by_matrix`) structurally parses
+# every `#[cfg(...)]` predicate in a trust-boundary file and asks whether it
+# is satisfiable on some leg (cfg from `rustc --print cfg --target <triple>`)
+# under some feature combination; a predicate no (leg × combination) can
+# satisfy — e.g. `target_os = "windows"` — fails the build, as does any cfg
+# form the guard cannot structurally parse (fail closed).
+#
+# Full detail: CONTRIBUTING.md > Coverage > Multi-target instrumentation.
+# ---------------------------------------------------------------------------
+
+[thresholds]
+# Overall line coverage on the workspace. Enforced on pull requests and on
+# pushes to the `main` branch (see CONTRIBUTING.md for full event coverage).
+overall = 85.0
+# Aggregate changed-line coverage across all changed Rust files on a PR.
+aggregate_changed = 95.0
+# Changed-line coverage of every individual changed Rust file on a PR.
+per_file_changed = 90.0
+# Changed-line coverage for trust-boundary files on a PR. Must be 100%.
+trust_boundary_changed = 100.0
+
+# Trust-boundary groups. Each group documents a class of code whose changes
+# must reach the trust-boundary threshold, with the globs that select files
+# in that class. Groups are unioned to form the full trust-boundary set.
+
+[[trust_boundaries]]
+purpose = "configuration parsing"
+patterns = [
+  "crates/chaffra-core/src/config.rs",
+  "crates/chaffra-telemetry/src/config.rs",
+  "crates/chaffra-plugin/src/config.rs",
+]
+
+[[trust_boundaries]]
+purpose = "telemetry audience, sampling, emission, and privacy projection"
+# Every file that gates or shapes a telemetry emission decision (audience,
+# sampling, snapshot, flush) is a trust boundary. The CLI's run_with_telemetry
+# orchestration is included via crates/chaffra-cli/src/main.rs below.
+# See https://github.com/laplaque/chaffra/issues/50 for the consolidation
+# tracker that aims to fold the parallel CLI/telemetry-module flush paths
+# into a single audited routine; until that lands, all current paths remain
+# explicitly covered.
+patterns = [
+  "crates/chaffra-telemetry/src/collector.rs",
+  "crates/chaffra-telemetry/src/audit_log.rs",
+  "crates/chaffra-telemetry/src/module.rs",
+  "crates/chaffra-telemetry/src/sampling.rs",
+]
+
+[[trust_boundaries]]
+purpose = "suppression handling"
+patterns = [
+  "crates/chaffra-parse/src/suppression.rs",
+]
+
+[[trust_boundaries]]
+purpose = "persistence boundaries (telemetry sinks and on-disk state)"
+patterns = [
+  "crates/chaffra-telemetry/src/backends/mod.rs",
+  "crates/chaffra-telemetry/src/backends/cloudwatch.rs",
+  "crates/chaffra-telemetry/src/backends/otlp.rs",
+  "crates/chaffra-telemetry/src/backends/prometheus.rs",
+  "crates/chaffra-telemetry/src/backends/statsd.rs",
+  "crates/chaffra-telemetry/src/backends/stderr.rs",
+  "crates/chaffra-telemetry/src/backends/json_file.rs",
+  "crates/chaffra-telemetry/src/churn.rs",
+  "crates/chaffra-audit/src/lib.rs",
+  "crates/chaffra-impact/src/lib.rs",
+]
+
+[[trust_boundaries]]
+purpose = "telemetry gRPC ingress and metric data path"
+patterns = [
+  "crates/chaffra-telemetry/src/grpc_service.rs",
+  "crates/chaffra-telemetry/src/metrics.rs",
+]
+
+[[trust_boundaries]]
+purpose = "gRPC / proto conversion"
+patterns = [
+  "crates/chaffra-core/src/grpc.rs",
+  "crates/chaffra-core/src/grpc/convert.rs",
+  "crates/chaffra-plugin/src/proto.rs",
+]
+
+[[trust_boundaries]]
+purpose = "MCP / LSP request validation and dispatch"
+patterns = [
+  "crates/chaffra-mcp/src/server.rs",
+  "crates/chaffra-mcp/src/tools.rs",
+  "crates/chaffra-mcp/src/protocol.rs",
+  "crates/chaffra-cli/src/lsp.rs",
+]
+
+[[trust_boundaries]]
+# Trust boundary for CLI orchestration: `main.rs` is where the binary
+# applies audience overrides, sampling, and churn persistence around every
+# module dispatch (`run_with_telemetry`), and `watch.rs` does the same for
+# the watch loop. The glob intentionally covers the whole file rather than
+# specific functions because the policy patterns are fnmatch globs without
+# per-symbol granularity, and the privacy-relevant orchestration is
+# interleaved with the rest of `main.rs`. This widens the 100%-changed-line
+# requirement to unrelated CLI surface (argparse, help text), which is
+# accepted as the safer tradeoff until chaffra#50 extracts the orchestration
+# into a dedicated module.
+purpose = "CLI orchestration around telemetry and module dispatch"
+patterns = [
+  "crates/chaffra-cli/src/main.rs",
+  "crates/chaffra-cli/src/watch.rs",
+]
+
+[[trust_boundaries]]
+purpose = "management HTTP server and API (telemetry / config over HTTP)"
+patterns = [
+  "crates/chaffra-management/src/api.rs",
+  "crates/chaffra-management/src/server.rs",
+]
+
+[[trust_boundaries]]
+purpose = "external plugin gRPC framing and host dispatch"
+patterns = [
+  "crates/chaffra-plugin/src/client.rs",
+  "crates/chaffra-plugin/src/host.rs",
+]

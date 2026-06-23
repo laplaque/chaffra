@@ -8,6 +8,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Single source of truth for the Python version used by the coverage jobs.
+  COVERAGE_PYTHON_VERSION: "3.11"
+  # Pinned cargo-llvm-cov version installed via taiki-e/install-action. Bump
+  # together with the comment in the `coverage` job for reviewer visibility.
+  CARGO_LLVM_COV_VERSION: "0.6.21"
+  # Pinned cargo-hack version — drives the `--feature-powerset` coverage run
+  # so every feature combination is instrumented. Verified locally on the
+  # workspace's cloudwatch-gated trust-boundary code before adoption.
+  CARGO_HACK_VERSION: "0.6.45"
 
 jobs:
   check:
@@ -105,3 +114,408 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt -- --check
+
+  coverage-checker-tests:
+    name: coverage checker tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # This Python-test job needs a Rust toolchain for two reasons:
+      #   1. the H4a guard shells out to `rustc --print cfg --target <triple>`
+      #      for each matrix leg's authoritative cfg set (no target std
+      #      required — `--print cfg` answers for a cross target such as
+      #      aarch64-apple-darwin from a Linux host); and
+      #   2. TestPowersetAccumulationRegression runs the real cargo-hack +
+      #      cargo-llvm-cov recipe on a fixture crate.
+      #
+      # PINNED (not `@stable`) so the guard is DETERMINISTIC: `--print cfg`
+      # output — chiefly the `target_feature` set — evolves across stable
+      # releases, and a floating toolchain would let a borderline cfg's
+      # pass/fail flip on a day no source changed. The `coverage-instrument`
+      # legs intentionally stay on `@stable` (they must build current code);
+      # the only guard↔build divergence is a newer stable ADDING a default
+      # target_feature, which makes the guard over-reject (fail-closed, safe).
+      # SHA-pinned to the head of dtolnay/rust-toolchain's `1.94.1` branch;
+      # bump (and re-resolve the SHA) in step with the workspace's MSRV.
+      - uses: dtolnay/rust-toolchain@aad518f59d88bae90133242f9ddac7f8bbc5dddf # 1.94.1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      # cargo-llvm-cov + cargo-hack for the powerset-accumulation regression.
+      # Same pins as the coverage-instrument legs; the installer action is
+      # SHA-pinned at the v2 tag.
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        with:
+          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},cargo-hack@${{ env.CARGO_HACK_VERSION }}
+      # SHA-pinned to the commit at the v5 tag (currently v5.6.0). The
+      # other actions used here (`checkout`) already appear in this
+      # workflow under the repository's existing major-tag style; keep
+      # that style for the ones the repository was already trusting at
+      # the major tag.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
+      - name: Run unit tests
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Install coverage.py
+        # Pinned exact version for reproducibility; coverage.py has no runtime
+        # deps so --no-deps keeps the install closed.
+        run: python3 -m pip install --no-deps "coverage==7.14.2"
+      - name: Enforce checker self-coverage (100%, trust-boundary standard)
+        # The Rust `coverage` job below does not measure this Python checker
+        # (it is Rust-only). The checker is security/validation/trust-boundary
+        # code in its entirety, so it is held to the policy's 100% rule, not
+        # the 95% delta rule. Config + threshold live in
+        # scripts/tests/.coveragerc (fail_under = 100, line + branch).
+        run: |
+          set -euo pipefail
+          python3 -m coverage run --rcfile=scripts/tests/.coveragerc \
+            -m unittest discover -s scripts/tests
+          python3 -m coverage report --rcfile=scripts/tests/.coveragerc
+
+  # Coverage runs as three coupled jobs so the 100% trust-boundary gate can
+  # see code that only one target compiles:
+  #   coverage-prep        — resolve the base/head SHAs and PR/push mode once.
+  #   coverage-instrument  — a per-target-OS matrix; each leg runs
+  #                          `cargo llvm-cov` and uploads that target's LCOV.
+  #   coverage             — download every target's LCOV, merge them, and run
+  #                          the checker (the gate). This is the job branch
+  #                          protection should require.
+  # `#[cfg(target_os = "...")]` / `#[cfg(target_arch = "...")]` code is
+  # compiled (and therefore instrumented) only on the matching leg; merging
+  # the per-leg LCOV is what lets the single gate enforce coverage across all
+  # targets the matrix builds — closing chaffra#49.
+  coverage-prep:
+    name: coverage (resolve shas)
+    # Run only on PRs (changed-line gates) and pushes to main (overall gate).
+    # Skipping feature-branch pushes removes the duplicate execution that
+    # would otherwise run alongside every PR with different enforcement.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      base: ${{ steps.shas.outputs.base }}
+      head: ${{ steps.shas.outputs.head }}
+      mode: ${{ steps.shas.outputs.mode }}
+    steps:
+      - name: Resolve head SHA and mode
+        id: prep
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            # Use the PR head SHA for both checkout and labeling. Defaulting
+            # to the synthetic merge commit (`refs/pull/N/merge`) would
+            # generate LCOV from a tree whose line numbers diverge from the
+            # head when main has moved, so the diff coordinates and the
+            # coverage records would disagree.
+            head="$PR_HEAD_SHA"
+            mode="pr"
+          else
+            head="$GITHUB_SHA"
+            mode="push"
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.prep.outputs.head }}
+          fetch-depth: 0
+      - name: Resolve base SHA
+        id: shas
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ steps.prep.outputs.head }}
+          MODE: ${{ steps.prep.outputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+            # Now that the checkout exists the fallback hits a real git
+            # repository: rev-parse can walk HEAD^ instead of silently
+            # collapsing base to head on a new-branch push.
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse --verify "${HEAD_SHA}^" 2>/dev/null || echo "$HEAD_SHA")"
+            fi
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+
+  coverage-instrument:
+    name: coverage (instrument ${{ matrix.label }})
+    needs: coverage-prep
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    # `cargo hack --feature-powerset` runs a separate instrumented test build
+    # per crate × feature combination (~50+ cycles on this workspace). A
+    # defensive ceiling so a runaway (e.g. a cold cache on the slower macOS
+    # runner, or a future feature explosion) fails loudly instead of hanging
+    # the required `coverage` gate up to the 6h default. Raise if a legitimate
+    # cold run approaches it; the powerset-size guard test keeps the combo
+    # count bounded so this should stay comfortable.
+    timeout-minutes: 60
+    strategy:
+      # One target failing must not cancel the others — we need every leg's
+      # LCOV to merge, and a real platform failure should surface on its own.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+            # `triple` is this leg's rustc target triple. The H4a guard
+            # (scripts/tests/test_coverage_check.py) feeds it to `rustc
+            # --print cfg --target <triple>` for the authoritative active-cfg
+            # set, and the self-verify step below asserts the runner's
+            # `rustc -vV` host equals it — so a trust-boundary file gating
+            # code on a target no leg builds fails the build, with no
+            # hand-maintained target→cfg table to drift. macos-latest is
+            # Apple-silicon (aarch64); ubuntu is x86_64. Windows is NOT in
+            # the matrix: chaffra-autofix uses `std::os::unix`
+            # unconditionally, so the workspace does not compile on Windows
+            # today — a windows-latest leg can never produce LCOV (verified
+            # by an earlier 3-leg attempt, laplaque/chaffra#52). If Windows
+            # support is ever added, this matrix gains a leg in the same PR.
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            label: macos
+            triple: aarch64-apple-darwin
+    defaults:
+      run:
+        # GitHub's Windows runners ship Git Bash; forcing bash keeps the
+        # heredocs and `set -euo pipefail` identical across all three legs.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.coverage-prep.outputs.head }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      # Guarantees a `python3` on every runner (including Windows, which does
+      # not reliably expose `python3` by default) for the LCOV path
+      # normalization step below. SHA-pinned to the commit at the v5 tag.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc --no-progress -y
+      - name: Install cargo-llvm-cov and cargo-hack
+        # Pins: see CARGO_LLVM_COV_VERSION / CARGO_HACK_VERSION in the
+        # workflow env block. The installer action is SHA-pinned to the
+        # current commit at the v2 tag.
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        with:
+          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},cargo-hack@${{ env.CARGO_HACK_VERSION }}
+      - name: Verify resolved head SHA matches checkout
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          expected="${{ needs.coverage-prep.outputs.head }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "checkout HEAD ($actual) != resolved head ($expected)" >&2
+            exit 1
+          fi
+      - name: Generate LCOV (${{ matrix.label }})
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          # Instrument the FULL feature powerset for this target. cargo-hack
+          # runs `cargo llvm-cov --no-report` once per feature combination of
+          # each workspace crate; cargo-llvm-cov accumulates the per-combo
+          # profraw, and `report` merges it into one LCOV. This is what lets
+          # the 100% trust-boundary gate enforce BOTH `#[cfg(feature = "x")]`
+          # and `#[cfg(not(feature = "x"))]` — and EVERY combination once a
+          # crate has more than one feature — without hand-enumerating
+          # features (which only ever covered a fixed N=1 pair). cargo-llvm-cov
+          # also instruments only the current target's code, so
+          # target-`cfg`-gated code is captured on the matching leg.
+          cargo llvm-cov clean --workspace
+          cargo hack --feature-powerset --workspace llvm-cov --no-report
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+      - name: Normalize LCOV SF paths to repo-relative POSIX
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # cargo-llvm-cov emits each SF path using the HOST OS's path
+          # conventions — an absolute path under the checkout, with
+          # backslashes and a drive letter on Windows. The `coverage` job
+          # merges every leg's LCOV on a Linux runner and keys files by
+          # repo-relative POSIX path, so a Windows SF block like
+          # `SF:D:\a\chaffra\chaffra\crates\...\config.rs` would never match
+          # the policy key `crates/.../config.rs` and would silently drop
+          # out of the gate. Relativize the LCOV HERE, where the host path
+          # semantics are known, so the merge sees identical repo-relative
+          # keys from every target.
+          python3 - "$WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+
+          workspace = sys.argv[1].replace("\\", "/").rstrip("/") + "/"
+          lcov = pathlib.Path("coverage/lcov.info")
+          out = []
+          for line in lcov.read_text(encoding="utf-8").splitlines():
+              if line.startswith("SF:"):
+                  sf = line[len("SF:"):].replace("\\", "/")
+                  if sf.startswith(workspace):
+                      sf = sf[len(workspace):]
+                  line = "SF:" + sf
+              out.append(line)
+          lcov.write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
+      - name: Verify runner target matches the leg's declared triple
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          # The H4a guard feeds `matrix.triple` to `rustc --print cfg
+          # --target <triple>` for this leg's authoritative cfg set. Make
+          # that declaration self-verifying: assert the runner's actual rustc
+          # host triple equals it, so a runner-image drift (or an edited `os:`
+          # without an edited `triple:`) fails the build rather than silently
+          # feeding the guard the cfg of a target this leg does not run.
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host triple: $host  (declared triple: $TRIPLE)"
+          if [ "$host" != "$TRIPLE" ]; then
+            echo "matrix.triple ($TRIPLE) != runner rustc host ($host)" >&2
+            exit 1
+          fi
+      - name: Upload per-target LCOV
+        # SHA-pinned: actions/upload-artifact v4.6.2 (2025-03-19).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov-${{ matrix.label }}-${{ needs.coverage-prep.outputs.head }}
+          # One merged-powerset LCOV per leg.
+          path: coverage/lcov.info
+          # Fail loudly: a missing LCOV would silently shrink the merged
+          # denominator in the gate job.
+          if-no-files-found: error
+
+  coverage:
+    name: coverage
+    needs: [coverage-prep, coverage-instrument]
+    # `!cancelled()` so this gate still RUNS when an instrument leg fails,
+    # rather than being silently skipped by the implicit success() of `needs`.
+    # A skipped required check would leave the PR stuck (neither pass nor
+    # fail); instead the gate runs and the "Require all instrument legs" step
+    # below fails it loudly. The event filter is preserved so feature-branch
+    # pushes still skip coverage entirely.
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require all instrument legs to have succeeded
+        env:
+          PREP_RESULT: ${{ needs.coverage-prep.result }}
+          INSTRUMENT_RESULT: ${{ needs.coverage-instrument.result }}
+        run: |
+          set -euo pipefail
+          # coverage-instrument is a matrix; its aggregate result is 'success'
+          # only if EVERY leg succeeded. We must not certify coverage on a
+          # partial set of targets — a missing leg means a target's
+          # #[cfg(...)] code reached no LCOV, which would let the gate pass
+          # vacuously. Fail closed and clearly instead of merging partial data.
+          if [ "$PREP_RESULT" != "success" ] || [ "$INSTRUMENT_RESULT" != "success" ]; then
+            echo "coverage prerequisites did not all succeed " \
+                 "(prep=$PREP_RESULT, instrument=$INSTRUMENT_RESULT); " \
+                 "cannot certify coverage on partial target data" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.coverage-prep.outputs.head }}
+          fetch-depth: 0
+      # SHA-pinned to the commit at the v5 tag (currently v5.6.0).
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
+      - name: Verify resolved head SHA matches checkout
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          expected="${{ needs.coverage-prep.outputs.head }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "checkout HEAD ($actual) != resolved head ($expected)" >&2
+            exit 1
+          fi
+      - name: Download per-target LCOV
+        # SHA-pinned: actions/download-artifact v4.3.0 (2025-04-29).
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          # Only this run's per-target artifacts (head SHA suffix); each lands
+          # in its own subdirectory under lcov-artifacts/.
+          pattern: coverage-lcov-*-${{ needs.coverage-prep.outputs.head }}
+          path: lcov-artifacts
+      - name: Merge per-target LCOV and run coverage checker
+        env:
+          BASE_SHA: ${{ needs.coverage-prep.outputs.base }}
+          HEAD_SHA: ${{ needs.coverage-prep.outputs.head }}
+          MODE: ${{ needs.coverage-prep.outputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          # Each downloaded artifact is one target's LCOV under its own
+          # subdirectory. Pass them all to --lcov; the checker unions DA lines
+          # across targets (a line is instrumented if any target compiled it,
+          # and covered if any target exercised it).
+          mapfile -t lcovs < <(find lcov-artifacts -name 'lcov.info' | sort)
+          # Expect exactly one merged-powerset LCOV per matrix leg. Deriving
+          # the count from ci.yml's `triple:` keys (not a magic number) means
+          # adding a matrix leg automatically tightens this guard. Anything
+          # less than the full set would silently shrink the merged
+          # denominator and let a target's cfg-gated code pass the gate by
+          # absence — refuse partial data.
+          expected="$(grep -cE '^[[:space:]]+triple:' .github/workflows/ci.yml)"
+          if [ "${#lcovs[@]}" -ne "$expected" ]; then
+            echo "expected $expected LCOV file(s) (one per matrix leg) but " \
+                 "found ${#lcovs[@]} under lcov-artifacts/" >&2
+            exit 1
+          fi
+          echo "merging ${#lcovs[@]} LCOV file(s):"
+          printf '  %s\n' "${lcovs[@]}"
+          python3 scripts/coverage_check.py \
+            --lcov "${lcovs[@]}" \
+            --policy .github/coverage-policy.toml \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --json-out coverage/result.json \
+            --markdown-out coverage/result.md \
+            --mode "$MODE"
+      - name: Append Markdown to step summary
+        if: always()
+        run: |
+          if [ -f coverage/result.md ]; then
+            cat coverage/result.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload coverage artifacts
+        if: always()
+        # SHA-pinned: actions/upload-artifact v4.6.2 (2025-03-19).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-${{ needs.coverage-prep.outputs.head }}
+          path: |
+            lcov-artifacts/**/lcov.info
+            coverage/result.json
+            coverage/result.md
+          if-no-files-found: warn

@@ -1661,7 +1661,50 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
     use tempfile::TempDir;
+
+    // The process cwd is global, but cargo test runs tests in parallel. Two
+    // sibling tests both doing `set_current_dir(tempdir)` would race: test A's
+    // TempDir can be dropped (cleaned up) while test B is still cd'd inside it,
+    // and the next `current_dir()` call inside the now-vanished directory
+    // returns ENOENT. That is chaffra#51 (test_run_with_telemetry_end_to_end
+    // intermittent NotFound). Every cwd-mutating test takes `CwdGuard::enter`,
+    // which serializes them on `CWD_LOCK` and restores the original cwd on
+    // drop — including on panic, so a panicking test cannot leave the runner
+    // pointed at a dropped tempdir.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CwdGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(target: &Path) -> Self {
+            // A prior test that panicked inside the guarded region poisons the
+            // lock. The state the lock protects is the global cwd, which the
+            // panicking test's Drop has already restored, so recovering the
+            // inner guard is safe and keeps subsequent tests runnable.
+            let lock = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(target).unwrap();
+            Self {
+                _lock: lock,
+                original,
+            }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            // Best-effort restore. If the original directory has somehow been
+            // removed, there is nothing the test harness can do about it; the
+            // panic-already-in-progress path must not double-panic.
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
 
     #[test]
     fn test_build_module_host() {
@@ -2731,16 +2774,14 @@ mod tests {
         };
 
         // Temporarily override the state file path by running in the temp dir.
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        // `CwdGuard` serializes the cwd switch (see chaffra#51).
+        let _cwd = CwdGuard::enter(dir.path());
 
         let formatter = create_formatter(OutputFormat::Terminal);
         let output = run_with_telemetry(&tel_config, &config, "dead-code", |collector| {
             cmd_dead_code(&root, &config, formatter.as_ref(), collector)
         })
         .unwrap();
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(!output.is_empty());
 
@@ -2779,14 +2820,11 @@ mod tests {
             ..Default::default()
         };
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = CwdGuard::enter(dir.path());
 
         let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
             anyhow::bail!("simulated analysis failure")
         });
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(result.is_err());
 
@@ -2829,14 +2867,11 @@ mod tests {
             ..Default::default()
         };
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = CwdGuard::enter(dir.path());
 
         let result = run_with_telemetry(&tel_config, &config, "failing-cmd", |_collector| {
             anyhow::bail!("simulated analysis failure")
         });
-
-        std::env::set_current_dir(&original_dir).unwrap();
 
         assert!(result.is_err());
 

@@ -1,0 +1,11 @@
+policy_version = 1
+
+[thresholds]
+overall = 85.0
+aggregate_changed = 95.0
+per_file_changed = 90.0
+trust_boundary_changed = 100.0
+
+[[trust_boundaries]]
+purpose = "configuration parsing"
+patterns = ["crates/chaffra-core/src/config.rs"]
