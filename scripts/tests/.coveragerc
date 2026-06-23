@@ -1,8 +1,11 @@
 # Coverage configuration for the Python checker (scripts/coverage_check.py).
-# Used by the `coverage-checker-tests` CI job and locally:
-#   python3 -m coverage run --branch --include='*/coverage_check.py' \
+# Used by the `coverage-checker-tests` CI job and locally. The CI command
+# (and this local usage example) are rcfile-driven so the 100% gate below
+# applies — never pass `--fail-under` on the CLI, which would override the
+# rcfile and silently lower the bar:
+#   python3 -m coverage run --rcfile=scripts/tests/.coveragerc \
 #       -m unittest discover -s scripts/tests
-#   python3 -m coverage report --fail-under=95 --show-missing
+#   python3 -m coverage report --rcfile=scripts/tests/.coveragerc
 [run]
 branch = true
 # Only the checker itself is gated; the test file is the harness.
