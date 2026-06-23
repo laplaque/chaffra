@@ -2541,5 +2541,67 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
         )
 
 
+def _have_powerset_tools() -> bool:
+    return all(shutil.which(t) for t in ("cargo", "cargo-hack", "cargo-llvm-cov"))
+
+
+@unittest.skipUnless(
+    _have_powerset_tools(), "cargo + cargo-hack + cargo-llvm-cov required"
+)
+class TestPowersetAccumulationRegression(unittest.TestCase):
+    """Load-bearing regression for the feature-exhaustiveness guarantee.
+
+    The whole design rests on cargo-llvm-cov RETAINING profraw across the
+    per-combo ``--no-report`` runs that ``cargo hack --feature-powerset``
+    drives — documented behavior, not a contract. This runs the EXACT CI
+    recipe on a checked-in 2-combo fixture crate (one feature `fa`, so the
+    powerset is {} and {fa}) and asserts the merged LCOV contains BOTH the
+    ``cfg(feature = "fa")`` and the ``cfg(not(feature = "fa"))`` function. A
+    regression in accumulation (e.g. a tool-version bump that re-enables
+    per-run cleaning) would leave only the last combo's function and fail
+    here, rather than silently shrinking coverage in production.
+    """
+
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "powerset_crate"
+
+    def test_powerset_merges_both_feature_branches(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="cov-powerset-"))
+        try:
+            crate = tmp / "powerset_crate"
+            shutil.copytree(self.FIXTURE, crate)
+            env = dict(os.environ, CARGO_TERM_COLOR="never")
+
+            def run(*args: str) -> None:
+                subprocess.run(args, cwd=crate, env=env, check=True, capture_output=True)
+
+            # The exact CI recipe (.github/workflows/ci.yml, Generate LCOV).
+            run("cargo", "llvm-cov", "clean", "--workspace")
+            run("cargo", "hack", "--feature-powerset", "llvm-cov", "--no-report")
+            lcov = crate / "merged.lcov"
+            run("cargo", "llvm-cov", "report", "--lcov", "--output-path", str(lcov))
+
+            covered_fns: list[str] = []
+            for line in lcov.read_text(encoding="utf-8").splitlines():
+                if line.startswith("FNDA:"):
+                    hits_str, _, name = line[len("FNDA:"):].partition(",")
+                    if int(hits_str) > 0:
+                        covered_fns.append(name)
+
+            # Mangled symbol names carry the source fn name as a suffix token.
+            self.assertTrue(
+                any("branch_with_fa" in n for n in covered_fns),
+                "cfg(feature=\"fa\") branch missing/uncovered in merged LCOV; "
+                f"covered fns: {covered_fns}",
+            )
+            self.assertTrue(
+                any("branch_without_fa" in n for n in covered_fns),
+                "cfg(not(feature=\"fa\")) branch missing/uncovered in merged "
+                "LCOV — feature-powerset accumulation regressed (only the last "
+                f"combo's code survived the merge); covered fns: {covered_fns}",
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

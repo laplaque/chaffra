@@ -120,11 +120,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # The H4a guard (TestPolicyAndCiInvariants) shells out to
-      # `rustc --print cfg --target <triple>` for each matrix leg's
-      # authoritative cfg set, so this Python-test job needs a Rust toolchain.
-      # No target std is required — `--print cfg` answers for a cross target
-      # (e.g. aarch64-apple-darwin from a Linux host) without it.
+      # This Python-test job needs a Rust toolchain for two reasons:
+      #   1. the H4a guard shells out to `rustc --print cfg --target <triple>`
+      #      for each matrix leg's authoritative cfg set (no target std
+      #      required — `--print cfg` answers for a cross target such as
+      #      aarch64-apple-darwin from a Linux host); and
+      #   2. TestPowersetAccumulationRegression runs the real cargo-hack +
+      #      cargo-llvm-cov recipe on a fixture crate.
       #
       # PINNED (not `@stable`) so the guard is DETERMINISTIC: `--print cfg`
       # output — chiefly the `target_feature` set — evolves across stable
@@ -133,8 +135,18 @@ jobs:
       # legs intentionally stay on `@stable` (they must build current code);
       # the only guard↔build divergence is a newer stable ADDING a default
       # target_feature, which makes the guard over-reject (fail-closed, safe).
-      # Bump this in step with the workspace's effective MSRV.
-      - uses: dtolnay/rust-toolchain@1.94.1
+      # SHA-pinned to the head of dtolnay/rust-toolchain's `1.94.1` branch;
+      # bump (and re-resolve the SHA) in step with the workspace's MSRV.
+      - uses: dtolnay/rust-toolchain@aad518f59d88bae90133242f9ddac7f8bbc5dddf # 1.94.1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      # cargo-llvm-cov + cargo-hack for the powerset-accumulation regression.
+      # Same pins as the coverage-instrument legs; the installer action is
+      # SHA-pinned at the v2 tag.
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        with:
+          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},cargo-hack@${{ env.CARGO_HACK_VERSION }}
       # SHA-pinned to the commit at the v5 tag (currently v5.6.0). The
       # other actions used here (`checkout`) already appear in this
       # workflow under the repository's existing major-tag style; keep
