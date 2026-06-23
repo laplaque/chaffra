@@ -13,6 +13,10 @@ env:
   # Pinned cargo-llvm-cov version installed via taiki-e/install-action. Bump
   # together with the comment in the `coverage` job for reviewer visibility.
   CARGO_LLVM_COV_VERSION: "0.6.21"
+  # Pinned cargo-hack version — drives the `--feature-powerset` coverage run
+  # so every feature combination is instrumented. Verified locally on the
+  # workspace's cloudwatch-gated trust-boundary code before adoption.
+  CARGO_HACK_VERSION: "0.6.45"
 
 jobs:
   check:
@@ -116,6 +120,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # The H4a guard (TestPolicyAndCiInvariants) shells out to
+      # `rustc --print cfg --target <triple>` for each matrix leg's
+      # authoritative cfg set, so this Python-test job needs a Rust toolchain.
+      # No target std is required — `--print cfg` answers for a cross target
+      # (e.g. aarch64-apple-darwin from a Linux host) without it.
+      #
+      # PINNED (not `@stable`) so the guard is DETERMINISTIC: `--print cfg`
+      # output — chiefly the `target_feature` set — evolves across stable
+      # releases, and a floating toolchain would let a borderline cfg's
+      # pass/fail flip on a day no source changed. The `coverage-instrument`
+      # legs intentionally stay on `@stable` (they must build current code);
+      # the only guard↔build divergence is a newer stable ADDING a default
+      # target_feature, which makes the guard over-reject (fail-closed, safe).
+      # Bump this in step with the workspace's effective MSRV.
+      - uses: dtolnay/rust-toolchain@1.94.1
       # SHA-pinned to the commit at the v5 tag (currently v5.6.0). The
       # other actions used here (`checkout`) already appear in this
       # workflow under the repository's existing major-tag style; keep
@@ -226,6 +245,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    # `cargo hack --feature-powerset` runs a separate instrumented test build
+    # per crate × feature combination (~50+ cycles on this workspace). A
+    # defensive ceiling so a runaway (e.g. a cold cache on the slower macOS
+    # runner, or a future feature explosion) fails loudly instead of hanging
+    # the required `coverage` gate up to the 6h default. Raise if a legitimate
+    # cold run approaches it; the powerset-size guard test keeps the combo
+    # count bounded so this should stay comfortable.
+    timeout-minutes: 60
     strategy:
       # One target failing must not cancel the others — we need every leg's
       # LCOV to merge, and a real platform failure should surface on its own.
@@ -234,21 +261,23 @@ jobs:
         include:
           - os: ubuntu-latest
             label: linux
-            # `covers` lists the cfg target tokens this leg's build
-            # instruments. scripts/tests/test_coverage_check.py parses these
-            # to enforce that no trust-boundary file gates code on a target
-            # the matrix does not build (the mechanical replacement for the
-            # old inactive-cfg carve-out). macos-latest is Apple-silicon
-            # (aarch64); ubuntu is x86_64. Windows is NOT in the matrix:
-            # chaffra-autofix uses `std::os::unix` unconditionally, so the
-            # workspace does not compile on Windows today — a windows-latest
-            # leg can never produce LCOV. Empirically verified by an earlier
-            # 3-leg attempt (laplaque/chaffra#52). If Windows support is ever
-            # added, this matrix gains a `windows-latest` leg in the same PR.
-            covers: "target_os=linux target_arch=x86_64"
+            # `triple` is this leg's rustc target triple. The H4a guard
+            # (scripts/tests/test_coverage_check.py) feeds it to `rustc
+            # --print cfg --target <triple>` for the authoritative active-cfg
+            # set, and the self-verify step below asserts the runner's
+            # `rustc -vV` host equals it — so a trust-boundary file gating
+            # code on a target no leg builds fails the build, with no
+            # hand-maintained target→cfg table to drift. macos-latest is
+            # Apple-silicon (aarch64); ubuntu is x86_64. Windows is NOT in
+            # the matrix: chaffra-autofix uses `std::os::unix`
+            # unconditionally, so the workspace does not compile on Windows
+            # today — a windows-latest leg can never produce LCOV (verified
+            # by an earlier 3-leg attempt, laplaque/chaffra#52). If Windows
+            # support is ever added, this matrix gains a leg in the same PR.
+            triple: x86_64-unknown-linux-gnu
           - os: macos-latest
             label: macos
-            covers: "target_os=macos target_arch=aarch64"
+            triple: aarch64-apple-darwin
     defaults:
       run:
         # GitHub's Windows runners ship Git Bash; forcing bash keeps the
@@ -278,12 +307,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: choco install protoc --no-progress -y
-      - name: Install cargo-llvm-cov
-        # Pin: see CARGO_LLVM_COV_VERSION in the workflow env block. The
-        # installer action is SHA-pinned to the current commit at the v2 tag.
+      - name: Install cargo-llvm-cov and cargo-hack
+        # Pins: see CARGO_LLVM_COV_VERSION / CARGO_HACK_VERSION in the
+        # workflow env block. The installer action is SHA-pinned to the
+        # current commit at the v2 tag.
         uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
-          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }}
+          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},cargo-hack@${{ env.CARGO_HACK_VERSION }}
       - name: Verify resolved head SHA matches checkout
         run: |
           set -euo pipefail
@@ -297,25 +327,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p coverage
-          # Two coverage builds per target OS/arch — one with every
-          # non-default workspace feature enabled (today
-          # `chaffra-telemetry/cloudwatch`) and one with no non-default
-          # features. This is what lets the 100% trust-boundary gate enforce
-          # BOTH `#[cfg(feature = "...")]` and `#[cfg(not(feature = "..."))]`
-          # code paths: each profile compiles a different set of branches,
-          # the merge in the `coverage` job unions them.
-          # cargo-llvm-cov also instruments only the current target's code,
-          # so target-`cfg`-gated code is captured on the matching leg.
-          # When a new non-default feature is added, append it to the
-          # features-on profile and to CONTRIBUTING.md; a test enforces both.
-          # `--all-features` is intentionally not used: a strict superset of
-          # the profiles below would not cover the no-features branches.
-          mkdir -p coverage
-          cargo llvm-cov --workspace \
-            --features chaffra-telemetry/cloudwatch \
-            --lcov --output-path coverage/lcov-features-on.info
-          cargo llvm-cov --workspace \
-            --lcov --output-path coverage/lcov-features-off.info
+          # Instrument the FULL feature powerset for this target. cargo-hack
+          # runs `cargo llvm-cov --no-report` once per feature combination of
+          # each workspace crate; cargo-llvm-cov accumulates the per-combo
+          # profraw, and `report` merges it into one LCOV. This is what lets
+          # the 100% trust-boundary gate enforce BOTH `#[cfg(feature = "x")]`
+          # and `#[cfg(not(feature = "x"))]` — and EVERY combination once a
+          # crate has more than one feature — without hand-enumerating
+          # features (which only ever covered a fixed N=1 pair). cargo-llvm-cov
+          # also instruments only the current target's code, so
+          # target-`cfg`-gated code is captured on the matching leg.
+          cargo llvm-cov clean --workspace
+          cargo hack --feature-powerset --workspace llvm-cov --no-report
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
       - name: Normalize LCOV SF paths to repo-relative POSIX
         env:
           WORKSPACE: ${{ github.workspace }}
@@ -328,68 +352,49 @@ jobs:
           # repo-relative POSIX path, so a Windows SF block like
           # `SF:D:\a\chaffra\chaffra\crates\...\config.rs` would never match
           # the policy key `crates/.../config.rs` and would silently drop
-          # out of the gate. Relativize each LCOV HERE, where the host path
+          # out of the gate. Relativize the LCOV HERE, where the host path
           # semantics are known, so the merge sees identical repo-relative
-          # keys from every target × profile.
+          # keys from every target.
           python3 - "$WORKSPACE" <<'PY'
           import pathlib
           import sys
 
           workspace = sys.argv[1].replace("\\", "/").rstrip("/") + "/"
-          for lcov in pathlib.Path("coverage").glob("lcov-*.info"):
-              out = []
-              for line in lcov.read_text(encoding="utf-8").splitlines():
-                  if line.startswith("SF:"):
-                      sf = line[len("SF:"):].replace("\\", "/")
-                      if sf.startswith(workspace):
-                          sf = sf[len(workspace):]
-                      line = "SF:" + sf
-                  out.append(line)
-              lcov.write_text("\n".join(out) + "\n", encoding="utf-8")
+          lcov = pathlib.Path("coverage/lcov.info")
+          out = []
+          for line in lcov.read_text(encoding="utf-8").splitlines():
+              if line.startswith("SF:"):
+                  sf = line[len("SF:"):].replace("\\", "/")
+                  if sf.startswith(workspace):
+                      sf = sf[len(workspace):]
+                  line = "SF:" + sf
+              out.append(line)
+          lcov.write_text("\n".join(out) + "\n", encoding="utf-8")
           PY
-      - name: Verify runner target matches the leg's declared `covers`
+      - name: Verify runner target matches the leg's declared triple
         env:
-          COVERS: ${{ matrix.covers }}
+          TRIPLE: ${{ matrix.triple }}
         run: |
           set -euo pipefail
-          # The H4 guard test trusts each leg's `covers:` declaration as
-          # ground truth for what this leg compiles. Make that declaration
-          # self-verifying: compare it against rustc's actual host triple so a
-          # drift in runner image (or an edited `os:` without an edited
-          # `covers:`) fails the build instead of silently lying to the guard.
+          # The H4a guard feeds `matrix.triple` to `rustc --print cfg
+          # --target <triple>` for this leg's authoritative cfg set. Make
+          # that declaration self-verifying: assert the runner's actual rustc
+          # host triple equals it, so a runner-image drift (or an edited `os:`
+          # without an edited `triple:`) fails the build rather than silently
+          # feeding the guard the cfg of a target this leg does not run.
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          echo "rustc host triple: $host  (declared covers: $COVERS)"
-          for token in $COVERS; do
-            key="${token%%=*}"
-            val="${token#*=}"
-            case "$key" in
-              target_arch)
-                case "$host" in
-                  "$val"-*) ;;
-                  *) echo "covers claims $token but host triple is $host" >&2; exit 1;;
-                esac ;;
-              target_os)
-                case "$val" in
-                  linux)   needle="linux" ;;
-                  macos)   needle="darwin" ;;
-                  windows) needle="windows" ;;
-                  *)       needle="$val" ;;
-                esac
-                case "$host" in
-                  *"$needle"*) ;;
-                  *) echo "covers claims $token but host triple is $host" >&2; exit 1;;
-                esac ;;
-              *) echo "unknown covers key: $key" >&2; exit 1;;
-            esac
-          done
+          echo "rustc host triple: $host  (declared triple: $TRIPLE)"
+          if [ "$host" != "$TRIPLE" ]; then
+            echo "matrix.triple ($TRIPLE) != runner rustc host ($host)" >&2
+            exit 1
+          fi
       - name: Upload per-target LCOV
         # SHA-pinned: actions/upload-artifact v4.6.2 (2025-03-19).
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-lcov-${{ matrix.label }}-${{ needs.coverage-prep.outputs.head }}
-          # Both feature profiles (`lcov-features-on.info` and
-          # `lcov-features-off.info`) are uploaded together for this leg.
-          path: coverage/lcov-*.info
+          # One merged-powerset LCOV per leg.
+          path: coverage/lcov.info
           # Fail loudly: a missing LCOV would silently shrink the merged
           # denominator in the gate job.
           if-no-files-found: error
@@ -462,20 +467,17 @@ jobs:
           # subdirectory. Pass them all to --lcov; the checker unions DA lines
           # across targets (a line is instrumented if any target compiled it,
           # and covered if any target exercised it).
-          mapfile -t lcovs < <(find lcov-artifacts -name 'lcov-*.info' | sort)
-          # Expect TWO LCOV files per matrix leg: one with non-default
-          # features enabled, one without. The product covers both
-          # `cfg(feature = "x")` and `cfg(not(feature = "x"))` branches.
-          # Deriving the count from ci.yml's `covers:` keys (not a magic
-          # number) means adding a matrix leg automatically tightens this
-          # guard. Anything less than the full set would silently shrink
-          # the merged denominator and let a target's cfg-gated code pass
-          # the gate by absence — refuse partial data.
-          legs="$(grep -cE '^[[:space:]]+covers:' .github/workflows/ci.yml)"
-          expected="$((legs * 2))"
+          mapfile -t lcovs < <(find lcov-artifacts -name 'lcov.info' | sort)
+          # Expect exactly one merged-powerset LCOV per matrix leg. Deriving
+          # the count from ci.yml's `triple:` keys (not a magic number) means
+          # adding a matrix leg automatically tightens this guard. Anything
+          # less than the full set would silently shrink the merged
+          # denominator and let a target's cfg-gated code pass the gate by
+          # absence — refuse partial data.
+          expected="$(grep -cE '^[[:space:]]+triple:' .github/workflows/ci.yml)"
           if [ "${#lcovs[@]}" -ne "$expected" ]; then
-            echo "expected $expected LCOV file(s) ($legs leg(s) × 2 feature " \
-                 "profiles) but found ${#lcovs[@]} under lcov-artifacts/" >&2
+            echo "expected $expected LCOV file(s) (one per matrix leg) but " \
+                 "found ${#lcovs[@]} under lcov-artifacts/" >&2
             exit 1
           fi
           echo "merging ${#lcovs[@]} LCOV file(s):"
@@ -501,7 +503,7 @@ jobs:
         with:
           name: coverage-${{ needs.coverage-prep.outputs.head }}
           path: |
-            lcov-artifacts/**/lcov-*.info
+            lcov-artifacts/**/lcov.info
             coverage/result.json
             coverage/result.md
           if-no-files-found: warn

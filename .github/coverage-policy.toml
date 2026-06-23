@@ -35,21 +35,22 @@ policy_version = 1
 #
 # The `coverage-instrument` matrix in .github/workflows/ci.yml runs
 # `cargo llvm-cov` once per target the workspace actually compiles on —
-# `linux/x86_64` (`ubuntu-latest`) and `macos/aarch64` (`macos-latest`) — and
-# the `coverage` job merges the per-target LCOV before the gate. A line is
-# instrumented in the merge if ANY built target compiled it, so
-# target-`cfg`-gated trust-boundary code IS enforced on the leg whose target
-# matches. Windows is intentionally NOT in the matrix: `chaffra-autofix`
+# `x86_64-unknown-linux-gnu` (`ubuntu-latest`) and `aarch64-apple-darwin`
+# (`macos-latest`) — and the `coverage` job merges the per-target LCOV before
+# the gate. A line is instrumented in the merge if ANY built target compiled
+# it, so target-`cfg`-gated trust-boundary code IS enforced on the leg whose
+# target matches. Windows is intentionally NOT in the matrix: `chaffra-autofix`
 # uses `std::os::unix` unconditionally, so a `windows-latest` leg would fail
-# to compile and produce no LCOV. The H4 guard
-# (`test_trust_boundary_target_cfg_is_covered_by_matrix`) structurally
-# parses every `#[cfg(...)]` predicate in a trust-boundary file against the
-# per-leg target environment plus the explicit feature set; a trust-boundary
-# file that gates code on `target_os = "windows"` (or any other target no leg
-# builds, or any cfg form the guard cannot structurally validate) fails the
-# build. Feature-gated code is likewise enforced: the coverage build
-# enumerates every non-default feature by name and the guard parses the
-# concrete `--features` argument from the workflow.
+# to compile and produce no LCOV. Feature-`cfg`-gated code is enforced by
+# instrumenting the FULL feature powerset per leg via
+# `cargo hack --feature-powerset`, so both `cfg(feature = "x")` and
+# `cfg(not(feature = "x"))` reach the DA records by construction. The H4 guard
+# (`test_trust_boundary_target_cfg_is_covered_by_matrix`) structurally parses
+# every `#[cfg(...)]` predicate in a trust-boundary file and asks whether it
+# is satisfiable on some leg (cfg from `rustc --print cfg --target <triple>`)
+# under some feature combination; a predicate no (leg × combination) can
+# satisfy — e.g. `target_os = "windows"` — fails the build, as does any cfg
+# form the guard cannot structurally parse (fail closed).
 #
 # Full detail: CONTRIBUTING.md > Coverage > Multi-target instrumentation.
 # ---------------------------------------------------------------------------

@@ -20,10 +20,10 @@ Run locally with::
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -1853,15 +1853,25 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
     """Regression guards that keep the multi-target coverage mechanism honest
     (chaffra#49 / H4).
 
-    H4 is closed by the `coverage-instrument` matrix: `cargo llvm-cov` runs
-    once per target OS/arch and the per-leg LCOV is merged before the gate, so
-    `#[cfg(target_os = "...")]`-gated trust-boundary code is instrumented on
-    the matching leg. Two invariants keep that real, enforced mechanically so
-    a future PR cannot silently re-open the gap:
+    H4 is closed by two orthogonal exhaustiveness mechanisms, each sourced
+    from an authority rather than a hand-maintained table:
 
-      * every target-`cfg` in a trust-boundary file must name a target the
-        matrix actually builds (else its code reaches no LCOV), and
-      * the coverage build must enumerate every non-default feature by name.
+      * **Targets** — the `coverage-instrument` matrix runs `cargo llvm-cov`
+        once per target the workspace builds on (linux + macos). The guard
+        derives each leg's active cfg from ``rustc --print cfg --target
+        <triple>`` (rustc is the authority), so a trust-boundary cfg that no
+        leg can satisfy is flagged.
+      * **Features** — each leg drives coverage through
+        ``cargo hack --feature-powerset``, instrumenting EVERY feature
+        combination, so both ``cfg(feature = "x")`` and
+        ``cfg(not(feature = "x"))`` (and all combinations for N>1 features)
+        reach LCOV by construction. The guard treats a crate's defined
+        features as free variables when testing cfg satisfiability.
+
+    The guard therefore fails the build iff a trust-boundary file contains a
+    cfg that is unsatisfiable across (every matrix leg) × (the feature
+    powerset) — i.e. genuinely un-instrumentable executable code — or a
+    conditional form the structural parser cannot understand (fail closed).
     """
 
     WORKSPACE = Path(__file__).resolve().parents[2]
@@ -1884,62 +1894,85 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
         return matched
 
     @staticmethod
-    def _matrix_legs() -> list[dict[str, str]]:
-        """Per-leg dict of `cfg` target tokens the coverage matrix builds.
+    def _matrix_target_triples() -> list[str]:
+        """Return the rustc target triple of each coverage-instrument leg.
 
-        Each leg returns ``{"target_os": ..., "target_arch": ...}`` parsed
-        from the `covers:` field on the matrix entry in ci.yml. The dict
-        shape (vs a flat set) lets the cfg evaluator look up `target_os`
-        and `target_arch` directly during predicate evaluation.
+        Parsed from the `triple:` field on each matrix entry in ci.yml
+        (comment lines are ignored so a prose mention cannot inject a leg).
+        The triple is authoritative: the guard feeds it to ``rustc --print
+        cfg --target <triple>`` for the exact cfg rustc activates, and CI's
+        self-verify step asserts the runner's ``rustc -vV`` host equals it —
+        so there is no hand-maintained target→cfg table to drift.
         """
         ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
-        text = ci_path.read_text(encoding="utf-8")
-        legs: list[dict[str, str]] = []
-        for m in re.finditer(r'covers:\s*"([^"]*)"', text):
-            leg: dict[str, str] = {}
-            for tok in m.group(1).split():
-                if "=" not in tok:
-                    continue
-                k, v = tok.split("=", 1)
-                leg[k] = v
-            legs.append(leg)
-        return legs
+        triples: list[str] = []
+        for raw in ci_path.read_text(encoding="utf-8").splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("#"):
+                continue
+            m = re.match(r'triple:\s*"?([A-Za-z0-9_.-]+)"?$', stripped)
+            if m:
+                triples.append(m.group(1))
+        return triples
 
     @staticmethod
-    def _parse_workspace_features() -> dict[str, dict[str, set[str]]]:
-        """Return per-crate feature data: ``{crate: {"default": {...}, "all": {...}}}``.
+    def _rustc_target_cfg(triple: str) -> tuple[frozenset[str], dict[str, frozenset[str]]]:
+        """Return ``(names, pairs)`` of the cfg rustc activates for ``triple``.
 
-        The ``default`` set is the union of features cargo enables when no
-        ``--features`` is passed; ``all`` is every feature defined in the
-        ``[features]`` table including the implicit ``default``. Used by both
-        ``_parse_non_default_features`` (for H4b's expected-set computation)
-        and the H4a guard's per-leg active-feature derivation.
+        ``names`` is the set of bare cfg atoms (``unix``, ``windows``, ...);
+        ``pairs`` maps each keyed cfg (``target_os``, ``target_arch``,
+        ``target_feature``, ...) to the set of values rustc prints — a key
+        like ``target_feature`` legitimately has many values. Sourced from
+        ``rustc --print cfg --target <triple>``, which computes the target's
+        cfg without the target's std being installed, so a Linux host can
+        answer for the macOS leg. This is the authoritative replacement for
+        the hand-maintained target table that round-6 review flagged as
+        incomplete.
         """
-        out: dict[str, dict[str, set[str]]] = {}
+        out = subprocess.check_output(
+            ["rustc", "--print", "cfg", "--target", triple], text=True
+        )
+        names: set[str] = set()
+        pairs: dict[str, set[str]] = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "=" in line:
+                # `key="value"`. Split on the FIRST `=` (rustc never emits a
+                # bare `=` in a key) and strip exactly ONE surrounding quote
+                # pair from the value — not all quote characters — so an
+                # (unlikely) value containing a literal quote is preserved.
+                key, _, val = line.partition("=")
+                val = val.strip()
+                if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                    val = val[1:-1]
+                pairs.setdefault(key.strip(), set()).add(val)
+            else:
+                names.add(line)
+        return frozenset(names), {k: frozenset(v) for k, v in pairs.items()}
+
+    @staticmethod
+    def _parse_workspace_features() -> dict[str, frozenset[str]]:
+        """Return ``{crate: frozenset[defined_feature_name]}`` for the workspace.
+
+        Every feature in a crate's ``[features]`` table (including the
+        implicit ``default``) is a name the feature powerset can toggle, so
+        a ``cfg(feature = "x")`` is reachable iff ``x`` is in this set. Read
+        from the checked-out ``crates/*/Cargo.toml``; in CI that is the clean
+        immutable HEAD tree, so it matches the blob-sourced trust-boundary
+        reads. A ``cfg(feature = ...)`` naming a feature NOT defined here is
+        never compiled by any powerset combination, so it stays fail-closed.
+        """
+        out: dict[str, frozenset[str]] = {}
         crates_dir = TestPolicyAndCiInvariants.WORKSPACE / "crates"
         for cargo_toml in sorted(crates_dir.glob("*/Cargo.toml")):
             data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
             features = data.get("features")
             if not isinstance(features, dict):
+                out[cargo_toml.parent.name] = frozenset()
                 continue
-            crate_name = cargo_toml.parent.name
-            default = set(features.get("default", []))
-            all_feats = {k for k in features if k != "default"}
-            out[crate_name] = {"default": default, "all": all_feats}
-        return out
-
-    @classmethod
-    def _parse_non_default_features(cls) -> dict[str, list[str]]:
-        """Return {crate_name: [non_default_feature, ...]} for the workspace.
-
-        Thin wrapper around :func:`_parse_workspace_features` kept for the
-        H4b assertion's pre-existing shape.
-        """
-        out: dict[str, list[str]] = {}
-        for crate, feats in cls._parse_workspace_features().items():
-            non_default = sorted(feats["all"] - feats["default"])
-            if non_default:
-                out[crate] = non_default
+            out[cargo_toml.parent.name] = frozenset(features.keys())
         return out
 
     @staticmethod
@@ -1950,88 +1983,10 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
             return parts[1]
         return None
 
-    # Rust `cfg` shorthand → expanded predicate. `target_os = "linux"` /
-    # `target_os = "macos"` etc. each imply target_family = "unix"; Windows
-    # implies target_family = "windows". The mapping is used to compute the
-    # "active names" set for each matrix leg.
-    _UNIX_TARGET_OS = frozenset({"linux", "macos", "freebsd", "netbsd", "openbsd"})
-
-    # Atom names whose meaning is "always true under cargo test" — these are
-    # active in EVERY matrix-leg environment, so a trust-boundary cfg of, say,
-    # `#[cfg(test)]` is automatically covered.
+    # Atom cfg names that are active in every coverage build regardless of
+    # target or feature selection (the build is a debug test build). rustc's
+    # ``--print cfg`` does not list these, so the evaluator adds them.
     _ALWAYS_ACTIVE = frozenset({"test", "debug_assertions"})
-
-    # Known per-(target_os, target_arch) target predicates that both GitHub
-    # runners populate. Populating these in the eval env keeps the structural
-    # parser from fail-closed-rejecting legitimate cfg forms the old regex
-    # accepted — e.g. `cfg(target_pointer_width = "64")` is true on both legs.
-    # Anything not in this table evaluates to False (fail closed), which the
-    # caller treats as an offender.
-    _TARGET_PROFILE: dict[tuple[str, str], dict[str, str]] = {
-        ("linux", "x86_64"): {
-            "target_env": "gnu",
-            "target_vendor": "unknown",
-            "target_pointer_width": "64",
-            "target_endian": "little",
-        },
-        ("macos", "aarch64"): {
-            "target_env": "",
-            "target_vendor": "apple",
-            "target_pointer_width": "64",
-            "target_endian": "little",
-        },
-    }
-
-    @classmethod
-    def _leg_env(
-        cls,
-        leg: dict[str, str],
-        ci_features: frozenset[str],
-        workspace_features: dict[str, dict[str, set[str]]],
-    ) -> dict[str, object]:
-        """Build a cfg-evaluation environment for one matrix leg.
-
-        Returns a dict with the scalar target keys (``target_os``,
-        ``target_arch``, ``target_family``, plus ``target_env``,
-        ``target_vendor``, ``target_pointer_width``, ``target_endian`` from
-        :attr:`_TARGET_PROFILE`), an ``active_features`` map
-        ``{crate: frozenset[bare_feature_name]}`` of every feature cargo
-        activates for that crate under this leg (the crate's defaults
-        unioned with anything ``ci_features`` explicitly enables via
-        ``<crate>/<feature>``), and the ``names`` set of atom cfg names
-        active in this leg (``test``, ``debug_assertions``, ``unix`` /
-        ``windows``, etc.). Predicates the parser does not understand, or
-        whose key is not in the env, fail closed at the caller.
-        """
-        target_os = leg.get("target_os", "")
-        target_arch = leg.get("target_arch", "")
-        if target_os in cls._UNIX_TARGET_OS:
-            family = "unix"
-        elif target_os == "windows":
-            family = "windows"
-        else:
-            family = ""
-        names = set(cls._ALWAYS_ACTIVE)
-        if family:
-            names.add(family)
-        active_features: dict[str, frozenset[str]] = {}
-        for crate, feats in workspace_features.items():
-            crate_active = set(feats["default"])
-            for spec in ci_features:
-                if "/" in spec:
-                    c, name = spec.split("/", 1)
-                    if c == crate:
-                        crate_active.add(name)
-            active_features[crate] = frozenset(crate_active)
-        env: dict[str, object] = {
-            "target_os": target_os,
-            "target_arch": target_arch,
-            "target_family": family,
-            "active_features": active_features,
-            "names": frozenset(names),
-        }
-        env.update(cls._TARGET_PROFILE.get((target_os, target_arch), {}))
-        return env
 
     # --- structural cfg parser ----------------------------------------------
     #
@@ -2143,37 +2098,77 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
         return _CfgLiteral(name), i
 
     @classmethod
-    def _eval_cfg(
-        cls, pred: "_CfgPred", env: dict[str, object], crate: str | None
-    ) -> bool:
-        """Evaluate a parsed cfg predicate against a per-leg env + file crate.
+    def _feature_atoms(cls, pred: "_CfgPred", defined: frozenset[str]) -> list[str]:
+        """Collect the distinct DEFINED features `pred` references.
 
-        ``crate`` is the workspace crate the file belongs to (e.g.
-        ``chaffra-telemetry``); needed to resolve `feature = "x"` against
-        the crate's own active feature set, since `--features <crate>/<x>`
-        only enables `x` on `<crate>`.
+        Only features in ``defined`` are free variables (the powerset toggles
+        them). A ``feature = "x"`` naming an undefined feature is not free —
+        it is fixed off, because no powerset combination enables a feature
+        that does not exist.
         """
+        found: set[str] = set()
+
+        def walk(p: _CfgPred) -> None:
+            if isinstance(p, _CfgEquals):
+                if p.key == "feature" and p.value in defined:
+                    found.add(p.value)
+            elif isinstance(p, _CfgNot):
+                walk(p.child)
+            elif isinstance(p, (_CfgAny, _CfgAll)):
+                for c in p.children:
+                    walk(c)
+
+        walk(pred)
+        return sorted(found)
+
+    @classmethod
+    def _eval_cfg(
+        cls,
+        pred: "_CfgPred",
+        names: frozenset[str],
+        pairs: dict[str, frozenset[str]],
+        feature_on: frozenset[str],
+    ) -> bool:
+        """Evaluate `pred` under one leg's rustc cfg (``names``/``pairs``) and
+        a concrete feature assignment (``feature_on`` = enabled features;
+        anything absent is disabled)."""
         if isinstance(pred, _CfgEquals):
             if pred.key == "feature":
-                if crate is None:
-                    # No crate context (path outside `crates/`) — cannot
-                    # resolve a feature reference; fail closed.
-                    return False
-                active_features = env["active_features"]
-                assert isinstance(active_features, dict)
-                return pred.value in active_features.get(crate, frozenset())
-            return env.get(pred.key) == pred.value
+                return pred.value in feature_on
+            return pred.value in pairs.get(pred.key, frozenset())
         if isinstance(pred, _CfgLiteral):
-            names = env["names"]
-            assert isinstance(names, frozenset)
-            return pred.name in names
+            return pred.name in names or pred.name in cls._ALWAYS_ACTIVE
         if isinstance(pred, _CfgNot):
-            return not cls._eval_cfg(pred.child, env, crate)
+            return not cls._eval_cfg(pred.child, names, pairs, feature_on)
         if isinstance(pred, _CfgAny):
-            return any(cls._eval_cfg(c, env, crate) for c in pred.children)
+            return any(cls._eval_cfg(c, names, pairs, feature_on) for c in pred.children)
         if isinstance(pred, _CfgAll):
-            return all(cls._eval_cfg(c, env, crate) for c in pred.children)
+            return all(cls._eval_cfg(c, names, pairs, feature_on) for c in pred.children)
         raise _CfgParseError(f"unknown predicate node {pred!r}")
+
+    @classmethod
+    def _coverable(
+        cls,
+        pred: "_CfgPred",
+        legs_cfg: list[tuple[frozenset[str], dict[str, frozenset[str]]]],
+        defined: frozenset[str],
+    ) -> bool:
+        """Is `pred` satisfiable on SOME leg under SOME feature assignment the
+        powerset covers?
+
+        Brute-forces the (small) powerset of the predicate's free defined
+        features against each leg's authoritative rustc cfg. Coverable means
+        cargo-hack's powerset compiles the gated code on at least one leg, so
+        it reaches LCOV; not coverable means no built (leg × feature-combo)
+        compiles it — a genuine coverage gap → offender.
+        """
+        feats = cls._feature_atoms(pred, defined)
+        for names, pairs in legs_cfg:
+            for bits in itertools.product((False, True), repeat=len(feats)):
+                feature_on = frozenset(f for f, on in zip(feats, bits) if on)
+                if cls._eval_cfg(pred, names, pairs, feature_on):
+                    return True
+        return False
 
     # Markers for the H4a scanner: outer (`#[...]`) and inner (`#![...]`)
     # forms of `cfg(...)` and `cfg_attr(P, ...)`. The inner form gates an
@@ -2328,38 +2323,28 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
             pos += size + 1
         return blobs
 
+    @unittest.skipUnless(shutil.which("rustc"), "rustc not available")
     def test_trust_boundary_target_cfg_is_covered_by_matrix(self) -> None:
-        """H4a (fail-closed structural variant): every `cfg` / `cfg_attr`
-        in a trust-boundary file must be satisfiable by some matrix leg.
+        """H4a: every `cfg` / `cfg_attr` in a trust-boundary file must be
+        coverable by (some matrix leg) × (the feature powerset).
 
-        Differs from the prior regex scan in three durable ways:
-
-          * **Policy globs are expanded.** Uses the checker's own glob
-            expansion against the immutable head tree, so a sanctioned
-            wildcard pattern is not silently dropped.
-          * **Structural cfg parsing.** Tokenizer + recursive-descent
-            parser handles any/all/not, inner cfg, `cfg_attr`, multi-line
-            forms, and every `target_*` predicate (not just os/arch).
-            Anything the grammar doesn't understand fails closed.
-          * **Immutable source.** Reads each file from ``git show HEAD:<rel>``
-            rather than the worktree, so dirty in-progress edits cannot
-            falsify the guard.
+          * **Targets** come from ``rustc --print cfg --target <triple>``
+            per leg — authoritative, no hand-maintained table.
+          * **Features** are free variables (cargo-hack instruments the full
+            powerset), bounded to each crate's defined features.
+          * **Policy globs are expanded** via the checker's own glob
+            expansion against the immutable head tree.
+          * **Structural cfg parsing** (tokenizer + recursive descent)
+            handles any/all/not, inner cfg, `cfg_attr`, multi-line forms,
+            and every `target_*` predicate; anything it cannot understand
+            fails closed.
+          * **Immutable source** — each file is read from the HEAD blob, so
+            a dirty worktree cannot falsify the guard.
         """
-        legs = self._matrix_legs()
-        self.assertTrue(legs, "no coverage matrix legs parsed from ci.yml")
-        ci_features = self._extract_features_arg(
-            (self.WORKSPACE / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        )
+        triples = self._matrix_target_triples()
+        self.assertTrue(triples, "no matrix target triples parsed from ci.yml")
+        legs_cfg = [self._rustc_target_cfg(t) for t in triples]
         workspace_features = self._parse_workspace_features()
-        # Each matrix leg runs `cargo llvm-cov` TWICE — once with the explicit
-        # `--features` set and once with no non-default features — so both
-        # `cfg(feature = "x")` and `cfg(not(feature = "x"))` branches reach
-        # LCOV. The H4a guard mirrors that by considering BOTH profiles per
-        # leg when evaluating whether the matrix can instrument a predicate.
-        leg_envs: list[dict[str, object]] = []
-        for leg in legs:
-            leg_envs.append(self._leg_env(leg, frozenset(ci_features), workspace_features))
-            leg_envs.append(self._leg_env(leg, frozenset(), workspace_features))
 
         tb_paths = self._expand_policy_paths()
         self.assertTrue(tb_paths, "policy paths set is empty — parser regression")
@@ -2377,6 +2362,7 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 offenders.append((rel, "missing from head tree"))
                 continue
             crate = self._file_crate(rel)
+            defined = workspace_features.get(crate, frozenset()) if crate else frozenset()
             try:
                 attrs = self._scan_cfg_attributes(source)
             except _CfgParseError as exc:
@@ -2388,94 +2374,27 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
                 except _CfgParseError as exc:
                     offenders.append((rel, f"cfg({attr_src}): {exc}"))
                     continue
-                if not any(self._eval_cfg(pred, env, crate) for env in leg_envs):
-                    offenders.append((rel, f"cfg({attr_src}) not satisfied by any matrix leg"))
+                if not self._coverable(pred, legs_cfg, defined):
+                    offenders.append((rel, f"cfg({attr_src}) not coverable by the matrix"))
         self.assertEqual(
             offenders,
             [],
-            "trust-boundary file contains a cfg the coverage matrix does not "
-            "build, or a conditional form this guard does not understand "
-            "(fail-closed). Either add a matrix leg in "
-            ".github/workflows/ci.yml (with a matching `covers:` field), "
-            "split the cfg, or remove the unsupported form.\n"
-            f"Offenders: {offenders}",
+            "trust-boundary file contains a cfg no (matrix leg × feature "
+            "combination) compiles, so its lines reach no LCOV — or a "
+            "conditional form this guard cannot understand (fail-closed). "
+            "Add a matrix leg in .github/workflows/ci.yml (with a matching "
+            "`triple:` field), split the cfg, or remove the unsupported "
+            f"form.\nOffenders: {offenders}",
         )
 
     @staticmethod
-    def _extract_all_features_args(text: str) -> list[set[str]]:
-        """Return the concrete `--features` set for EVERY actual
-        `cargo llvm-cov --workspace` invocation in ``text``, in order.
-
-        Each list entry is one invocation's feature set; an invocation with
-        no `--features` argument contributes an empty set. Comment lines
-        (YAML `#`, Markdown prose, C-style `//`) are filtered out before
-        scanning so a prose mention of the command cannot satisfy the
-        check. The remaining lines are joined across bash `\\`-newline
-        continuations and tokenized with ``shlex``; the value following
-        ``--features`` (or ``--features=...``) is parsed as cargo's space-
-        or comma-separated list. Returns the empty list when no invocation
-        is found.
-        """
-        command_lines: list[str] = []
-        for raw in text.splitlines():
-            stripped = raw.lstrip()
-            if stripped.startswith("#") or stripped.startswith("//"):
-                continue
-            command_lines.append(raw)
-        joined = "\n".join(command_lines)
-        anchor = "cargo llvm-cov --workspace"
-        results: list[set[str]] = []
-        n = len(joined)
-        pos = 0
-        while True:
-            start = joined.find(anchor, pos)
-            if start < 0:
-                break
-            invocation: list[str] = []
-            i = start
-            while i < n:
-                ch = joined[i]
-                if ch == "\n":
-                    break
-                if ch == "\\" and i + 1 < n and joined[i + 1] == "\n":
-                    invocation.append(" ")
-                    i += 2
-                    continue
-                invocation.append(ch)
-                i += 1
-            try:
-                tokens = shlex.split("".join(invocation))
-            except ValueError as exc:
-                raise AssertionError(
-                    f"could not tokenize cargo invocation: {exc}\n"
-                    f"line: {''.join(invocation)!r}"
-                ) from exc
-            features: set[str] = set()
-            j = 0
-            while j < len(tokens):
-                t = tokens[j]
-                if t == "--features" and j + 1 < len(tokens):
-                    for f in tokens[j + 1].replace(",", " ").split():
-                        features.add(f)
-                    j += 2
-                    continue
-                if t.startswith("--features="):
-                    for f in t.split("=", 1)[1].replace(",", " ").split():
-                        features.add(f)
-                j += 1
-            results.append(features)
-            pos = i  # continue past this invocation's newline
-        return results
-
-    @classmethod
-    def _extract_features_arg(cls, text: str) -> set[str]:
-        """Return the feature set of the FIRST `cargo llvm-cov --workspace`
-        invocation in ``text``. Wrapper around
-        :meth:`_extract_all_features_args` for callers (the H4a leg-env
-        builder) that need the features-on profile specifically.
-        """
-        invocations = cls._extract_all_features_args(text)
-        return invocations[0] if invocations else set()
+    def _non_comment_text(text: str) -> str:
+        """Drop comment/prose lines (`#`, `//`) so a mention in a comment or
+        Markdown paragraph cannot satisfy a structural CI-command check."""
+        return "\n".join(
+            raw for raw in text.splitlines()
+            if not raw.lstrip().startswith(("#", "//"))
+        )
 
     def test_scan_cfg_attributes_finds_inner_attribute_form(self) -> None:
         # Regression guard: `#![cfg(...)]` (inner attribute) gates an entire
@@ -2513,56 +2432,113 @@ class TestPolicyAndCiInvariants(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertEqual(self._scan_cfg_attributes(src), expected)
 
-    def test_ci_coverage_command_enumerates_every_non_default_feature(self) -> None:
-        # H4b: previously this test searched the entire YAML and Markdown
-        # text for each `<crate>/<feature>` token, so a comment that
-        # mentioned the feature would satisfy the check even if the actual
-        # `--features` argument had dropped it. Here we parse the literal
-        # cargo invocations (both, per the dual-profile design) from both
-        # files and compare each profile to the contract:
-        #   * features-on (the FIRST invocation)  must equal the workspace's
-        #     non-default feature set;
-        #   * features-off (the SECOND invocation) must pass NO features —
-        #     otherwise the `cfg(not(feature = "x"))` branches the dual-
-        #     profile design is meant to cover would still be missed.
-        non_default = self._parse_non_default_features()
-        expected_on = {
-            f"{crate}/{feat}"
-            for crate, feats in non_default.items()
-            for feat in feats
-        }
-
+    def test_coverage_build_uses_feature_powerset(self) -> None:
+        # H4b: feature exhaustiveness is delegated to `cargo hack
+        # --feature-powerset`, which instruments EVERY feature combination
+        # (so both `cfg(feature="x")` and `cfg(not(feature="x"))`, and all
+        # combinations for N>1 features, reach LCOV). This replaces the
+        # earlier hand-enumerated `--features` list that only covered a fixed
+        # N=1 pair and silently regressed when a second feature landed. The
+        # check is structural: the powerset driver and the report step must
+        # appear in the actual command (comment/prose lines are stripped so a
+        # mention cannot satisfy it), and no restricting `--features` is
+        # passed to the powerset driver (which would defeat exhaustiveness).
         for path_rel, label in (
             (".github/workflows/ci.yml", "ci.yml"),
             ("CONTRIBUTING.md", "CONTRIBUTING.md"),
         ):
-            invocations = self._extract_all_features_args(
-                (TestPolicyAndCiInvariants.WORKSPACE / path_rel).read_text(encoding="utf-8")
-            )
+            text = (TestPolicyAndCiInvariants.WORKSPACE / path_rel).read_text(encoding="utf-8")
+            cmd = self._non_comment_text(text)
             with self.subTest(file=label):
-                self.assertEqual(
-                    len(invocations),
-                    2,
-                    f"{label}: expected exactly TWO `cargo llvm-cov --workspace` "
-                    f"invocations (features-on + features-off), found {len(invocations)}.",
+                self.assertIn(
+                    "cargo hack --feature-powerset",
+                    cmd,
+                    f"{label}: the coverage build must drive `cargo llvm-cov` "
+                    "through `cargo hack --feature-powerset` so every feature "
+                    "combination is instrumented; a hand-enumerated --features "
+                    "list silently regresses when a second non-default feature "
+                    "is added.",
                 )
-                self.assertEqual(
-                    invocations[0],
-                    expected_on,
-                    f"{label}: features-on invocation `--features` argument "
-                    f"{sorted(invocations[0])} does not match the workspace "
-                    f"non-default feature set {sorted(expected_on)}. Update the "
-                    "invocation in lockstep with new non-default features so "
-                    "their executable code reaches LCOV.",
+                self.assertIn(
+                    "cargo llvm-cov report --lcov",
+                    cmd,
+                    f"{label}: feature-powerset coverage accumulates per-combo "
+                    "profraw via `--no-report`; the merged LCOV must be produced "
+                    "by `cargo llvm-cov report --lcov`.",
                 )
-                self.assertEqual(
-                    invocations[1],
-                    set(),
-                    f"{label}: features-off invocation must pass NO `--features` "
-                    f"so `cfg(not(feature = \"x\"))` branches reach LCOV. "
-                    f"Got {sorted(invocations[1])}. Drop the `--features` "
-                    "argument from this invocation.",
-                )
+                # The powerset driver line must not also pin `--features`,
+                # which would collapse the powerset to a single combination.
+                for line in cmd.splitlines():
+                    if "cargo hack --feature-powerset" in line:
+                        self.assertNotIn(
+                            "--features",
+                            line,
+                            f"{label}: `cargo hack --feature-powerset` must not "
+                            "also pass `--features` — that pins one combination "
+                            "and defeats the powerset.",
+                        )
+                # The guard hardcodes `debug_assertions` as active (the
+                # coverage build is a debug test build). Pin that assumption:
+                # a `--release` coverage build would drop `cfg(debug_assertions)`
+                # code from every LCOV while the guard still treats it as
+                # always-covered — a silent false negative. Fail loudly if the
+                # coverage command ever goes release.
+                for line in cmd.splitlines():
+                    if "cargo hack" in line or "cargo llvm-cov" in line:
+                        self.assertNotIn(
+                            "--release",
+                            line,
+                            f"{label}: the coverage build must stay a debug "
+                            "build — the H4a guard assumes `debug_assertions` "
+                            "is active. A release coverage build would silently "
+                            "drop `cfg(debug_assertions)` trust-boundary code.",
+                        )
+
+    def test_merge_job_leg_count_matches_triples(self) -> None:
+        # The merge job refuses a partial LCOV set by comparing the number of
+        # downloaded LCOVs to a shell `grep -cE '^[[:space:]]+triple:'` over
+        # ci.yml. That shell counter and the Python `_matrix_target_triples`
+        # parser use different matching rules; if they ever disagree the merge
+        # job could reject a complete set (or accept a partial one). Pin them
+        # to the same answer by replicating the shell count here.
+        ci_path = TestPolicyAndCiInvariants.WORKSPACE / ".github" / "workflows" / "ci.yml"
+        text = ci_path.read_text(encoding="utf-8")
+        shell_count = sum(
+            1 for raw in text.splitlines() if re.match(r"[ \t]+triple:", raw)
+        )
+        python_count = len(self._matrix_target_triples())
+        self.assertEqual(
+            shell_count,
+            python_count,
+            "the merge job's `grep -cE '^[[:space:]]+triple:'` leg count "
+            f"({shell_count}) disagrees with `_matrix_target_triples()` "
+            f"({python_count}). Both must resolve to exactly the matrix legs; "
+            "a divergence makes the merge job's partial-data check wrong.",
+        )
+
+    def test_feature_powerset_size_is_bounded(self) -> None:
+        # `cargo hack --feature-powerset` runs 2**N instrumented builds for a
+        # crate with N features, and the guard's `_coverable` brute-forces the
+        # same 2**N per predicate. Both are fine for the current workspace
+        # (max is chaffra-telemetry at 2 features), but a crate that grows many
+        # features would explode CI time and the guard. Make that cost
+        # assumption explicit: a crate exceeding the bound must consciously cap
+        # the powerset (e.g. `cargo hack --depth`) rather than silently blow
+        # the `coverage-instrument` timeout.
+        max_features = 6  # 2**6 = 64 combos/crate — generous headroom over 2
+        offenders = {
+            crate: len(feats)
+            for crate, feats in self._parse_workspace_features().items()
+            if len(feats) > max_features
+        }
+        self.assertEqual(
+            offenders,
+            {},
+            f"crate(s) define more than {max_features} features, so the "
+            "feature powerset (2**N per crate) would explode the coverage "
+            f"build and the guard: {offenders}. Cap the powerset depth in the "
+            "coverage command and revisit this bound.",
+        )
 
 
 if __name__ == "__main__":
