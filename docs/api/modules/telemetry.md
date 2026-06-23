@@ -73,10 +73,52 @@ Per-module initialization time (relevant post-Phase 11 when all modules are gRPC
 
 | Audience | Scope | Default |
 |----------|-------|---------|
-| User-facing | Finding counts, durations, health scores in output | on |
-| Operator | Call latencies, error rates, memory pressure to backends | on |
+| User-facing | Finding counts, durations, health scores in output | **on** |
+| Operator | Call latencies, error rates, startup/connection failures to backends | **off** |
 
-Control via `--telemetry on|off|user-only|operator-only`.
+The default audience is `user-only`: a default invocation collects user-facing
+summary metrics only and **cannot** emit operator metrics. Operator telemetry
+is opt-in.
+
+### Audience modes
+
+| Mode | User-facing | Operator | Projection at emission boundaries |
+|------|-------------|----------|-----------------------------------|
+| `on` | yes | yes | snapshot kept whole |
+| `user-only` (default) | yes | no | `operator_summary` and every operator-only data point are stripped before any flush/persistence |
+| `operator-only` | no | yes | `user_summary` is stripped before any flush/persistence |
+| `off` | no | no | telemetry is disabled; nothing is collected or emitted |
+
+Enable operator telemetry explicitly via either:
+
+- the CLI flag: `--telemetry on` or `--telemetry operator-only`; or
+- the file setting: `[modules.telemetry] audience = "on" | "operator-only"`.
+
+Precedence: an explicit `--telemetry` flag overrides the file `audience`, which
+overrides the `user-only` default. An unrecognised audience value (CLI or file)
+is rejected with an actionable error — it is never coerced to a default that
+would widen emission (fail-closed).
+
+Operator-only data points (matched by metric-name prefix) are:
+`chaffra.module.call_duration_ms`, `chaffra.module.error_total`,
+`chaffra.module.startup_duration_ms`, `chaffra.module.load_error_total`,
+`chaffra.startup.*`, `chaffra.plugin.*`, `chaffra.config.parse_error_total`.
+Projection is applied at every emission boundary (telemetry-module backend
+flush and the CLI `run_with_telemetry` success and failure flush paths) before
+filtering, persistence, or backend write, so operator-only fields never cross a
+user-facing boundary.
+
+#### GDPR rationale
+
+Operator metrics describe process- and environment-shaped behaviour (per-module
+latencies, error/connection failures, startup timing) that can be combined with
+deployment context to characterise an individual operator or environment. Under
+GDPR data-minimisation (Art. 5(1)(c)) such operational metadata should not be
+collected or forwarded unless explicitly justified. Defaulting to `user-only`
+makes operator emission an explicit, auditable opt-in rather than implicit
+behaviour. (Wiring an audit-log accountability event when operator telemetry is
+activated is tracked separately; see the `TODO(issue)` in
+`crates/chaffra-cli/src/main.rs::merge_telemetry_config`.)
 
 ## Backends
 
@@ -115,7 +157,7 @@ sampling-strategy = "rate"  # rate | on-change
 
 ```toml
 [modules.telemetry]
-audience = "on"              # on | off | user-only | operator-only
+audience = "user-only"       # on | off | user-only (default) | operator-only
 backend = "json-file"        # json-file | stderr | prometheus | otlp | statsd | cloudwatch
 endpoint = ""                # For OTLP/StatsD/CloudWatch
 path = "chaffra-telemetry.json"  # For json-file backend
@@ -175,10 +217,26 @@ chaffra telemetry dashboard   # Generate Grafana dashboard JSON
 chaffra telemetry audit-log   # Display telemetry audit log
 
 # Global flags on all commands:
---telemetry on|off|user-only|operator-only
+--telemetry on|off|user-only|operator-only   # default: user-only (operator metrics off)
 --telemetry-backend json-file|stderr|otlp|statsd
 --telemetry-endpoint http://localhost:4317
 ```
+
+## Migration notes (Phase 15a.1)
+
+- **Default audience changed from `on` to `user-only`.** Runs that previously
+  emitted operator metrics (call latencies, error/startup/connection counters)
+  to backends by default now emit only user-facing summary metrics. No flag or
+  config was required before; operator emission now requires an explicit opt-in.
+- **To restore the prior behaviour**, pass `--telemetry on` or set
+  `[modules.telemetry] audience = "on"`. To collect operator metrics only, use
+  `--telemetry operator-only` / `audience = "operator-only"`.
+- **Invalid audience values now fail closed.** A typo in `--telemetry` or in
+  `[modules.telemetry] audience` is now a hard error instead of silently
+  falling back to a default. Fix the value to proceed.
+- No on-disk format, metric names, backend payloads, or gRPC schema changed.
+  Existing dashboards and backends continue to work once operator telemetry is
+  re-enabled.
 
 ## MCP Tool
 

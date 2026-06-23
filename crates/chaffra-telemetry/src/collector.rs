@@ -1,12 +1,38 @@
 //! Telemetry collector: aggregates metrics and spans from all modules.
 
-use crate::config::TelemetryConfig;
+use crate::config::{TelemetryAudience, TelemetryConfig};
 use crate::error::Result;
 use crate::metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Metric-name prefixes whose data points describe operator-level system
+/// behaviour (call latencies, error/connection failures, process startup)
+/// rather than user-facing analysis results.
+///
+/// These are projected out of a snapshot for any audience that does not have
+/// the operator scope enabled. The list is matched by prefix so that labelled
+/// variants (e.g. `chaffra.module.call_duration_ms` carrying a `module` label)
+/// are all covered.
+const OPERATOR_METRIC_PREFIXES: &[&str] = &[
+    "chaffra.module.call_duration_ms",
+    "chaffra.module.error_total",
+    "chaffra.module.startup_duration_ms",
+    "chaffra.module.load_error_total",
+    "chaffra.startup.",
+    "chaffra.plugin.",
+    "chaffra.config.parse_error_total",
+];
+
+/// Whether a metric data point is operator-only and must be withheld from a
+/// user-facing emission boundary.
+fn is_operator_metric(name: &str) -> bool {
+    OPERATOR_METRIC_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
 
 /// Aggregated telemetry snapshot from a single analysis run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +84,72 @@ pub struct OperatorSummary {
     pub module_call_durations: HashMap<String, u64>,
     /// Per-module error counts.
     pub module_error_counts: HashMap<String, u64>,
+}
+
+impl TelemetrySnapshot {
+    /// Project this snapshot down to exactly what the given audience is allowed
+    /// to see, returning a new snapshot. This is the privacy boundary: it MUST
+    /// be applied before any filtering, aggregation, persistence, history
+    /// recording, or backend emission so that operator-only fields never cross
+    /// a user-facing boundary even temporarily.
+    ///
+    /// Semantics for every audience mode:
+    /// - [`TelemetryAudience::On`]: keep everything (user + operator).
+    /// - [`TelemetryAudience::UserOnly`]: drop `operator_summary` and every
+    ///   operator-only data point; keep the user summary, definitions, spans,
+    ///   and user-facing data points.
+    /// - [`TelemetryAudience::OperatorOnly`]: drop `user_summary`; keep the
+    ///   operator summary and all data points/spans/definitions.
+    /// - [`TelemetryAudience::Off`]: drop both summaries and all data
+    ///   points/spans/definitions, leaving only the timestamp shell.
+    #[must_use]
+    pub fn project_for_audience(&self, audience: TelemetryAudience) -> Self {
+        let keep_user = audience.user_enabled();
+        let keep_operator = audience.operator_enabled();
+
+        let data_points = self
+            .data_points
+            .iter()
+            .filter(|dp| {
+                if is_operator_metric(&dp.name) {
+                    keep_operator
+                } else {
+                    keep_user
+                }
+            })
+            .cloned()
+            .collect();
+
+        // Definitions, spans, and the timestamp are descriptive metadata; they
+        // only travel with non-disabled telemetry. When neither audience is
+        // enabled (`Off`) we strip them too so a flushed shell carries nothing.
+        let any_enabled = keep_user || keep_operator;
+
+        Self {
+            timestamp_ms: self.timestamp_ms,
+            definitions: if any_enabled {
+                self.definitions.clone()
+            } else {
+                HashMap::new()
+            },
+            data_points,
+            spans: if any_enabled {
+                self.spans.clone()
+            } else {
+                Vec::new()
+            },
+            user_summary: if keep_user {
+                self.user_summary.clone()
+            } else {
+                UserSummary::default()
+            },
+            operator_summary: if keep_operator {
+                self.operator_summary.clone()
+            } else {
+                OperatorSummary::default()
+            },
+        }
+    }
 }
 
 /// Thread-safe telemetry collector.
@@ -767,6 +859,132 @@ mod tests {
                 .definitions
                 .contains_key("chaffra.startup.total_duration_ms")
         );
+    }
+
+    /// Build a snapshot that contains both user-facing and operator-only
+    /// data so projection can be checked exhaustively.
+    fn snapshot_with_mixed_metrics() -> TelemetrySnapshot {
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(7);
+        // Operator-only metrics (call duration + error).
+        collector.record_module_call("dead-code", 42, true);
+        collector.record_module_startup("dead-code", 5);
+        collector.record_startup_total(120);
+        collector.record_plugin_connect_error("fastapi");
+        collector.record_config_parse_error();
+        // User-facing metrics (findings).
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 2);
+        collector.record_module_findings("dead-code", 2, &sev);
+        collector.record_module_summary_metric("dead-code", "unused_functions", 3.0);
+        collector.record_span(SpanData {
+            name: "dead-code.analyze".to_owned(),
+            trace_id: "t".to_owned(),
+            span_id: "s".to_owned(),
+            parent_span_id: String::new(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            attributes: HashMap::new(),
+            status: "ok".to_owned(),
+        });
+        collector.snapshot()
+    }
+
+    #[test]
+    fn test_projection_on_keeps_everything() {
+        let snap = snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::On);
+        assert!(!snap.operator_summary.module_call_durations.is_empty());
+        assert_eq!(snap.user_summary.files_total, 7);
+        assert!(!snap.spans.is_empty());
+        assert!(!snap.definitions.is_empty());
+        // Both an operator metric and a user metric survive.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.module.call_duration_ms")
+        );
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.analysis.findings_total")
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_drops_operator() {
+        let snap = snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::UserOnly);
+        // Operator summary is wiped.
+        assert!(snap.operator_summary.module_call_durations.is_empty());
+        assert!(snap.operator_summary.module_error_counts.is_empty());
+        // User summary survives.
+        assert_eq!(snap.user_summary.files_total, 7);
+        assert!(!snap.spans.is_empty());
+        // No operator-only data point may cross the boundary.
+        for dp in &snap.data_points {
+            assert!(
+                !is_operator_metric(&dp.name),
+                "operator metric {} leaked under user-only projection",
+                dp.name
+            );
+        }
+        // User-facing data points remain.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.analysis.findings_total")
+        );
+    }
+
+    #[test]
+    fn test_projection_operator_only_drops_user_summary() {
+        let snap =
+            snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::OperatorOnly);
+        // User summary is wiped...
+        assert_eq!(snap.user_summary.files_total, 0);
+        assert!(snap.user_summary.findings_by_module.is_empty());
+        // ...but operator data survives.
+        assert!(!snap.operator_summary.module_call_durations.is_empty());
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.module.call_duration_ms")
+        );
+    }
+
+    #[test]
+    fn test_projection_off_drops_everything() {
+        let snap = snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::Off);
+        assert!(snap.data_points.is_empty());
+        assert!(snap.spans.is_empty());
+        assert!(snap.definitions.is_empty());
+        assert_eq!(snap.user_summary.files_total, 0);
+        assert!(snap.operator_summary.module_call_durations.is_empty());
+    }
+
+    #[test]
+    fn test_is_operator_metric_classification() {
+        // Operator-only prefixes.
+        for name in [
+            "chaffra.module.call_duration_ms",
+            "chaffra.module.error_total",
+            "chaffra.module.startup_duration_ms",
+            "chaffra.module.load_error_total",
+            "chaffra.startup.total_duration_ms",
+            "chaffra.plugin.connect_error_total",
+            "chaffra.config.parse_error_total",
+        ] {
+            assert!(is_operator_metric(name), "{name} should be operator-only");
+        }
+        // User-facing metrics.
+        for name in [
+            "chaffra.analysis.findings_total",
+            "chaffra.analysis.findings_by_severity",
+            "chaffra.findings.churn_rate",
+            "chaffra.module.dead-code.unused_functions",
+        ] {
+            assert!(!is_operator_metric(name), "{name} should be user-facing");
+        }
     }
 
     #[test]

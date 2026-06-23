@@ -112,7 +112,7 @@ Active configuration (redacted secrets).
 
 ```json
 {
-  "audience": "On",
+  "audience": "user-only",
   "sampling_rate": 1.0,
   "sampling_strategy": "Rate",
   "backends": ["JsonFile"]

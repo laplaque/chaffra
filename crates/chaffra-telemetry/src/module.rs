@@ -42,8 +42,10 @@ impl TelemetryModule {
             .unwrap_or_else(TelemetryCollector::with_defaults)
     }
 
-    fn get_config(&self, config: &HashMap<String, String>) -> TelemetryConfig {
-        TelemetryConfig::from_module_config(config)
+    fn get_config(&self, config: &HashMap<String, String>) -> Result<TelemetryConfig> {
+        // Preserve the typed config error (fail closed) rather than coercing an
+        // invalid audience to a default that would widen emission.
+        TelemetryConfig::from_module_config(config).map_err(|e| ChaffraError::Config(e.to_string()))
     }
 }
 
@@ -105,7 +107,7 @@ impl AnalysisModule for TelemetryModule {
         _files: &[FileInfo],
         config: &HashMap<String, String>,
     ) -> Result<AnalysisResult> {
-        let tel_config = self.get_config(config);
+        let tel_config = self.get_config(config)?;
         let collector = self.get_collector();
 
         // Create backends and check status.
@@ -148,11 +150,15 @@ impl AnalysisModule for TelemetryModule {
             },
         });
 
-        // Flush to backends if operator telemetry is enabled.
+        // Flush to backends if operator telemetry is enabled. Project to the
+        // configured audience BEFORE emission so the persisted payload never
+        // carries fields the audience is not entitled to (and so raw
+        // operator-only fields never cross this persistence boundary unprojected).
         if tel_config.audience.operator_enabled() {
+            let projected = snapshot.project_for_audience(tel_config.audience);
             let (active_backends, _) = backends::create_backends(&tel_config.backends);
             for backend in &active_backends {
-                if let Err(e) = backend.flush(&snapshot) {
+                if let Err(e) = backend.flush(&projected) {
                     eprintln!("[telemetry] backend '{}' flush error: {e}", backend.name());
                 }
             }
@@ -373,6 +379,78 @@ mod tests {
         let finding = backend_status_finding(&status);
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.message.contains("connected"));
+    }
+
+    #[test]
+    fn test_get_config_invalid_audience_is_error() {
+        let module = TelemetryModule::new();
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), "everyone".to_owned());
+        let err = module.analyze(&[], &config).unwrap_err();
+        assert!(
+            matches!(err, ChaffraError::Config(ref m) if m.contains("invalid telemetry audience")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_audience_does_not_flush_operator_metrics() {
+        // With no `audience` key the default (user-only) applies, so the
+        // operator backend flush branch must NOT run: the JSON file is never
+        // written.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("telemetry.json");
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 10, false);
+        let module = TelemetryModule::with_collector(collector);
+
+        let mut config = HashMap::new();
+        config.insert("backend".to_owned(), "json-file".to_owned());
+        config.insert("path".to_owned(), path.to_str().unwrap().to_owned());
+        // No audience key -> default user-only.
+
+        let result = module.analyze(&[], &config).unwrap();
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "metric-summary")
+        );
+        assert!(
+            !path.exists(),
+            "default (user-only) audience must not flush operator telemetry to a backend"
+        );
+    }
+
+    #[test]
+    fn test_operator_only_flush_is_projected_before_emission() {
+        // Operator-only: the flushed payload must contain operator data but
+        // NOT the user summary (projection happens before the backend write).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("telemetry.json");
+        let collector = TelemetryCollector::with_defaults();
+        collector.set_files_total(9);
+        collector.record_module_call("dead-code", 10, false);
+        let module = TelemetryModule::with_collector(collector);
+
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), "operator-only".to_owned());
+        config.insert("backend".to_owned(), "json-file".to_owned());
+        config.insert("path".to_owned(), path.to_str().unwrap().to_owned());
+
+        module.analyze(&[], &config).unwrap();
+        assert!(path.exists(), "operator-only audience should flush");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // Operator data present.
+        assert!(
+            !parsed["operator_summary"]["module_call_durations"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        // User summary projected out.
+        assert_eq!(parsed["user_summary"]["files_total"], 0);
     }
 
     #[test]

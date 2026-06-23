@@ -13,6 +13,12 @@ pub enum TelemetryError {
     #[error("invalid backend config: {0}")]
     InvalidBackendConfig(String),
 
+    /// A telemetry audience value could not be parsed.
+    #[error(
+        "invalid telemetry audience: {0:?} (expected one of: on, off, user-only, operator-only)"
+    )]
+    InvalidAudience(String),
+
     /// Backend failed to flush or send data.
     #[error("backend error: {0}")]
     BackendError(String),
