@@ -2,36 +2,32 @@
 
 use crate::config::{TelemetryAudience, TelemetryConfig};
 use crate::error::Result;
+use crate::metrics::metric_names;
 use crate::metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Metric-name prefixes whose data points describe operator-level system
-/// behaviour (call latencies, error/connection failures, process startup)
-/// rather than user-facing analysis results.
+/// Whether a metric (data point or definition) is operator-scoped and must be
+/// withheld from a user-facing emission boundary.
 ///
-/// These are projected out of a snapshot for any audience that does not have
-/// the operator scope enabled. The list is matched by prefix so that labelled
-/// variants (e.g. `chaffra.module.call_duration_ms` carrying a `module` label)
-/// are all covered.
-const OPERATOR_METRIC_PREFIXES: &[&str] = &[
-    "chaffra.module.call_duration_ms",
-    "chaffra.module.error_total",
-    "chaffra.module.startup_duration_ms",
-    "chaffra.module.load_error_total",
-    "chaffra.startup.",
-    "chaffra.plugin.",
-    "chaffra.config.parse_error_total",
-];
-
-/// Whether a metric data point is operator-only and must be withheld from a
-/// user-facing emission boundary.
+/// Classification is by EXACT name against
+/// [`metric_names::OPERATOR`](crate::metrics::metric_names::OPERATOR), the same
+/// set the producers name their metrics from, so producer and classifier cannot
+/// drift. Exact (not prefix) matching is what keeps a per-module summary metric
+/// `chaffra.module.<id>.<key>` from colliding with an operator metric whose name
+/// is a prefix of it (e.g. id `error_total` vs `chaffra.module.error_total`).
 fn is_operator_metric(name: &str) -> bool {
-    OPERATOR_METRIC_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    metric_names::is_operator(name)
+}
+
+/// Whether a span is operator-scoped. Spans are module execution traces
+/// (timing/correlation) — operator-level telemetry by nature — so they are
+/// withheld from any audience without the operator scope, exactly like the
+/// operator data points.
+fn is_operator_span(_span: &SpanData) -> bool {
+    true
 }
 
 /// Aggregated telemetry snapshot from a single analysis run.
@@ -88,28 +84,40 @@ pub struct OperatorSummary {
 
 impl TelemetrySnapshot {
     /// Project this snapshot down to exactly what the given audience is allowed
-    /// to see, returning a new snapshot. This is the privacy boundary: it MUST
-    /// be applied before any filtering, aggregation, persistence, history
-    /// recording, or backend emission so that operator-only fields never cross
-    /// a user-facing boundary even temporarily.
+    /// to see, consuming the snapshot and returning the projected one. This is
+    /// the privacy boundary: it MUST be applied before any filtering,
+    /// aggregation, persistence, history recording, or backend emission so that
+    /// operator-only fields never cross a user-facing boundary even temporarily.
+    ///
+    /// Taking `self` by value avoids a defensive deep clone of the whole
+    /// snapshot on the per-run emission hot path: every caller already owns a
+    /// freshly produced snapshot, so the projection filters and moves the
+    /// retained data instead of cloning it.
+    ///
+    /// Scope is classified at the field level: operator data points
+    /// ([`is_operator_metric`]), spans ([`is_operator_span`] — all spans are
+    /// module execution traces, hence operator-level), and operator metric
+    /// DEFINITIONS are all gated on the operator scope. Keeping operator
+    /// definitions out of a user-only payload matters too: the definition
+    /// catalogue itself discloses which operator metrics exist.
     ///
     /// Semantics for every audience mode:
     /// - [`TelemetryAudience::On`]: keep everything (user + operator).
-    /// - [`TelemetryAudience::UserOnly`]: drop `operator_summary` and every
-    ///   operator-only data point; keep the user summary, definitions, spans,
-    ///   and user-facing data points.
+    /// - [`TelemetryAudience::UserOnly`]: drop `operator_summary`, every
+    ///   operator-only data point, every span, and every operator-only
+    ///   definition; keep the user summary and user-facing data points/definitions.
     /// - [`TelemetryAudience::OperatorOnly`]: drop `user_summary`; keep the
     ///   operator summary and all data points/spans/definitions.
     /// - [`TelemetryAudience::Off`]: drop both summaries and all data
     ///   points/spans/definitions, leaving only the timestamp shell.
     #[must_use]
-    pub fn project_for_audience(&self, audience: TelemetryAudience) -> Self {
+    pub fn project_for_audience(self, audience: TelemetryAudience) -> Self {
         let keep_user = audience.user_enabled();
         let keep_operator = audience.operator_enabled();
 
         let data_points = self
             .data_points
-            .iter()
+            .into_iter()
             .filter(|dp| {
                 if is_operator_metric(&dp.name) {
                     keep_operator
@@ -117,34 +125,45 @@ impl TelemetrySnapshot {
                     keep_user
                 }
             })
-            .cloned()
             .collect();
 
-        // Definitions, spans, and the timestamp are descriptive metadata; they
-        // only travel with non-disabled telemetry. When neither audience is
-        // enabled (`Off`) we strip them too so a flushed shell carries nothing.
-        let any_enabled = keep_user || keep_operator;
+        // Spans are operator-scoped: retain them only when the operator scope
+        // is enabled (covers both `Off`, which keeps neither scope, and
+        // `user-only`, which must not leak module trace/timing spans).
+        let spans = if keep_operator {
+            self.spans.into_iter().filter(is_operator_span).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Definitions are kept per-scope too: a user-facing definition survives
+        // whenever the user scope is on, an operator definition only when the
+        // operator scope is on. Under `Off` neither scope is enabled, so the
+        // catalogue is emptied.
+        let definitions = self
+            .definitions
+            .into_iter()
+            .filter(|(name, _)| {
+                if is_operator_metric(name) {
+                    keep_operator
+                } else {
+                    keep_user
+                }
+            })
+            .collect();
 
         Self {
             timestamp_ms: self.timestamp_ms,
-            definitions: if any_enabled {
-                self.definitions.clone()
-            } else {
-                HashMap::new()
-            },
+            definitions,
             data_points,
-            spans: if any_enabled {
-                self.spans.clone()
-            } else {
-                Vec::new()
-            },
+            spans,
             user_summary: if keep_user {
-                self.user_summary.clone()
+                self.user_summary
             } else {
                 UserSummary::default()
             },
             operator_summary: if keep_operator {
-                self.operator_summary.clone()
+                self.operator_summary
             } else {
                 OperatorSummary::default()
             },
@@ -255,7 +274,7 @@ impl TelemetryCollector {
         // Record as data points.
         let ts = now_ms();
         inner.data_points.push(MetricDataPoint {
-            name: "chaffra.module.call_duration_ms".to_owned(),
+            name: metric_names::MODULE_CALL_DURATION_MS.to_owned(),
             value: duration_ms as f64,
             labels: {
                 let mut m = HashMap::new();
@@ -268,7 +287,7 @@ impl TelemetryCollector {
         if had_error {
             let error_count = inner.module_errors.get(module_id).copied().unwrap_or(1);
             inner.data_points.push(MetricDataPoint {
-                name: "chaffra.module.error_total".to_owned(),
+                name: metric_names::MODULE_ERROR_TOTAL.to_owned(),
                 value: error_count as f64,
                 labels: {
                     let mut m = HashMap::new();
@@ -408,7 +427,7 @@ impl TelemetryCollector {
     pub fn record_module_load_error(&self, module_id: &str, error_type: &str) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.module.load_error_total".to_owned(),
+            name: metric_names::MODULE_LOAD_ERROR_TOTAL.to_owned(),
             value: 1.0,
             labels: {
                 let mut m = HashMap::new();
@@ -424,7 +443,7 @@ impl TelemetryCollector {
     pub fn record_config_parse_error(&self) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.config.parse_error_total".to_owned(),
+            name: metric_names::CONFIG_PARSE_ERROR_TOTAL.to_owned(),
             value: 1.0,
             labels: HashMap::new(),
             timestamp_ms: ts,
@@ -435,7 +454,7 @@ impl TelemetryCollector {
     pub fn record_plugin_connect_error(&self, module_id: &str) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.plugin.connect_error_total".to_owned(),
+            name: metric_names::PLUGIN_CONNECT_ERROR_TOTAL.to_owned(),
             value: 1.0,
             labels: {
                 let mut m = HashMap::new();
@@ -450,7 +469,7 @@ impl TelemetryCollector {
     pub fn record_module_startup(&self, module_id: &str, duration_ms: u64) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.module.startup_duration_ms".to_owned(),
+            name: metric_names::MODULE_STARTUP_DURATION_MS.to_owned(),
             value: duration_ms as f64,
             labels: {
                 let mut m = HashMap::new();
@@ -465,7 +484,7 @@ impl TelemetryCollector {
     pub fn record_startup_total(&self, duration_ms: u64) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.startup.total_duration_ms".to_owned(),
+            name: metric_names::STARTUP_TOTAL_DURATION_MS.to_owned(),
             value: duration_ms as f64,
             labels: HashMap::new(),
             timestamp_ms: ts,
@@ -547,13 +566,13 @@ impl TelemetryCollector {
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.call_duration_ms".to_owned(),
+                name: metric_names::MODULE_CALL_DURATION_MS.to_owned(),
                 kind: MetricKind::Histogram,
                 description: "Per-module call duration".to_owned(),
                 unit: "ms".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.error_total".to_owned(),
+                name: metric_names::MODULE_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "Per-module error count".to_owned(),
                 unit: "count".to_owned(),
@@ -583,31 +602,31 @@ impl TelemetryCollector {
                 unit: "ratio".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.load_error_total".to_owned(),
+                name: metric_names::MODULE_LOAD_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "Module load failures by module_id and error_type".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.config.parse_error_total".to_owned(),
+                name: metric_names::CONFIG_PARSE_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "Config parse failures".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.plugin.connect_error_total".to_owned(),
+                name: metric_names::PLUGIN_CONNECT_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "External module gRPC connection failures".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.startup_duration_ms".to_owned(),
+                name: metric_names::MODULE_STARTUP_DURATION_MS.to_owned(),
                 kind: MetricKind::Histogram,
                 description: "Per-module initialization time".to_owned(),
                 unit: "ms".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.startup.total_duration_ms".to_owned(),
+                name: metric_names::STARTUP_TOTAL_DURATION_MS.to_owned(),
                 kind: MetricKind::Gauge,
                 description: "Total time from process start to all modules ready".to_owned(),
                 unit: "ms".to_owned(),
@@ -878,6 +897,13 @@ mod tests {
         sev.insert("warning".to_owned(), 2);
         collector.record_module_findings("dead-code", 2, &sev);
         collector.record_module_summary_metric("dead-code", "unused_functions", 3.0);
+        // Operator-only parse-cache metric (memory/eviction pressure).
+        collector.record_data_point(MetricDataPoint {
+            name: metric_names::PARSE_CACHE_SIZE_BYTES.to_owned(),
+            value: 4096.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
         collector.record_span(SpanData {
             name: "dead-code.analyze".to_owned(),
             trace_id: "t".to_owned(),
@@ -902,12 +928,21 @@ mod tests {
         assert!(
             snap.data_points
                 .iter()
-                .any(|p| p.name == "chaffra.module.call_duration_ms")
+                .any(|p| p.name == metric_names::MODULE_CALL_DURATION_MS)
         );
         assert!(
             snap.data_points
                 .iter()
                 .any(|p| p.name == "chaffra.analysis.findings_total")
+        );
+        // Both an operator definition and a user definition survive.
+        assert!(
+            snap.definitions
+                .contains_key(metric_names::MODULE_ERROR_TOTAL)
+        );
+        assert!(
+            snap.definitions
+                .contains_key("chaffra.analysis.findings_total")
         );
     }
 
@@ -919,8 +954,13 @@ mod tests {
         assert!(snap.operator_summary.module_error_counts.is_empty());
         // User summary survives.
         assert_eq!(snap.user_summary.files_total, 7);
-        assert!(!snap.spans.is_empty());
-        // No operator-only data point may cross the boundary.
+        // Spans are operator-scoped (module traces): none may cross the boundary.
+        assert!(
+            snap.spans.is_empty(),
+            "operator-scoped spans leaked under user-only projection"
+        );
+        // No operator-only data point may cross the boundary, including the
+        // parse-cache pressure metric.
         for dp in &snap.data_points {
             assert!(
                 !is_operator_metric(&dp.name),
@@ -928,11 +968,29 @@ mod tests {
                 dp.name
             );
         }
-        // User-facing data points remain.
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == metric_names::PARSE_CACHE_SIZE_BYTES),
+            "parse-cache metric must be withheld under user-only"
+        );
+        // Operator metric DEFINITIONS must not be disclosed either...
+        for op in metric_names::OPERATOR {
+            assert!(
+                !snap.definitions.contains_key(*op),
+                "operator definition {op} leaked under user-only projection"
+            );
+        }
+        // ...while user-facing data points and definitions remain.
         assert!(
             snap.data_points
                 .iter()
                 .any(|p| p.name == "chaffra.analysis.findings_total")
+        );
+        assert!(
+            snap.definitions
+                .contains_key("chaffra.analysis.findings_total")
         );
     }
 
@@ -943,12 +1001,20 @@ mod tests {
         // User summary is wiped...
         assert_eq!(snap.user_summary.files_total, 0);
         assert!(snap.user_summary.findings_by_module.is_empty());
-        // ...but operator data survives.
+        // ...but operator data survives, including spans and operator definitions.
         assert!(!snap.operator_summary.module_call_durations.is_empty());
         assert!(
             snap.data_points
                 .iter()
-                .any(|p| p.name == "chaffra.module.call_duration_ms")
+                .any(|p| p.name == metric_names::MODULE_CALL_DURATION_MS)
+        );
+        assert!(
+            !snap.spans.is_empty(),
+            "operator-scoped spans must survive under operator-only"
+        );
+        assert!(
+            snap.definitions
+                .contains_key(metric_names::MODULE_ERROR_TOTAL)
         );
     }
 
@@ -964,27 +1030,37 @@ mod tests {
 
     #[test]
     fn test_is_operator_metric_classification() {
-        // Operator-only prefixes.
-        for name in [
-            "chaffra.module.call_duration_ms",
-            "chaffra.module.error_total",
-            "chaffra.module.startup_duration_ms",
-            "chaffra.module.load_error_total",
-            "chaffra.startup.total_duration_ms",
-            "chaffra.plugin.connect_error_total",
-            "chaffra.config.parse_error_total",
-        ] {
+        // The full operator set, including the parse-cache family, classifies
+        // as operator.
+        for name in metric_names::OPERATOR {
             assert!(is_operator_metric(name), "{name} should be operator-only");
         }
-        // User-facing metrics.
+        // User-facing metrics — and the collision case: a per-module summary
+        // metric whose module id matches an operator name must NOT be misclassified.
         for name in [
             "chaffra.analysis.findings_total",
             "chaffra.analysis.findings_by_severity",
             "chaffra.findings.churn_rate",
             "chaffra.module.dead-code.unused_functions",
+            "chaffra.module.error_total.health_score",
         ] {
             assert!(!is_operator_metric(name), "{name} should be user-facing");
         }
+    }
+
+    #[test]
+    fn test_is_operator_span_all_spans_operator_scoped() {
+        let span = SpanData {
+            name: "dead-code.analyze".to_owned(),
+            trace_id: "t".to_owned(),
+            span_id: "s".to_owned(),
+            parent_span_id: String::new(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            attributes: HashMap::new(),
+            status: "ok".to_owned(),
+        };
+        assert!(is_operator_span(&span));
     }
 
     #[test]

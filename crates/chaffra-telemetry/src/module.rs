@@ -6,7 +6,7 @@
 
 use crate::backends::{self, BackendStatus};
 use crate::collector::TelemetryCollector;
-use crate::config::TelemetryConfig;
+use crate::config::{TelemetryAudience, TelemetryConfig};
 use chaffra_core::diagnostic::{
     AnalysisResult, FileInfo, Finding, FixResult, Location, ModuleInfo, ModuleMetrics, Rule,
     RuleExplanation, Severity,
@@ -150,11 +150,14 @@ impl AnalysisModule for TelemetryModule {
             },
         });
 
-        // Flush to backends if operator telemetry is enabled. Project to the
-        // configured audience BEFORE emission so the persisted payload never
-        // carries fields the audience is not entitled to (and so raw
-        // operator-only fields never cross this persistence boundary unprojected).
-        if tel_config.audience.operator_enabled() {
+        // Flush to backends whenever telemetry is not fully disabled. This is
+        // the SAME rule the CLI `run_with_telemetry` paths use (flush the
+        // projected snapshot for any audience except `Off`): projection decides
+        // what the payload contains, so under `user-only` the backends receive
+        // exactly the user-facing fields and never any operator data, while
+        // `Off` emits nothing at all. Projecting BEFORE emission guarantees raw
+        // operator-only fields never cross this persistence boundary unprojected.
+        if !matches!(tel_config.audience, TelemetryAudience::Off) {
             let projected = snapshot.project_for_audience(tel_config.audience);
             let (active_backends, _) = backends::create_backends(&tel_config.backends);
             for backend in &active_backends {
@@ -274,6 +277,93 @@ fn backend_status_finding(status: &BackendStatus) -> Finding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::metric_names;
+
+    /// Run the telemetry module's `analyze` for a given audience with a single
+    /// JSON-file backend at `path`, against a collector carrying both a
+    /// user-facing finding metric and operator-only metrics. Returns the parsed
+    /// flushed JSON, or `None` when nothing was flushed (file absent).
+    fn module_flush_for_audience(
+        audience: &str,
+        path: &std::path::Path,
+    ) -> Option<serde_json::Value> {
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(3);
+        collector.record_module_call("dead-code", 7, false); // operator metric
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev); // user metric
+
+        let module = TelemetryModule::with_collector(collector);
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), audience.to_owned());
+        config.insert("backend".to_owned(), "json-file".to_owned());
+        config.insert("path".to_owned(), path.to_str().unwrap().to_owned());
+
+        module.analyze(&[], &config).unwrap();
+
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|c| serde_json::from_str(&c).unwrap())
+    }
+
+    #[test]
+    fn test_module_flush_rule_matches_projection_each_audience() {
+        // 1B: the module flush path uses the SAME rule as the CLI paths —
+        // flush the projected snapshot whenever audience != Off — so its
+        // behaviour is identical to `project_for_audience` for every audience.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // user-only: flushes user data, NO operator data.
+        let p = dir.path().join("user.json");
+        let v = module_flush_for_audience("user-only", &p).expect("user-only must flush");
+        assert_eq!(v["user_summary"]["files_total"], 3);
+        assert!(
+            v["operator_summary"]["module_call_durations"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "operator data leaked under user-only module flush"
+        );
+        for dp in v["data_points"].as_array().unwrap() {
+            assert!(
+                !metric_names::is_operator(dp["name"].as_str().unwrap()),
+                "operator metric leaked under user-only module flush"
+            );
+        }
+
+        // operator-only: flushes operator data, NO user summary.
+        let p = dir.path().join("op.json");
+        let v = module_flush_for_audience("operator-only", &p).expect("operator-only must flush");
+        assert_eq!(v["user_summary"]["files_total"], 0);
+        assert!(
+            v["data_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|dp| dp["name"] == metric_names::MODULE_CALL_DURATION_MS)
+        );
+
+        // on: flushes everything.
+        let p = dir.path().join("on.json");
+        let v = module_flush_for_audience("on", &p).expect("on must flush");
+        assert_eq!(v["user_summary"]["files_total"], 3);
+        assert!(
+            v["data_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|dp| dp["name"] == metric_names::MODULE_CALL_DURATION_MS)
+        );
+
+        // off: flushes NOTHING (no file written).
+        let p = dir.path().join("off.json");
+        assert!(
+            module_flush_for_audience("off", &p).is_none(),
+            "off audience must not flush anything"
+        );
+    }
 
     #[test]
     fn test_module_describe() {
@@ -394,14 +484,19 @@ mod tests {
     }
 
     #[test]
-    fn test_default_audience_does_not_flush_operator_metrics() {
-        // With no `audience` key the default (user-only) applies, so the
-        // operator backend flush branch must NOT run: the JSON file is never
-        // written.
+    fn test_default_audience_flush_is_projected_user_only() {
+        // 1B: under the unified rule the module flushes for any non-Off audience.
+        // With no `audience` key the default (user-only) applies, so the flush
+        // DOES run but the projected payload carries NO operator data — exactly
+        // like the CLI `run_with_telemetry` user-only path.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("telemetry.json");
         let collector = TelemetryCollector::with_defaults();
-        collector.record_module_call("dead-code", 10, false);
+        collector.set_files_total(4);
+        collector.record_module_call("dead-code", 10, false); // operator metric
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev); // user metric
         let module = TelemetryModule::with_collector(collector);
 
         let mut config = HashMap::new();
@@ -417,9 +512,26 @@ mod tests {
                 .any(|f| f.rule_id == "metric-summary")
         );
         assert!(
-            !path.exists(),
-            "default (user-only) audience must not flush operator telemetry to a backend"
+            path.exists(),
+            "user-only audience must flush projected user data"
         );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // User data present, operator data projected out.
+        assert_eq!(parsed["user_summary"]["files_total"], 4);
+        assert!(
+            parsed["operator_summary"]["module_call_durations"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "operator data leaked into a user-only module flush"
+        );
+        for dp in parsed["data_points"].as_array().unwrap() {
+            assert!(
+                !metric_names::is_operator(dp["name"].as_str().unwrap()),
+                "operator metric leaked into a user-only module flush"
+            );
+        }
     }
 
     #[test]

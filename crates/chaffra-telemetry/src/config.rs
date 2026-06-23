@@ -135,6 +135,18 @@ pub struct TelemetryConfig {
     /// How to decide whether to emit operator telemetry.
     #[serde(default)]
     pub sampling_strategy: SamplingStrategy,
+
+    /// An explicit CLI `--telemetry` audience, if one was passed.
+    ///
+    /// This is a precedence hint, not persisted state: it records whether the
+    /// audience in [`audience`](Self::audience) came from an explicit command
+    /// line flag (`Some`) or merely the default/file value (`None`), so the
+    /// config-merge step can let an explicit flag win over a checked-in
+    /// `[modules.telemetry] audience`. It never crosses a wire or disk boundary
+    /// — `#[serde(skip)]` keeps it out of every serialized snapshot and backend
+    /// payload, so the persisted telemetry schema is unchanged.
+    #[serde(skip)]
+    pub cli_audience_override: Option<TelemetryAudience>,
 }
 
 fn default_sampling_rate() -> f64 {
@@ -148,6 +160,7 @@ impl Default for TelemetryConfig {
             backends: default_backends(),
             sampling_rate: 1.0,
             sampling_strategy: SamplingStrategy::default(),
+            cli_audience_override: None,
         }
     }
 }
@@ -210,7 +223,31 @@ impl TelemetryConfig {
             backends,
             sampling_rate,
             sampling_strategy,
+            cli_audience_override: None,
         })
+    }
+
+    /// Resolve the effective audience for a run, applying the precedence:
+    /// explicit CLI `--telemetry` flag > file `[modules.telemetry] audience` >
+    /// `base` (the CLI-derived base, which is itself the flag value or the
+    /// `user-only` default).
+    ///
+    /// `cli_audience` is the parsed CLI flag (`None` when the flag was omitted);
+    /// `file_audience` is the audience parsed from the project file's telemetry
+    /// section, present only when the file explicitly set `audience`; `base` is
+    /// the fallback used when neither explicit source applies. An explicit CLI
+    /// flag is authoritative — a checked-in file can never re-enable operator
+    /// emission that the operator disabled on the command line (e.g.
+    /// `--telemetry off`), and can never override a narrower explicit
+    /// `--telemetry user-only`. This is the single precedence rule; both the CLI
+    /// and the telemetry module resolve through it.
+    #[must_use]
+    pub fn resolve_audience(
+        cli_audience: Option<TelemetryAudience>,
+        file_audience: Option<TelemetryAudience>,
+        base: TelemetryAudience,
+    ) -> TelemetryAudience {
+        cli_audience.or(file_audience).unwrap_or(base)
     }
 }
 
@@ -392,5 +429,64 @@ mod tests {
         mc.insert("sampling-rate".to_owned(), "-1.0".to_owned());
         let cfg = TelemetryConfig::from_module_config(&mc).unwrap();
         assert!((cfg.sampling_rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cli_audience_override_defaults_to_none() {
+        // The precedence hint is absent on both the default config and any
+        // config loaded from a file section; it is only ever set by the CLI.
+        assert_eq!(TelemetryConfig::default().cli_audience_override, None);
+        let mut mc = HashMap::new();
+        mc.insert("audience".to_owned(), "on".to_owned());
+        assert_eq!(
+            TelemetryConfig::from_module_config(&mc)
+                .unwrap()
+                .cli_audience_override,
+            None
+        );
+    }
+
+    #[test]
+    fn test_cli_audience_override_is_not_serialized() {
+        // `#[serde(skip)]`: the precedence hint must never reach the persisted
+        // schema, and a deserialized config defaults it back to `None`.
+        let mut cfg = TelemetryConfig::default();
+        cfg.cli_audience_override = Some(TelemetryAudience::Off);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("cli_audience_override"),
+            "precedence hint leaked into serialized config: {json}"
+        );
+        let restored: TelemetryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.cli_audience_override, None);
+    }
+
+    #[test]
+    fn test_resolve_audience_precedence() {
+        use TelemetryAudience::{Off, On, OperatorOnly, UserOnly};
+        // (cli, file, base, expected) — explicit CLI flag wins over file, file
+        // wins over the base fallback.
+        let cases = [
+            // Explicit CLI beats file in BOTH directions.
+            (Some(Off), Some(On), UserOnly, Off),
+            (Some(On), Some(Off), UserOnly, On),
+            (Some(UserOnly), Some(On), UserOnly, UserOnly),
+            (Some(OperatorOnly), Some(UserOnly), UserOnly, OperatorOnly),
+            // `--telemetry off` is not overridable by a checked-in file.
+            (Some(Off), Some(OperatorOnly), UserOnly, Off),
+            // No CLI flag: the file governs when present (over the base).
+            (None, Some(On), UserOnly, On),
+            (None, Some(OperatorOnly), UserOnly, OperatorOnly),
+            // Neither explicit source: the base fallback applies.
+            (None, None, UserOnly, UserOnly),
+            (None, None, On, On),
+        ];
+        for (cli, file, base, expected) in cases {
+            assert_eq!(
+                TelemetryConfig::resolve_audience(cli, file, base),
+                expected,
+                "cli={cli:?} file={file:?} base={base:?}"
+            );
+        }
     }
 }

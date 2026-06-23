@@ -85,8 +85,8 @@ is opt-in.
 | Mode | User-facing | Operator | Projection at emission boundaries |
 |------|-------------|----------|-----------------------------------|
 | `on` | yes | yes | snapshot kept whole |
-| `user-only` (default) | yes | no | `operator_summary` and every operator-only data point are stripped before any flush/persistence |
-| `operator-only` | no | yes | `user_summary` is stripped before any flush/persistence |
+| `user-only` (default) | yes | no | `operator_summary`, every operator-only data point, every operator-only **definition**, and **all spans** are stripped before any flush/persistence |
+| `operator-only` | no | yes | `user_summary` and every user-only data point/definition are stripped; operator data, definitions, and spans are kept |
 | `off` | no | no | telemetry is disabled; nothing is collected or emitted |
 
 Enable operator telemetry explicitly via either:
@@ -94,19 +94,39 @@ Enable operator telemetry explicitly via either:
 - the CLI flag: `--telemetry on` or `--telemetry operator-only`; or
 - the file setting: `[modules.telemetry] audience = "on" | "operator-only"`.
 
-Precedence: an explicit `--telemetry` flag overrides the file `audience`, which
-overrides the `user-only` default. An unrecognised audience value (CLI or file)
-is rejected with an actionable error — it is never coerced to a default that
-would widen emission (fail-closed).
+Precedence (fail-closed): an explicit `--telemetry` flag is authoritative — it
+overrides the file `audience`, which in turn overrides the `user-only` default.
+A checked-in `[modules.telemetry] audience` can NOT re-enable operator emission
+that the operator disabled on the command line (`--telemetry off`), nor widen a
+narrower explicit `--telemetry user-only`. An unrecognised audience value (CLI
+or file) is rejected with an actionable error — it is never coerced to a default
+that would widen emission.
 
-Operator-only data points (matched by metric-name prefix) are:
-`chaffra.module.call_duration_ms`, `chaffra.module.error_total`,
-`chaffra.module.startup_duration_ms`, `chaffra.module.load_error_total`,
-`chaffra.startup.*`, `chaffra.plugin.*`, `chaffra.config.parse_error_total`.
-Projection is applied at every emission boundary (telemetry-module backend
-flush and the CLI `run_with_telemetry` success and failure flush paths) before
-filtering, persistence, or backend write, so operator-only fields never cross a
-user-facing boundary.
+Scope classification (the single source of truth is
+`chaffra_telemetry::metrics::metric_names`; producers and the projector share
+those constants so naming cannot drift):
+
+- **Operator-only data points and definitions**, matched by EXACT metric name
+  (not prefix, so a per-module summary `chaffra.module.<id>.<key>` cannot
+  collide with an operator name): `chaffra.module.call_duration_ms`,
+  `chaffra.module.error_total`, `chaffra.module.startup_duration_ms`,
+  `chaffra.module.load_error_total`, `chaffra.startup.total_duration_ms`,
+  `chaffra.plugin.connect_error_total`, `chaffra.config.parse_error_total`, and
+  the parse-cache family `chaffra.parse.cache_hits` / `cache_misses` /
+  `cache_hit_rate` / `cache_size_bytes` / `cache_evictions`. Operator metric
+  *definitions* are stripped under `user-only` too — the catalogue itself
+  discloses which operator metrics exist.
+- **Spans** are module execution traces (timing/correlation) and are
+  operator-scoped in full: they are stripped under `user-only` and retained
+  only when the operator scope is enabled.
+
+Projection is applied at every emission boundary — the telemetry-module backend
+flush and the CLI `run_with_telemetry` success and failure flush paths, both of
+which use the SAME rule: **flush the projected snapshot whenever the audience is
+not `off`**. Projection decides the payload contents, so under `user-only` a
+backend receives exactly the user-facing fields and never operator data, and
+`off` emits nothing. Projecting before filtering, persistence, or backend write
+guarantees operator-only fields never cross a user-facing boundary.
 
 #### GDPR rationale
 
@@ -177,6 +197,10 @@ Library helper for tracking incremental parse cache effectiveness. Provides atom
 | `chaffra.parse.cache_size_bytes` | gauge | Current cache memory usage |
 | `chaffra.parse.cache_evictions` | counter | Cache entries evicted |
 
+All five parse-cache metrics are **operator-scoped** (memory/eviction pressure):
+they are classified as operator-only and withheld under `user-only`, the same as
+the other operator metrics above.
+
 Integration into the watch mode and LSP parse cache producers is planned for a future phase. Until then, these metrics are available as a library API for downstream consumers to call directly.
 
 ## Grafana Dashboard Generator
@@ -234,6 +258,15 @@ chaffra telemetry audit-log   # Display telemetry audit log
 - **Invalid audience values now fail closed.** A typo in `--telemetry` or in
   `[modules.telemetry] audience` is now a hard error instead of silently
   falling back to a default. Fix the value to proceed.
+- **An explicit `--telemetry` flag now wins over the file `audience`.** Earlier
+  builds let a checked-in `[modules.telemetry] audience` override the command
+  line; it no longer can. In particular `--telemetry off` (or `user-only`) on
+  the command line can no longer be re-enabled or widened by a committed config.
+- **Spans and operator metric definitions are now stripped under `user-only`.**
+  Module trace/timing spans are operator-scoped, and the operator metric
+  *definition* catalogue is withheld too, so a `user-only` payload no longer
+  discloses operator traces or which operator metrics exist. The parse-cache
+  metrics (`chaffra.parse.cache_*`) are now classified operator-only as well.
 - No on-disk format, metric names, backend payloads, or gRPC schema changed.
   Existing dashboards and backends continue to work once operator telemetry is
   re-enabled.

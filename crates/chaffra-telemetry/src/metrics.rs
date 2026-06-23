@@ -3,6 +3,61 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Canonical names of the metrics chaffra produces, split by audience scope.
+///
+/// These constants are the single source of truth for metric naming: every
+/// producer (the collector, the parse-cache flush, the core definition
+/// registry) names its data points and definitions from here, and the audience
+/// classifier in [`crate::collector`] decides operator-vs-user scope from the
+/// same set. Because producer and classifier share these symbols, a rename
+/// cannot silently desynchronise the two — a typo is a compile error, not a
+/// privacy leak.
+pub mod metric_names {
+    /// Operator-scoped metric names: process- and environment-shaped telemetry
+    /// (call latencies, error/connection/startup counters, cache pressure) that
+    /// is withheld from any audience without the operator scope.
+    ///
+    /// Matching is by EXACT name, not prefix: each of these is a complete metric
+    /// name whose dimensional variation lives in labels, never in a name suffix.
+    /// Exact matching prevents a per-module summary metric such as
+    /// `chaffra.module.<id>.<key>` (e.g. a module whose id is `error_total`)
+    /// from colliding with an operator name like `chaffra.module.error_total`.
+    pub const OPERATOR: &[&str] = &[
+        MODULE_CALL_DURATION_MS,
+        MODULE_ERROR_TOTAL,
+        MODULE_STARTUP_DURATION_MS,
+        MODULE_LOAD_ERROR_TOTAL,
+        STARTUP_TOTAL_DURATION_MS,
+        PLUGIN_CONNECT_ERROR_TOTAL,
+        CONFIG_PARSE_ERROR_TOTAL,
+        PARSE_CACHE_HITS,
+        PARSE_CACHE_MISSES,
+        PARSE_CACHE_HIT_RATE,
+        PARSE_CACHE_SIZE_BYTES,
+        PARSE_CACHE_EVICTIONS,
+    ];
+
+    pub const MODULE_CALL_DURATION_MS: &str = "chaffra.module.call_duration_ms";
+    pub const MODULE_ERROR_TOTAL: &str = "chaffra.module.error_total";
+    pub const MODULE_STARTUP_DURATION_MS: &str = "chaffra.module.startup_duration_ms";
+    pub const MODULE_LOAD_ERROR_TOTAL: &str = "chaffra.module.load_error_total";
+    pub const STARTUP_TOTAL_DURATION_MS: &str = "chaffra.startup.total_duration_ms";
+    pub const PLUGIN_CONNECT_ERROR_TOTAL: &str = "chaffra.plugin.connect_error_total";
+    pub const CONFIG_PARSE_ERROR_TOTAL: &str = "chaffra.config.parse_error_total";
+    pub const PARSE_CACHE_HITS: &str = "chaffra.parse.cache_hits";
+    pub const PARSE_CACHE_MISSES: &str = "chaffra.parse.cache_misses";
+    pub const PARSE_CACHE_HIT_RATE: &str = "chaffra.parse.cache_hit_rate";
+    pub const PARSE_CACHE_SIZE_BYTES: &str = "chaffra.parse.cache_size_bytes";
+    pub const PARSE_CACHE_EVICTIONS: &str = "chaffra.parse.cache_evictions";
+
+    /// Whether a metric NAME is operator-scoped (exact match against
+    /// [`OPERATOR`]).
+    #[must_use]
+    pub fn is_operator(name: &str) -> bool {
+        OPERATOR.contains(&name)
+    }
+}
+
 /// Kind of metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -136,6 +191,56 @@ pub fn span_to_proto(s: &SpanData) -> chaffra_proto::proto::SpanData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metric_names_operator_set_exact_match() {
+        // Every name in the OPERATOR set classifies as operator.
+        for name in metric_names::OPERATOR {
+            assert!(
+                metric_names::is_operator(name),
+                "{name} should be operator-scoped"
+            );
+        }
+        // The full parse-cache family is now covered.
+        for name in [
+            metric_names::PARSE_CACHE_HITS,
+            metric_names::PARSE_CACHE_MISSES,
+            metric_names::PARSE_CACHE_HIT_RATE,
+            metric_names::PARSE_CACHE_SIZE_BYTES,
+            metric_names::PARSE_CACHE_EVICTIONS,
+        ] {
+            assert!(metric_names::is_operator(name), "{name} should be operator");
+        }
+    }
+
+    #[test]
+    fn test_metric_names_user_facing_not_operator() {
+        for name in [
+            "chaffra.analysis.findings_total",
+            "chaffra.analysis.findings_by_severity",
+            "chaffra.findings.churn_rate",
+            "chaffra.module.dead-code.unused_functions",
+        ] {
+            assert!(
+                !metric_names::is_operator(name),
+                "{name} should be user-facing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metric_names_no_prefix_collision() {
+        // A module whose id collides with an operator metric name produces a
+        // per-module summary metric `chaffra.module.<id>.<key>`. Exact matching
+        // must NOT misclassify it as the operator metric `chaffra.module.error_total`.
+        assert!(metric_names::is_operator(metric_names::MODULE_ERROR_TOTAL));
+        assert!(!metric_names::is_operator(
+            "chaffra.module.error_total.health_score"
+        ));
+        assert!(!metric_names::is_operator(
+            "chaffra.startup.total_duration_ms.extra"
+        ));
+    }
 
     #[test]
     fn test_span_duration() {
