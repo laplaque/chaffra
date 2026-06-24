@@ -1548,36 +1548,55 @@ mod tests {
         // point with the same shape is NOT in that set and the projection
         // drops it under user-only. We exercise both halves in the same
         // snapshot to prove the discriminator is producer-source, not name.
-        let collector = TelemetryCollector::with_defaults();
-        // Trusted: emitted via the internal producer.
-        collector.record_module_summary_metric("complexity", "health_score", 88.0);
-        // Spoofed: same shape, but pushed as if from a plugin's gRPC
-        // `record_metrics` call (the production path lands here).
-        collector.record_data_point(MetricDataPoint {
-            name: "chaffra.module.plugin.cache_size_bytes".to_owned(),
-            value: 1024.0,
-            labels: HashMap::new(),
-            timestamp_ms: 0,
-        });
+        //
+        // The assertions are cross-checked against all four audiences so a
+        // future regression that admits the spoofed name on ANY audience
+        // boundary fails this test:
+        // - On            → both admitted (unrestricted)
+        // - UserOnly      → only trusted admitted (privacy boundary)
+        // - OperatorOnly  → both dropped (UNCLASSIFIED at the user split,
+        //                   user scope off)
+        // - Off           → both dropped
+        let make_snapshot = || {
+            let collector = TelemetryCollector::with_defaults();
+            // Trusted: emitted via the internal producer.
+            collector.record_module_summary_metric("complexity", "health_score", 88.0);
+            // Spoofed: same shape, but pushed as if from a plugin's gRPC
+            // `record_metrics` call (the production path lands here).
+            collector.record_data_point(MetricDataPoint {
+                name: "chaffra.module.plugin.cache_size_bytes".to_owned(),
+                value: 1024.0,
+                labels: HashMap::new(),
+                timestamp_ms: 0,
+            });
+            collector.snapshot()
+        };
 
-        let snap = collector
-            .snapshot()
-            .project_for_audience(TelemetryAudience::UserOnly);
+        let trusted = "chaffra.module.complexity.health_score";
+        let spoofed = "chaffra.module.plugin.cache_size_bytes";
 
-        assert!(
-            snap.data_points
-                .iter()
-                .any(|p| p.name == "chaffra.module.complexity.health_score"),
-            "trusted per-module summary metric was dropped under user-only"
-        );
-        assert!(
-            !snap
-                .data_points
-                .iter()
-                .any(|p| p.name == "chaffra.module.plugin.cache_size_bytes"),
-            "spoofed per-module-shaped runtime metric leaked under user-only \
-             via name pattern admission (fail-open regression)"
-        );
+        let cases = [
+            (TelemetryAudience::On, true, true),
+            (TelemetryAudience::UserOnly, true, false),
+            (TelemetryAudience::OperatorOnly, false, false),
+            (TelemetryAudience::Off, false, false),
+        ];
+        for (audience, expect_trusted, expect_spoofed) in cases {
+            let snap = make_snapshot().project_for_audience(audience);
+            let has_trusted = snap.data_points.iter().any(|p| p.name == trusted);
+            let has_spoofed = snap.data_points.iter().any(|p| p.name == spoofed);
+            assert_eq!(
+                has_trusted, expect_trusted,
+                "{audience:?}: trusted per-module summary metric \
+                 should be admitted={expect_trusted}, was {has_trusted}"
+            );
+            assert_eq!(
+                has_spoofed, expect_spoofed,
+                "{audience:?}: spoofed per-module-shaped runtime metric \
+                 should be admitted={expect_spoofed}, was {has_spoofed} \
+                 (a true means fail-open via name-shape pattern)"
+            );
+        }
     }
 
     #[test]
