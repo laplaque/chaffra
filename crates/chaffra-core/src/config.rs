@@ -388,39 +388,33 @@ threshold = "10"
         // old `Path::exists()` collapsed both cases to "treat as absent" and
         // silently defaulted on permission/IO errors. Verify the new
         // `try_exists()` path propagates a typed error instead.
-        use std::os::unix::fs::PermissionsExt;
+        //
+        // Trigger a non-`NotFound` failure with a symlink loop at the
+        // `.chaffra.toml` path: `Path::try_exists` traverses symlinks and
+        // returns `Err(ELOOP)`. The kernel enforces the loop regardless of
+        // UID, so this assertion is reachable on the CI runners (which run
+        // as root) and on a developer laptop alike — unlike a `chmod 0000`
+        // approach, which root bypasses and leaves the branch uncovered
+        // (caught by the trust-boundary coverage gate at 100% changed).
+        use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir_no_perm");
+        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir_symlink_loop");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_path = dir.join(CONFIG_FILE_NAME);
-        std::fs::write(&cfg_path, "[health]\nmax-cyclomatic = 25\n").unwrap();
+        // The link target points back at itself: `try_exists` follows it,
+        // loops, and returns `Err(ELOOP)`.
+        symlink(&cfg_path, &cfg_path).unwrap();
 
-        // Strip search permission on the directory so `try_exists` fails with
-        // EACCES (a non-`NotFound` error). root bypasses permission checks,
-        // so this assertion only runs when EACCES is actually reachable —
-        // probe by trying to read the file as a non-root sanity check.
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        let original_mode = perms.mode();
-        perms.set_mode(0o000);
-        std::fs::set_permissions(&dir, perms).unwrap();
-
-        let can_still_read = std::fs::read_to_string(&cfg_path).is_ok();
         let result = ChaffraConfig::load_from_dir(&dir);
-
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        perms.set_mode(original_mode);
-        std::fs::set_permissions(&dir, perms).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
-        if !can_still_read {
-            let err = result.expect_err("unreadable parent dir must fail closed");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("failed to probe"),
-                "expected typed probe error, got: {msg}"
-            );
-        }
+        let err = result.expect_err("symlink loop must fail closed (not default)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to probe"),
+            "expected typed probe error, got: {msg}"
+        );
     }
 
     #[test]
