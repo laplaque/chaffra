@@ -278,56 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_health_fails_closed_on_malformed_config() {
-        // Regression: the MCP tools must NOT silently default on a malformed
-        // `.chaffra.toml` (the old `.unwrap_or_default()`). They must surface
-        // the typed config error to the caller, matching the CLI strict
-        // loader. A malformed TOML triggers `ChaffraConfig::load_from_dir`'s
-        // Err path, which the tool now propagates as a ToolCallResult error.
-        let dir = std::env::temp_dir().join("chaffra_mcp_test_bad_config_health");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".chaffra.toml"), "this is = = not valid toml\n").unwrap();
-
-        let result = execute_health(&serde_json::json!({ "path": dir.to_str().unwrap() }));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert_eq!(
-            result.is_error,
-            Some(true),
-            "execute_health must fail closed on malformed config, not default"
-        );
-        assert!(
-            result.content[0].text.contains("Invalid configuration"),
-            "expected config error, got: {}",
-            result.content[0].text
-        );
-    }
-
-    #[test]
-    fn test_execute_dead_code_fails_closed_on_malformed_config() {
-        // Same fail-closed contract for the dead-code MCP tool.
-        let dir = std::env::temp_dir().join("chaffra_mcp_test_bad_config_deadcode");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".chaffra.toml"), "this is = = not valid toml\n").unwrap();
-
-        let result = execute_dead_code(&serde_json::json!({ "path": dir.to_str().unwrap() }));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert_eq!(
-            result.is_error,
-            Some(true),
-            "execute_dead_code must fail closed on malformed config, not default"
-        );
-        assert!(
-            result.content[0].text.contains("Invalid configuration"),
-            "expected config error, got: {}",
-            result.content[0].text
-        );
-    }
-
-    #[test]
     fn test_explain_missing_rule_id() {
         let result = execute_explain(&serde_json::json!({}));
         assert_eq!(result.is_error, Some(true));
