@@ -619,15 +619,19 @@ mod tests {
         assert_eq!(json["files_total"], 4);
         // Per-module timing leaked through the user_summary metadata under the
         // PREVIOUS unprojected path; with projection applied here it is scrubbed
-        // and the payload-empty entry is pruned.
+        // and the payload-empty entry is pruned. The `dead-code` entry has a
+        // finding so it survives the payload-empty pruning — assert directly
+        // (not `if let Some`) so the trust-boundary coverage check sees both
+        // branches of the lookup as exercised.
         let mods = json["module_summaries"].as_object().unwrap();
-        if let Some(entry) = mods.get("dead-code") {
-            assert_eq!(
-                entry["duration_ms"], 0,
-                "operator timing leaked through metric-summary metadata"
-            );
-            assert_eq!(entry["finding_count"], 1);
-        }
+        let entry = mods
+            .get("dead-code")
+            .expect("dead-code module summary should survive pruning (has a finding)");
+        assert_eq!(
+            entry["duration_ms"], 0,
+            "operator timing leaked through metric-summary metadata"
+        );
+        assert_eq!(entry["finding_count"], 1);
         // The OPERATOR data-point (`chaffra.module.call_duration_ms`) recorded
         // by `record_module_call` would inflate the displayed data_points count
         // unless projection ran first; assert the projected count is reflected
