@@ -342,29 +342,35 @@ fn build_module_host_with_telemetry(
     host
 }
 
+/// Load project config for an analysis command. Strict / fail-closed:
+/// an explicit `--config <file>` propagates load errors via `ChaffraConfig::load`,
+/// and the implicit `.chaffra.toml` discovery propagates parse errors via
+/// `ChaffraConfig::load_from_dir`. A missing `.chaffra.toml` is not an error
+/// (`load_from_dir` returns the default in that case).
+///
+/// Previously the implicit-discovery branch wrapped `load_from_dir(...)` in
+/// `unwrap_or_default()`, which silently coerced a malformed `.chaffra.toml`
+/// into `ChaffraConfig::default()`. That bypassed the telemetry precedence
+/// chain entirely: a broken `[modules.telemetry] audience` (or any other
+/// section) would be ignored and the privacy-preserving `user-only` default
+/// would silently apply instead of the configured value — so the project
+/// would still emit, but at the default audience rather than the operator-set
+/// one. The strict path here propagates the typed parse error so the
+/// command fails closed and the operator sees the bad config instead of a
+/// silently-defaulted run.
+///
+/// Single shared loader: every analysis command (`health`, `security`,
+/// `audit`, `dead-code`, `hotspot`, ...) routes through this. The telemetry
+/// diagnostic subcommands also route through this via
+/// [`resolve_subcommand_telemetry`] (see below), so live runs and previews
+/// agree on what counts as a valid config.
 fn load_config(config_path: Option<&str>, analysis_path: &Path) -> Result<ChaffraConfig> {
     if let Some(path) = config_path {
         ChaffraConfig::load(Path::new(path)).context("failed to load configuration file")
     } else {
-        Ok(ChaffraConfig::load_from_dir(analysis_path).unwrap_or_default())
+        ChaffraConfig::load_from_dir(analysis_path)
+            .context("failed to load .chaffra.toml from project directory")
     }
-}
-
-/// Strict variant of project-config loading for telemetry-precedence callers.
-///
-/// `load_config(None, dir)` wraps `ChaffraConfig::load_from_dir(dir)` in
-/// `unwrap_or_default()` so that an unreadable `.chaffra.toml` does not crash
-/// the analysis dispatch — convenient for `health`/`security`/etc, but unsafe
-/// for the telemetry precedence chain: a malformed TOML would silently fall
-/// back to the default config and a checked-in `[modules.telemetry] audience`
-/// would be silently ignored, re-introducing the precedence divergence the
-/// subcommand helper was added to fix. This wrapper propagates the typed error
-/// instead. A missing file (no `.chaffra.toml` on disk) is not an error —
-/// `ChaffraConfig::load_from_dir` returns the default in that case and we pass
-/// it through unchanged.
-fn load_project_config_strict(project_dir: &Path) -> Result<ChaffraConfig> {
-    ChaffraConfig::load_from_dir(project_dir)
-        .context("failed to load .chaffra.toml from project directory")
 }
 
 fn fingerprints_from_findings(
@@ -438,66 +444,78 @@ fn merge_telemetry_config(
         file_audience,
         cli_config.audience,
     );
-    // TODO(issue): when resolving to an operator-enabled audience (On /
-    // OperatorOnly) via the CLI flag or `[modules.telemetry] audience`, emit a
-    // `chaffra_telemetry::audit_log::log_telemetry_enabled(audience, user)`
-    // accountability event so GDPR data-subject requests can see when operator
-    // telemetry was activated. The Phase 14 writer helpers
-    // (`log_telemetry_enabled`/`log_telemetry_disabled`) exist but are not yet
-    // wired into this runtime resolution path; doing so requires a `user`
-    // attribution source and de-duplication across repeated invocations, which
-    // is out of Stage 15a.1 scope (no management/producer wiring). Refs:
-    // crates/chaffra-cli/src/main.rs::merge_telemetry_config,
-    // crates/chaffra-telemetry/src/audit_log.rs::log_telemetry_enabled.
+    // Audit-log emission happens at the live-emission boundary
+    // (`run_with_telemetry`), not here. This helper is also called by the
+    // diagnostic subcommands (`status` / `test` / `inspect`), which only
+    // PREVIEW the resolved config — they must not write an accountability
+    // event for telemetry that did not actually run. See
+    // [`maybe_audit_log_audience`] and its call from `run_with_telemetry`.
     Ok(config)
+}
+
+/// Emit the Phase 14 audit-log event when the live emission boundary
+/// resolves to a particular audience. This is the wiring the previous stage
+/// left unwired with a `TODO(issue)` placeholder: an explicit data-subject
+/// request needs to see when operator telemetry was actually activated, so we
+/// log on the LIVE path (not the diagnostic previews) where a flush will
+/// actually take place.
+///
+/// Emission rule, one event per chaffra invocation:
+/// - operator-enabled audience (`On` / `OperatorOnly`) -> `log_telemetry_enabled`
+/// - user-only / off -> `log_telemetry_disabled` (operator telemetry stayed off)
+///
+/// `user` attribution: best-effort from the process environment (`USER` on
+/// unix, `USERNAME` on windows). The audit-log type allows `None`, so we pass
+/// `None` when neither is set rather than fabricate a value. A proper user
+/// identity comes from the Phase-future management wiring; until then the
+/// process owner is the most faithful attribution we can produce locally.
+///
+/// De-duplication: NOT applied. Each chaffra invocation is one event in the
+/// audit log — that matches the GDPR temporal-record purpose ("when was
+/// telemetry running") better than collapsing repeated runs into a single
+/// entry. The audit log file is append-only and the `read_log` /
+/// `export_for_gdpr` helpers already handle multi-event traversal.
+fn maybe_audit_log_audience(audience: chaffra_telemetry::TelemetryAudience) {
+    // Best-effort process-owner attribution; `audit_log` accepts `Option`.
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|s| !s.is_empty());
+    match audience {
+        chaffra_telemetry::TelemetryAudience::On
+        | chaffra_telemetry::TelemetryAudience::OperatorOnly => {
+            chaffra_telemetry::audit_log::log_telemetry_enabled(&format!("{audience:?}"), user);
+        }
+        chaffra_telemetry::TelemetryAudience::UserOnly
+        | chaffra_telemetry::TelemetryAudience::Off => {
+            chaffra_telemetry::audit_log::log_telemetry_disabled(user);
+        }
+    }
 }
 
 /// Resolve the effective telemetry config for the `telemetry` diagnostic
 /// subcommands (`status` / `test` / `inspect`) through the SAME precedence chain
 /// a live run uses. These commands have no analysis path of their own, so the
-/// caller supplies the project directory whose `.chaffra.toml` is consulted
-/// (the CLI dispatch resolves `std::env::current_dir()` once and passes it
-/// here). Precedence: explicit `--telemetry` flag > file
-/// `[modules.telemetry] audience` > default. This removes the divergence whereby
-/// a checked-in `[modules.telemetry] audience` was honoured by real runs but
-/// silently ignored by these previews — `test`/`inspect` now preview exactly
-/// what a real flush at the resolved audience would emit.
+/// caller supplies the project directory whose `.chaffra.toml` is consulted,
+/// together with an optional explicit `--config <file>` (so previews honour the
+/// same global flag the live commands do). Precedence: explicit `--telemetry`
+/// flag > file `[modules.telemetry] audience` > default.
 ///
-/// Fail-closed (this helper only): a structurally invalid `[modules.telemetry]`
-/// AND a malformed TOML in `.chaffra.toml` both surface as typed errors here,
-/// via `load_project_config_strict`. Taking `project_dir` as an argument also
-/// removes the `current_dir().ok()` swallow (the caller now propagates a
-/// cwd-unreadable error with `?`) and lets tests pass `dir.path()` directly
-/// without a `CwdGuard` cwd switch.
-///
-/// Scope caveat — pre-existing leniency on the live-run path: the diagnostic
-/// subcommands routed through THIS helper are strict, but the live-run analysis
-/// dispatch (`health`, `security`, `audit`, ...) still loads project config via
-/// `load_config(None, &root)`, which wraps `ChaffraConfig::load_from_dir(...)`
-/// in `unwrap_or_default()` and so silently coerces a malformed `.chaffra.toml`
-/// to the default config. That fail-open is pre-existing chaffra behavior and
-/// is outside Phase 15a.1's audience-privacy altitude (tightening it would
-/// touch every analysis subcommand). Tracked as a follow-up for a future phase;
-/// no specific issue number — the coordinator will track.
-//
-// Earlier revisions of this comment claimed the strict behavior here "matched
-// `run_with_telemetry`". That was an overclaim — `run_with_telemetry` itself
-// is strict for the telemetry precedence chain (via `merge_telemetry_config`),
-// but the surrounding live-run dispatch loads project config leniently. The
-// alignment is between this helper and the telemetry-precedence chain only,
-// not between this helper and the live-run config-load path.
+/// Fail-closed everywhere: the live-run analysis dispatch and these previews
+/// now share the same strict [`load_config`] loader, so a malformed
+/// `.chaffra.toml` (or a structurally invalid `[modules.telemetry]`) surfaces
+/// as a typed error from both paths — they cannot disagree on what counts as
+/// a valid config any more.
 fn resolve_subcommand_telemetry(
     cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
     project_dir: &Path,
 ) -> Result<chaffra_telemetry::TelemetryConfig> {
-    // `load_project_config_strict` propagates a malformed-TOML error via `?`;
-    // a missing `.chaffra.toml` returns the default config and is the
-    // legitimate no-project-file case. `load_config` (used by the analysis
-    // dispatch) wraps `load_from_dir` in `unwrap_or_default()` to keep
-    // analysis commands working when the file is unreadable; that
-    // fail-open is unsafe for the telemetry precedence chain, so this
-    // helper goes through the strict path.
-    let project_config = load_project_config_strict(project_dir)?;
+    // Reuse the live-run loader: an explicit `--config <file>` wins over
+    // implicit `.chaffra.toml` discovery, exactly as `health` / `security` /
+    // etc. resolve it. A malformed file propagates via `?`; a missing
+    // implicit file returns the default config.
+    let project_config = load_config(config_path, project_dir)?;
     merge_telemetry_config(cli_config, &project_config)
 }
 
@@ -1287,29 +1305,29 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
     }
 }
 
-fn cmd_telemetry_status(cli_config: &chaffra_telemetry::TelemetryConfig) -> String {
-    // Resolve the project directory here, not inside the helper: a
-    // cwd-unreadable error must surface in the status report (fail-visible),
-    // never silently fall back to the default config. Previously this used
-    // `current_dir().ok()` which swallowed the error.
-    match std::env::current_dir() {
-        Ok(dir) => cmd_telemetry_status_in(cli_config, &dir),
-        Err(e) => format!("Telemetry configuration error: failed to read current directory: {e}\n"),
-    }
+fn cmd_telemetry_status(
+    cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
+) -> Result<String> {
+    let project_dir = std::env::current_dir().context("failed to read current directory")?;
+    cmd_telemetry_status_in(cli_config, config_path, &project_dir)
 }
 
 fn cmd_telemetry_status_in(
     cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
     project_dir: &Path,
-) -> String {
-    // Resolve through the same precedence chain a live run uses (file > flag >
-    // default) so the reported mode reflects a checked-in `[modules.telemetry]
-    // audience`, not just the CLI/default. A malformed project file is surfaced
-    // in the report (fail-visible) rather than silently coerced to a default.
-    let resolved = match resolve_subcommand_telemetry(cli_config, project_dir) {
-        Ok(cfg) => cfg,
-        Err(e) => return format!("Telemetry configuration error: {e}\n"),
-    };
+) -> Result<String> {
+    // Returns `Result<String>` (not just `String`): an invalid telemetry
+    // configuration must propagate as a nonzero exit, the same way `test`
+    // and `inspect` already do. The previous implementation returned a
+    // success string with an inline "Telemetry configuration error: ..."
+    // message, which scripted callers (CI, automation) could not tell apart
+    // from a healthy report — invalid config looked like a clean run. The
+    // command now fails closed end-to-end: caller in `main()` reports the
+    // error to stderr and exits nonzero, consistent with every other
+    // telemetry diagnostic command.
+    let resolved = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
     let mut out = String::new();
     out.push_str(&format!("Telemetry mode: {:?}\n\n", resolved.audience));
     out.push_str("Backends:\n");
@@ -1327,21 +1345,44 @@ fn cmd_telemetry_status_in(
         out.push_str("  (no backends configured)\n");
     }
 
-    out
+    Ok(out)
 }
 
-fn cmd_telemetry_test(cli_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
+fn cmd_telemetry_test(
+    cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
+) -> Result<String> {
     let project_dir = std::env::current_dir().context("failed to read current directory")?;
-    cmd_telemetry_test_in(cli_config, &project_dir)
+    cmd_telemetry_test_in(cli_config, config_path, &project_dir)
 }
 
 fn cmd_telemetry_test_in(
     cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
     project_dir: &Path,
 ) -> Result<String> {
     // Resolve through the live-run precedence chain so the diagnostic flush is
     // projected to the audience a real run would emit at (file > flag > default).
-    let tel_config = resolve_subcommand_telemetry(cli_config, project_dir)?;
+    let tel_config = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
+
+    // Off short-circuit: when the resolved audience is `Off`, the live-run
+    // flush rule is "no flush at all". `test` must observe the same rule
+    // before it does anything backend-visible, otherwise it diverges from
+    // the real run: the projected snapshot is empty under `Off`, but
+    // creating and writing every configured backend (a file open / network
+    // connect, etc.) still side-effects the environment and would surprise
+    // an operator who explicitly disabled telemetry. Short-circuit here so
+    // `test` is a true no-op when telemetry is `Off`, exactly matching
+    // `run_with_telemetry`'s early return.
+    if matches!(
+        tel_config.audience,
+        chaffra_telemetry::TelemetryAudience::Off
+    ) {
+        return Ok(
+            "Telemetry is Off; no backend writes are performed by `telemetry test`.\n".to_owned(),
+        );
+    }
+
     let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
 
@@ -1379,18 +1420,22 @@ fn cmd_telemetry_test_in(
     Ok(out)
 }
 
-fn cmd_telemetry_inspect(cli_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
+fn cmd_telemetry_inspect(
+    cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
+) -> Result<String> {
     let project_dir = std::env::current_dir().context("failed to read current directory")?;
-    cmd_telemetry_inspect_in(cli_config, &project_dir)
+    cmd_telemetry_inspect_in(cli_config, config_path, &project_dir)
 }
 
 fn cmd_telemetry_inspect_in(
     cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
     project_dir: &Path,
 ) -> Result<String> {
     // Resolve through the live-run precedence chain so the previewed payload
     // matches a real flush at the resolved audience (file > flag > default).
-    let tel_config = resolve_subcommand_telemetry(cli_config, project_dir)?;
+    let tel_config = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
     let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
     collector.set_files_total(0);
@@ -1501,6 +1546,15 @@ where
     F: FnOnce(&chaffra_telemetry::TelemetryCollector) -> Result<String>,
 {
     let effective_config = merge_telemetry_config(tel_config, project_config)?;
+
+    // Emit the Phase 14 audit-log accountability event at the live boundary,
+    // BEFORE the Off short-circuit and before any backend write. The `Off`
+    // branch is still an active "telemetry was disabled" record for GDPR
+    // purposes, and `maybe_audit_log_audience` emits the appropriate
+    // `TelemetryDisabled` event under `Off`/`UserOnly`. The
+    // diagnostic-preview helpers (`status`/`test`/`inspect`) deliberately do
+    // NOT call this — they don't run the workload, so they don't log.
+    maybe_audit_log_audience(effective_config.audience);
 
     if matches!(
         effective_config.audience,
@@ -1827,23 +1881,39 @@ async fn main() -> Result<()> {
         }
 
         Command::Telemetry { ref action } => match action {
+            // Thread the global `--config <file>` through to every telemetry
+            // diagnostic so previews and live runs cannot disagree on which
+            // file defines the project's telemetry config. Previously these
+            // commands consulted only the cwd `.chaffra.toml`, so a `--config`
+            // run could flush a different audience than `telemetry status`
+            // reported — including missing an explicit `--config` that
+            // disabled telemetry. `Status` now also returns `Result` and exits
+            // nonzero on bad config, matching `Test`/`Inspect`.
             TelemetryAction::Status => {
-                print!("{}", cmd_telemetry_status(&tel_config));
+                match cmd_telemetry_status(&tel_config, cli.config.as_deref()) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
-            TelemetryAction::Test => match cmd_telemetry_test(&tel_config) {
+            TelemetryAction::Test => match cmd_telemetry_test(&tel_config, cli.config.as_deref()) {
                 Ok(output) => print!("{output}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             },
-            TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
-                Ok(output) => print!("{output}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
+            TelemetryAction::Inspect => {
+                match cmd_telemetry_inspect(&tel_config, cli.config.as_deref()) {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
-            },
+            }
             TelemetryAction::Dashboard { stdout } => match cmd_telemetry_dashboard(*stdout) {
                 Ok(output) => print!("{output}"),
                 Err(e) => {
@@ -3172,7 +3242,7 @@ mod tests {
         // symptom of the previous swallow of `current_dir()` errors; the new
         // signature removes both the swallow and the test-only cwd serialisation.
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let resolved = resolve_subcommand_telemetry(&cli_config, dir.path()).unwrap();
+        let resolved = resolve_subcommand_telemetry(&cli_config, None, dir.path()).unwrap();
         assert_eq!(
             resolved.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly,
@@ -3193,7 +3263,7 @@ mod tests {
         .unwrap();
 
         let cli_config = cli_config_with_flag(chaffra_telemetry::TelemetryAudience::UserOnly);
-        let resolved = resolve_subcommand_telemetry(&cli_config, dir.path()).unwrap();
+        let resolved = resolve_subcommand_telemetry(&cli_config, None, dir.path()).unwrap();
         assert_eq!(
             resolved.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly,
@@ -3213,7 +3283,7 @@ mod tests {
         .unwrap();
 
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let err = resolve_subcommand_telemetry(&cli_config, dir.path()).unwrap_err();
+        let err = resolve_subcommand_telemetry(&cli_config, None, dir.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("invalid [modules.telemetry] configuration"),
@@ -3239,7 +3309,7 @@ mod tests {
         .unwrap();
 
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let err = resolve_subcommand_telemetry(&cli_config, dir.path()).unwrap_err();
+        let err = resolve_subcommand_telemetry(&cli_config, None, dir.path()).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("failed to load .chaffra.toml"),
@@ -3249,7 +3319,7 @@ mod tests {
 
     #[test]
     fn test_cmd_telemetry_status_wrapper_resolves_cwd() {
-        // 1C: the top-level `cmd_telemetry_status` resolves `current_dir()` and
+        // The top-level `cmd_telemetry_status` resolves `current_dir()` and
         // calls `cmd_telemetry_status_in`. Exercise the wrapper's Ok-arm so the
         // dispatch-site behaviour (cwd-as-project-dir) is covered alongside the
         // testable `_in` form. The cwd is pinned to a clean tempdir via
@@ -3257,7 +3327,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _cwd = CwdGuard::enter(dir.path());
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let out = cmd_telemetry_status(&cli_config);
+        let out = cmd_telemetry_status(&cli_config, None).unwrap();
         assert!(
             out.contains("Telemetry mode: UserOnly"),
             "wrapper must resolve cwd and report the audience, got: {out}"
@@ -3265,30 +3335,31 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_telemetry_status_wrapper_surfaces_cwd_error() {
-        // 1C: the Err-arm of `current_dir()` must format as a fail-visible
-        // telemetry configuration error, NOT silently fall back to the default
-        // config. We trigger the failure by `cd`ing into a tempdir, deleting
-        // the dir, and calling the wrapper — Linux returns ENOENT from
-        // `getcwd(2)` in that state. The `CwdGuard` restores the original cwd
-        // on drop, so the runner is left in a valid directory.
+    fn test_cmd_telemetry_status_returns_error_on_bad_config() {
+        // F7: `cmd_telemetry_status` now returns `Result<String>` (matching
+        // `test` and `inspect`) so an invalid `.chaffra.toml` produces a
+        // nonzero exit instead of a success report containing an inline
+        // "Telemetry configuration error: ..." string. Scripted callers
+        // could not distinguish that success-with-error-string from a clean
+        // report; the typed error makes the fail-closed behaviour observable.
         let dir = TempDir::new().unwrap();
-        let target = dir.path().to_path_buf();
-        let _cwd = CwdGuard::enter(&target);
-        // Delete the directory we are inside; subsequent `current_dir()` errors.
-        drop(dir);
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"everyone\"\n",
+        )
+        .unwrap();
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let out = cmd_telemetry_status(&cli_config);
+        let err = cmd_telemetry_status_in(&cli_config, None, dir.path()).unwrap_err();
         assert!(
-            out.contains("Telemetry configuration error")
-                && out.contains("failed to read current directory"),
-            "wrapper must surface cwd-read failure as a configuration error, got: {out}"
+            err.to_string()
+                .contains("invalid [modules.telemetry] configuration"),
+            "got: {err}"
         );
     }
 
     #[test]
     fn test_cmd_telemetry_test_wrapper_resolves_cwd() {
-        // 1C: the top-level `cmd_telemetry_test` resolves cwd and forwards to
+        // The top-level `cmd_telemetry_test` resolves cwd and forwards to
         // `_in`. Cover the wrapper's Ok-arm. Cwd is pinned via `CwdGuard` to a
         // clean tempdir.
         let dir = TempDir::new().unwrap();
@@ -3304,13 +3375,51 @@ mod tests {
             ..Default::default()
         };
         let _cwd = CwdGuard::enter(dir.path());
-        let out = cmd_telemetry_test(&tel_config).unwrap();
+        let out = cmd_telemetry_test(&tel_config, None).unwrap();
         assert!(out.contains("flushed"), "got: {out}");
     }
 
     #[test]
+    fn test_cmd_telemetry_test_off_audience_does_not_write_backend() {
+        // F5: when the resolved audience is `Off`, `telemetry test` must NOT
+        // create/write/contact any backend. The previous implementation built
+        // the backend, called `.flush()` (which under JsonFile writes an
+        // empty-projection file), and printed `[OK] ... -- test metric flushed`
+        // even though the operator had explicitly disabled telemetry. The
+        // short-circuit now matches `run_with_telemetry`'s `Off` early-return
+        // so the diagnostic command honours the same "no flush" rule.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("off.json");
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::Off,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::JsonFile,
+                endpoint: None,
+                path: Some(path.to_str().unwrap().to_owned()),
+                options: HashMap::new(),
+            }],
+            cli_audience_override: Some(chaffra_telemetry::TelemetryAudience::Off),
+            ..Default::default()
+        };
+        let out = cmd_telemetry_test_in(&tel_config, None, dir.path()).unwrap();
+        assert!(
+            !path.exists(),
+            "telemetry test wrote backend file under Off audience: {}",
+            out
+        );
+        assert!(
+            out.contains("Off") || out.contains("no backend writes"),
+            "Off short-circuit message missing, got: {out}"
+        );
+        assert!(
+            !out.contains("flushed"),
+            "Off branch must not report flush, got: {out}"
+        );
+    }
+
+    #[test]
     fn test_cmd_telemetry_inspect_wrapper_resolves_cwd() {
-        // 1C: the top-level `cmd_telemetry_inspect` resolves cwd and forwards
+        // The top-level `cmd_telemetry_inspect` resolves cwd and forwards
         // to `_in`. Cover the wrapper's Ok-arm.
         let tel_config = chaffra_telemetry::TelemetryConfig {
             audience: chaffra_telemetry::TelemetryAudience::UserOnly,
@@ -3318,10 +3427,58 @@ mod tests {
         };
         let dir = TempDir::new().unwrap();
         let _cwd = CwdGuard::enter(dir.path());
-        let out = cmd_telemetry_inspect(&tel_config).unwrap();
+        let out = cmd_telemetry_inspect(&tel_config, None).unwrap();
         assert!(
             !out.contains("chaffra.module.call_duration_ms"),
             "wrapper must project to user-only, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_cmd_telemetry_diagnostics_honour_explicit_config_flag() {
+        // F6: every telemetry diagnostic accepts `Option<&str>` for the
+        // global `--config <file>` and threads it into the precedence
+        // resolution. The implicit cwd file says `audience = on` and an
+        // EXPLICIT config file says `audience = off` — the explicit path
+        // must win, exactly as it does for live `health`/`security` runs.
+        // Without this threading, previews would disagree with the real
+        // run, including missing an explicit config that disables telemetry.
+        let dir = TempDir::new().unwrap();
+        // Implicit project file: would say `on`.
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"on\"\n",
+        )
+        .unwrap();
+        // Explicit `--config` file: says `off`. Live commands honour this;
+        // diagnostics now honour it too.
+        let explicit = dir.path().join("explicit.toml");
+        fs::write(
+            &explicit,
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"off\"\n",
+        )
+        .unwrap();
+        let explicit_str = explicit.to_str().unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+
+        let status = cmd_telemetry_status_in(&cli_config, Some(explicit_str), dir.path()).unwrap();
+        assert!(
+            status.contains("Telemetry mode: Off"),
+            "status must reflect --config audience, got: {status}"
+        );
+
+        let test = cmd_telemetry_test_in(&cli_config, Some(explicit_str), dir.path()).unwrap();
+        assert!(
+            test.contains("Off") || test.contains("no backend writes"),
+            "test must short-circuit on --config Off, got: {test}"
+        );
+
+        let inspect =
+            cmd_telemetry_inspect_in(&cli_config, Some(explicit_str), dir.path()).unwrap();
+        // Off projection: no user_summary content beyond the shell.
+        assert!(
+            !inspect.contains("\"files_total\": 1"),
+            "inspect must project to Off via --config, got: {inspect}"
         );
     }
 
@@ -3335,7 +3492,7 @@ mod tests {
         // (error).
         let dir = TempDir::new().unwrap();
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let resolved = resolve_subcommand_telemetry(&cli_config, dir.path()).unwrap();
+        let resolved = resolve_subcommand_telemetry(&cli_config, None, dir.path()).unwrap();
         assert_eq!(
             resolved.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly
@@ -3412,6 +3569,100 @@ mod tests {
         assert!(
             message.contains("invalid telemetry audience"),
             "expected invalid --telemetry to be rejected, got: {message:?}"
+        );
+    }
+
+    #[test]
+    fn test_run_with_telemetry_emits_audit_log_event() {
+        // F4: replace the prior `TODO(issue)` with the wired Phase 14
+        // audit-log helper. `run_with_telemetry` calls
+        // `maybe_audit_log_audience(effective_config.audience)` at the live
+        // boundary, BEFORE the Off short-circuit and before any flush, so
+        // every chaffra invocation appends one accountability event to
+        // `.chaffra-telemetry-audit.log` that records the resolved audience.
+        // The previews (`status`/`test`/`inspect`) do NOT trigger this — it
+        // only fires on the path that actually ran the workload.
+        //
+        // The audit-log file path is relative; we use `CwdGuard` to keep the
+        // append inside the tempdir, then read it back and assert exactly
+        // one TelemetryEnabled event matching the resolved audience.
+        let dir = TempDir::new().unwrap();
+        let _cwd = CwdGuard::enter(dir.path());
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::OperatorOnly,
+            backends: vec![],
+            ..Default::default()
+        };
+        run_with_telemetry(&tel_config, &config, "dead-code", |_collector| {
+            Ok("ok\n".to_owned())
+        })
+        .unwrap();
+
+        let log_path = dir
+            .path()
+            .join(chaffra_telemetry::audit_log::AUDIT_LOG_FILE);
+        assert!(
+            log_path.exists(),
+            "audit log file was not written at {}",
+            log_path.display()
+        );
+        let events = chaffra_telemetry::audit_log::read_log(&log_path);
+        let enabled: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                chaffra_telemetry::audit_log::AuditEvent::TelemetryEnabled { audience, .. } => {
+                    Some(audience.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            enabled.len(),
+            1,
+            "expected exactly one TelemetryEnabled event, got: {events:?}"
+        );
+        assert_eq!(
+            enabled[0], "OperatorOnly",
+            "audience tag in audit event must match the resolved audience"
+        );
+    }
+
+    #[test]
+    fn test_run_with_telemetry_off_audience_emits_disabled_event() {
+        // The audit-log wiring covers `Off` too: disabling telemetry is itself
+        // an accountability-relevant event. `maybe_audit_log_audience` runs
+        // before the Off short-circuit so the disable is recorded even when
+        // no flush happens.
+        let dir = TempDir::new().unwrap();
+        let _cwd = CwdGuard::enter(dir.path());
+        let config = ChaffraConfig::default();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::Off,
+            backends: vec![],
+            ..Default::default()
+        };
+        run_with_telemetry(&tel_config, &config, "health", |_collector| {
+            Ok("ok\n".to_owned())
+        })
+        .unwrap();
+        let log_path = dir
+            .path()
+            .join(chaffra_telemetry::audit_log::AUDIT_LOG_FILE);
+        assert!(log_path.exists());
+        let events = chaffra_telemetry::audit_log::read_log(&log_path);
+        let disabled_count = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    chaffra_telemetry::audit_log::AuditEvent::TelemetryDisabled { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            disabled_count, 1,
+            "expected one TelemetryDisabled event under Off, got: {events:?}"
         );
     }
 
@@ -3571,7 +3822,7 @@ mod tests {
         // Resolve from a clean project dir (no `.chaffra.toml`) so the
         // audience stays UserOnly rather than picking up an ambient project
         // file. 1C: pass the project_dir explicitly — no cwd switch needed.
-        let out = cmd_telemetry_test_in(&tel_config, dir.path()).unwrap();
+        let out = cmd_telemetry_test_in(&tel_config, None, dir.path()).unwrap();
         assert!(out.contains("flushed"), "got: {out}");
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -3595,7 +3846,7 @@ mod tests {
         // Clean project dir so the resolved audience stays UserOnly (no
         // ambient file). 1C: project_dir is explicit, no cwd switch needed.
         let dir = TempDir::new().unwrap();
-        let out = cmd_telemetry_inspect_in(&tel_config, dir.path()).unwrap();
+        let out = cmd_telemetry_inspect_in(&tel_config, None, dir.path()).unwrap();
         assert!(
             !out.contains("chaffra.module.call_duration_ms"),
             "operator metric previewed under user-only inspect: {out}"
@@ -3616,7 +3867,7 @@ mod tests {
         )
         .unwrap();
         let cli_config = chaffra_telemetry::TelemetryConfig::default(); // user-only base
-        let out = cmd_telemetry_status_in(&cli_config, dir.path());
+        let out = cmd_telemetry_status_in(&cli_config, None, dir.path()).unwrap();
         assert!(
             out.contains("Telemetry mode: OperatorOnly"),
             "status must reflect the checked-in file audience, got: {out}"
@@ -3625,8 +3876,11 @@ mod tests {
 
     #[test]
     fn test_cmd_telemetry_status_malformed_file_is_surfaced() {
-        // P3: a malformed `[modules.telemetry]` is surfaced in the status report
-        // (fail-visible), never silently coerced to a default audience.
+        // A malformed `[modules.telemetry]` surfaces as a typed `Err`
+        // (fail-closed), so scripted callers see a nonzero exit instead of
+        // a success-with-error-string. Previously the helper returned a
+        // `String` that embedded the error inline, which automation could
+        // not distinguish from a healthy report.
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join(".chaffra.toml"),
@@ -3634,10 +3888,11 @@ mod tests {
         )
         .unwrap();
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let out = cmd_telemetry_status_in(&cli_config, dir.path());
+        let err = cmd_telemetry_status_in(&cli_config, None, dir.path()).unwrap_err();
         assert!(
-            out.contains("Telemetry configuration error"),
-            "malformed file must surface an error in status, got: {out}"
+            err.to_string()
+                .contains("invalid [modules.telemetry] configuration"),
+            "malformed file must surface a typed error from status, got: {err}"
         );
     }
 
@@ -3653,7 +3908,7 @@ mod tests {
         )
         .unwrap();
         let cli_config = chaffra_telemetry::TelemetryConfig::default(); // user-only base
-        let out = cmd_telemetry_inspect_in(&cli_config, dir.path()).unwrap();
+        let out = cmd_telemetry_inspect_in(&cli_config, None, dir.path()).unwrap();
         assert!(
             out.contains("chaffra.module.call_duration_ms"),
             "operator metric must appear when the file selects operator-only: {out}"

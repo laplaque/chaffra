@@ -136,9 +136,16 @@ deployment context to characterise an individual operator or environment. Under
 GDPR data-minimisation (Art. 5(1)(c)) such operational metadata should not be
 collected or forwarded unless explicitly justified. Defaulting to `user-only`
 makes operator emission an explicit, auditable opt-in rather than implicit
-behaviour. (Wiring an audit-log accountability event when operator telemetry is
-activated is tracked separately; see the `TODO(issue)` in
-`crates/chaffra-cli/src/main.rs::merge_telemetry_config`.)
+behaviour.
+
+Every live `run_with_telemetry` invocation also appends one accountability
+event to `.chaffra-telemetry-audit.log`: a `TelemetryEnabled` event recording
+the resolved audience (and best-effort process-owner attribution) when
+operator telemetry is active (`on` / `operator-only`), and a `TelemetryDisabled`
+event under `user-only` / `off`. The diagnostic previews (`telemetry status`
+/ `test` / `inspect`) deliberately do not write to the audit log — they never
+ran a workload, so there is nothing to record. Inspect or export the log with
+`chaffra telemetry audit-log [--export]`.
 
 ## Backends
 

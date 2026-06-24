@@ -60,11 +60,133 @@ pub mod metric_names {
     pub const PARSE_CACHE_SIZE_BYTES: &str = "chaffra.parse.cache_size_bytes";
     pub const PARSE_CACHE_EVICTIONS: &str = "chaffra.parse.cache_evictions";
 
+    /// User-facing metric names: counts and rates the user is owed in the
+    /// analysis output (file/finding totals, churn). Matched by EXACT name for
+    /// the same reason `OPERATOR` is: a `chaffra.module.<id>.<key>` runtime
+    /// metric whose `<id>` happens to spell one of these names must not
+    /// collide and admit an unknown shape past the classifier.
+    ///
+    /// This set is the OTHER half of the audience classification. Every metric
+    /// chaffra produces is classified by exact membership in `OPERATOR` (block
+    /// from user-only) or `KNOWN_USER` (allow through user-only); a name in
+    /// NEITHER set is unclassified and the projection drops it under
+    /// `user-only` / `operator-only` (fail closed). Adding a new metric without
+    /// listing it here is caught at registration time by the
+    /// `test_every_core_metric_is_classified` completeness test in
+    /// `crate::collector`.
+    pub const KNOWN_USER: &[&str] = &[
+        "chaffra.analysis.duration_ms",
+        "chaffra.analysis.files_total",
+        "chaffra.analysis.findings_total",
+        "chaffra.analysis.findings_by_severity",
+        "chaffra.findings.new",
+        "chaffra.findings.resolved",
+        "chaffra.findings.unchanged",
+        "chaffra.findings.churn_rate",
+    ];
+
     /// Whether a metric NAME is operator-scoped (exact match against
     /// [`OPERATOR`]).
     #[must_use]
     pub fn is_operator(name: &str) -> bool {
         OPERATOR.contains(&name)
+    }
+
+    /// Whether a metric NAME is an explicitly classified user-facing metric.
+    /// Exact membership in [`KNOWN_USER`] OR a runtime per-module summary of
+    /// the shape `chaffra.module.<id>.<key>` (produced only by
+    /// `TelemetryCollector::record_module_summary_metric`; never registered as
+    /// a `MetricDefinition`, so the operator-name collision risk that the
+    /// definitions completeness guard rejects pattern admission for does not
+    /// arise for these runtime points — and the `is_operator` exact-match
+    /// check above still wins for any operator name that happens to match the
+    /// per-module shape).
+    ///
+    /// This split — explicit set vs. runtime-pattern — is intentional. The
+    /// explicit set covers everything that gets REGISTERED as a definition
+    /// (the completeness test guards it). The pattern covers the runtime
+    /// per-module summary points the producer emits without a definition. A
+    /// name in neither — and not in [`OPERATOR`] — is unclassified and
+    /// blocked from a user boundary by [`crate::collector::TelemetrySnapshot::project_for_audience`].
+    #[must_use]
+    pub fn is_known_user(name: &str) -> bool {
+        if is_operator(name) {
+            return false;
+        }
+        if KNOWN_USER.contains(&name) {
+            return true;
+        }
+        is_per_module_summary_shape(name)
+    }
+
+    /// Match the runtime per-module summary shape `chaffra.module.<id>.<key>`
+    /// (e.g. `chaffra.module.complexity.health_score`): the prefix
+    /// `chaffra.module.` followed by at least two non-empty dot-separated
+    /// segments. Used only by [`is_known_user`] — the definitions
+    /// completeness guard intentionally does not pattern-admit, so a registered
+    /// operator metric of this shape cannot slip past it.
+    fn is_per_module_summary_shape(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix("chaffra.module.") else {
+            return false;
+        };
+        let segments: Vec<&str> = rest.split('.').collect();
+        segments.len() >= 2 && segments.iter().all(|s| !s.is_empty())
+    }
+
+    #[cfg(test)]
+    mod scope_tests {
+        use super::*;
+
+        #[test]
+        fn known_user_set_and_operator_set_are_disjoint() {
+            for op in OPERATOR {
+                assert!(!KNOWN_USER.contains(op), "{op} is in both sets");
+            }
+        }
+
+        #[test]
+        fn is_known_user_matches_explicit_user_set() {
+            for u in KNOWN_USER {
+                assert!(is_known_user(u), "{u} should be known-user");
+            }
+        }
+
+        #[test]
+        fn is_known_user_matches_per_module_summary_shape() {
+            assert!(is_known_user("chaffra.module.complexity.health_score"));
+            assert!(is_known_user("chaffra.module.dead-code.unused_functions"));
+            // A 3-segment runtime name (id + key + sub-key) still admits — the
+            // user can compose multi-part keys.
+            assert!(is_known_user("chaffra.module.foo.bar.baz"));
+        }
+
+        #[test]
+        fn is_known_user_rejects_operator_metrics() {
+            for op in OPERATOR {
+                assert!(!is_known_user(op), "{op} must NOT classify as user");
+            }
+        }
+
+        #[test]
+        fn is_known_user_rejects_unclassified_runtime_metric() {
+            // A runtime metric name that is neither in KNOWN_USER nor in the
+            // per-module shape, and not in OPERATOR, must be unclassified so
+            // the projection fails closed under user-only.
+            assert!(!is_known_user("chaffra.future.unregistered_metric"));
+            assert!(!is_known_user("chaffra.module."));
+            assert!(!is_known_user("chaffra.module.only_id"));
+            assert!(!is_known_user("custom.user.metric"));
+        }
+
+        #[test]
+        fn is_known_user_does_not_admit_operator_shaped_per_module_name() {
+            // An operator metric named with the per-module shape must still
+            // classify as OPERATOR via exact match (the `is_operator` short
+            // circuit at the top of `is_known_user`).
+            // Use the actual MODULE_CALL_DURATION_MS as the canonical case.
+            assert!(is_operator(MODULE_CALL_DURATION_MS));
+            assert!(!is_known_user(MODULE_CALL_DURATION_MS));
+        }
     }
 }
 

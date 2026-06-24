@@ -9,25 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Whether a metric (data point or definition) is operator-scoped and must be
-/// withheld from a user-facing emission boundary.
-///
-/// Classification is by EXACT name against
-/// [`metric_names::OPERATOR`](crate::metrics::metric_names::OPERATOR), the same
-/// set the producers name their metrics from. The guarantee this gives is
-/// precise: a RENAME of an operator metric is a compile error (producer and
-/// classifier share the symbol, so they cannot drift), but an ADDITION of a new
-/// operator metric that is never listed in `OPERATOR` would classify here as
-/// user-facing — that gap is caught by the `test_every_core_metric_is_classified`
-/// completeness test below, which fails CI if any registered metric is
-/// unclassified. Exact (not prefix) matching is what keeps a per-module summary
-/// metric `chaffra.module.<id>.<key>` from colliding with an operator metric
-/// whose name is a prefix of it (e.g. id `error_total` vs
-/// `chaffra.module.error_total`).
-fn is_operator_metric(name: &str) -> bool {
-    metric_names::is_operator(name)
-}
-
 /// Whether a span is operator-scoped. Spans are module execution traces
 /// (timing/correlation) — operator-level telemetry by nature — so today EVERY
 /// span is operator-scoped and withheld from any audience without the operator
@@ -120,7 +101,7 @@ impl TelemetrySnapshot {
     /// retained data instead of cloning it.
     ///
     /// Scope is classified at the field level: operator data points
-    /// ([`is_operator_metric`]), spans ([`is_operator_span`] — all spans are
+    /// ([`metric_names::is_operator`]), spans ([`is_operator_span`] — all spans are
     /// module execution traces, hence operator-level), and operator metric
     /// DEFINITIONS are all gated on the operator scope. Keeping operator
     /// definitions out of a user-only payload matters too: the definition
@@ -143,16 +124,38 @@ impl TelemetrySnapshot {
         let keep_user = audience.user_enabled();
         let keep_operator = audience.operator_enabled();
 
+        // Classification is three-way, not two-way: every name is either
+        // OPERATOR (gated on the operator scope), KNOWN_USER (gated on the
+        // user scope), or UNCLASSIFIED. A previous version of this filter
+        // collapsed UNCLASSIFIED into the user branch (`else => keep_user`),
+        // which was fail-OPEN at the privacy boundary: a runtime/external
+        // metric whose name was neither in `OPERATOR` nor `KNOWN_USER` would
+        // cross the user-only boundary unchallenged. The completeness test
+        // catches that for REGISTERED definitions, but runtime data points
+        // from plugins or future producers were unguarded.
+        //
+        // The fix is fail-CLOSED: an unclassified metric is admitted only
+        // under `On` (the unrestricted scope: BOTH user and operator scopes
+        // enabled). Under `user-only` it is dropped — there is no explicit
+        // user scope on the metric, so it cannot cross a user-only boundary.
+        // Under `operator-only` it is dropped for symmetry — operator-only is
+        // a SPECIFIC scope, not a catch-all. Under `Off` it is dropped along
+        // with everything else.
+        let admit = |name: &str| -> bool {
+            if metric_names::is_operator(name) {
+                keep_operator
+            } else if metric_names::is_known_user(name) {
+                keep_user
+            } else {
+                // Unclassified: require BOTH scopes (i.e. `On`).
+                keep_user && keep_operator
+            }
+        };
+
         let data_points = self
             .data_points
             .into_iter()
-            .filter(|dp| {
-                if is_operator_metric(&dp.name) {
-                    keep_operator
-                } else {
-                    keep_user
-                }
-            })
+            .filter(|dp| admit(&dp.name))
             .collect();
 
         // Spans are operator-scoped: retain them only when the operator scope
@@ -167,17 +170,13 @@ impl TelemetrySnapshot {
         // Definitions are kept per-scope too: a user-facing definition survives
         // whenever the user scope is on, an operator definition only when the
         // operator scope is on. Under `Off` neither scope is enabled, so the
-        // catalogue is emptied.
+        // catalogue is emptied. Definitions classify with the same three-way
+        // admit rule as data points: an unregistered/unclassified definition
+        // is admitted only when BOTH scopes are enabled (i.e. `On`).
         let definitions = self
             .definitions
             .into_iter()
-            .filter(|(name, _)| {
-                if is_operator_metric(name) {
-                    keep_operator
-                } else {
-                    keep_user
-                }
-            })
+            .filter(|(name, _)| admit(name))
             .collect();
 
         // The user summary survives whenever the user scope is on, but it carries
@@ -1029,7 +1028,7 @@ mod tests {
         // parse-cache pressure metric.
         for dp in &snap.data_points {
             assert!(
-                !is_operator_metric(&dp.name),
+                !metric_names::is_operator(&dp.name),
                 "operator metric {} leaked under user-only projection",
                 dp.name
             );
@@ -1224,38 +1223,19 @@ mod tests {
         assert!(snap.operator_summary.module_call_durations.is_empty());
     }
 
-    /// Known user-facing metric names that the classifier intentionally treats
-    /// as NON-operator. Source-tagging the producers is the real fix (deferred to
-    /// a proto-wire change); until then this explicit set is the second half of
-    /// the classification, paired with [`metric_names::OPERATOR`].
-    ///
-    /// Per-module summary names of the shape `chaffra.module.<id>.<key>` (e.g.
-    /// `chaffra.module.complexity.health_score`) are emitted as RUNTIME data
-    /// points via `record_module_summary_metric` and are NEVER registered as
-    /// `MetricDefinition`s, so they don't appear in `snapshot.definitions.keys()`
-    /// and don't need to be enumerated here. The completeness guard below
-    /// deliberately rejects ANY pattern-based admission so that a future
-    /// operator metric named `chaffra.module.<x>.<y>` (which would also match
-    /// the per-module shape) cannot slip past it silently.
-    const KNOWN_USER_METRICS: &[&str] = &[
-        "chaffra.analysis.duration_ms",
-        "chaffra.analysis.files_total",
-        "chaffra.analysis.findings_total",
-        "chaffra.analysis.findings_by_severity",
-        "chaffra.findings.new",
-        "chaffra.findings.resolved",
-        "chaffra.findings.unchanged",
-        "chaffra.findings.churn_rate",
-    ];
-
-    /// Classify a metric name into a known scope by EXACT membership of the two
-    /// explicit sets. Returns `false` for a name that is in neither — i.e. an
-    /// unclassified metric that would silently leak under user-only. Pattern
-    /// matching is intentionally omitted: a `chaffra.module.<x>.<y>`-shaped
-    /// operator metric must be classified by adding it to `metric_names::OPERATOR`,
-    /// not by passing through a permissive pattern.
+    /// Classify a REGISTERED metric definition name into a known scope by
+    /// EXACT membership of the two explicit sets. Returns `false` for a name
+    /// that is in neither — i.e. an unclassified metric that would either leak
+    /// (under the previous fail-open) or be silently dropped (under the new
+    /// fail-closed projection). Pattern matching is intentionally omitted at
+    /// the DEFINITIONS layer: a `chaffra.module.<x>.<y>`-shaped operator
+    /// metric must be classified by adding it to `metric_names::OPERATOR`,
+    /// not by passing through a permissive pattern. (The runtime per-module
+    /// SHAPE is admitted in `metric_names::is_known_user`, but only for
+    /// runtime data points; a registered definition with that shape that is
+    /// neither in `OPERATOR` nor `KNOWN_USER` still fails this guard.)
     fn metric_is_classified(name: &str) -> bool {
-        is_operator_metric(name) || KNOWN_USER_METRICS.contains(&name)
+        metric_names::is_operator(name) || metric_names::KNOWN_USER.contains(&name)
     }
 
     #[test]
@@ -1344,11 +1324,165 @@ mod tests {
     }
 
     #[test]
+    fn test_projection_user_only_drops_unclassified_data_point() {
+        // Fail-closed: a runtime data point whose name is in NEITHER
+        // `metric_names::OPERATOR` NOR `metric_names::KNOWN_USER` (nor the
+        // per-module summary shape) must not cross the user-only boundary.
+        // Previously such a name was admitted by the `else => keep_user`
+        // branch, leaking arbitrary external-plugin metrics under user-only.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        // Unclassified: not in OPERATOR, not in KNOWN_USER, not per-module
+        // summary shaped. A plugin or future producer could legitimately emit
+        // this; the classifier has no scope tag for it.
+        collector.record_data_point(MetricDataPoint {
+            name: "external.plugin.custom_metric".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        // A user-facing classified metric (control) — survives under user-only.
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev);
+
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == "external.plugin.custom_metric"),
+            "unclassified data point leaked under user-only (fail-open regression)"
+        );
+        // The classified user-facing metric is preserved.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.analysis.findings_total"),
+            "classified user-facing metric was dropped"
+        );
+    }
+
+    #[test]
+    fn test_projection_operator_only_drops_unclassified_data_point() {
+        // Symmetric fail-closed at the operator boundary: an unclassified
+        // metric is not implicitly operator-scoped either. Only `On` (both
+        // scopes enabled) admits unclassified.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_data_point(MetricDataPoint {
+            name: "external.plugin.custom_metric".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        collector.record_module_call("dead-code", 7, false); // OPERATOR metric
+
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::OperatorOnly);
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == "external.plugin.custom_metric"),
+            "unclassified data point leaked under operator-only"
+        );
+        // The classified operator metric is preserved.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == metric_names::MODULE_CALL_DURATION_MS),
+            "classified operator metric was dropped"
+        );
+    }
+
+    #[test]
+    fn test_projection_on_admits_unclassified_data_point() {
+        // `On` is the only audience that admits an unclassified metric:
+        // BOTH scopes are enabled, so the "needs explicit scope" rule does
+        // not gate. This keeps `On` as the genuine no-projection audience
+        // for operators who want raw passthrough.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_data_point(MetricDataPoint {
+            name: "external.plugin.custom_metric".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::On);
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "external.plugin.custom_metric"),
+            "On audience dropped an unclassified metric — On must pass everything"
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_drops_unclassified_definition() {
+        // The same fail-closed rule covers DEFINITIONS: an unclassified
+        // definition (one a plugin registers without listing in OPERATOR or
+        // KNOWN_USER) must not appear in a user-only catalogue, otherwise
+        // the catalogue itself discloses which unclassified metrics exist.
+        let collector = TelemetryCollector::with_defaults();
+        collector
+            .register_metrics(
+                "external-plugin",
+                vec![MetricDefinition {
+                    name: "external.plugin.unclassified_def".to_owned(),
+                    kind: MetricKind::Counter,
+                    description: "unclassified".to_owned(),
+                    unit: "count".to_owned(),
+                }],
+            )
+            .unwrap();
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            !snap
+                .definitions
+                .contains_key("external.plugin.unclassified_def"),
+            "unclassified definition leaked under user-only"
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_admits_per_module_summary_runtime_metric() {
+        // Per-module summary RUNTIME data points (`chaffra.module.<id>.<key>`)
+        // are produced by `record_module_summary_metric` and are admitted by
+        // the runtime classifier (`is_known_user` shape match) — they carry
+        // user-facing analysis output (health_score, clone_count, etc.).
+        // Note this is admitted at the DATA POINT layer; an operator metric
+        // of the same shape would have been classified as OPERATOR by exact
+        // match earlier and never reach the shape check.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.module.complexity.health_score"),
+            "per-module summary metric was dropped under user-only"
+        );
+    }
+
+    #[test]
     fn test_is_operator_metric_classification() {
         // The full operator set, including the parse-cache family, classifies
         // as operator.
         for name in metric_names::OPERATOR {
-            assert!(is_operator_metric(name), "{name} should be operator-only");
+            assert!(
+                metric_names::is_operator(name),
+                "{name} should be operator-only"
+            );
         }
         // User-facing metrics — and the collision case: a per-module summary
         // metric whose module id matches an operator name must NOT be misclassified.
@@ -1359,7 +1493,10 @@ mod tests {
             "chaffra.module.dead-code.unused_functions",
             "chaffra.module.error_total.health_score",
         ] {
-            assert!(!is_operator_metric(name), "{name} should be user-facing");
+            assert!(
+                !metric_names::is_operator(name),
+                "{name} should be user-facing"
+            );
         }
     }
 
