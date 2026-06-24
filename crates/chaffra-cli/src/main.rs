@@ -463,14 +463,29 @@ fn merge_telemetry_config(
 /// silently ignored by these previews — `test`/`inspect` now preview exactly
 /// what a real flush at the resolved audience would emit.
 ///
-/// Fail-closed: a structurally invalid `[modules.telemetry]` AND a malformed
-/// TOML in `.chaffra.toml` both surface as typed errors here, matching
-/// `run_with_telemetry`. Previously this helper used `load_config(None, &cwd).ok()`,
-/// which silently swallowed a parse error and fell back to the default config —
-/// re-introducing the precedence divergence the helper was added to fix. Taking
-/// `project_dir` as an argument also removes the `current_dir().ok()` swallow
-/// (the caller now propagates a cwd-unreadable error with `?`) and lets tests
-/// pass `dir.path()` directly without a `CwdGuard` cwd switch.
+/// Fail-closed (this helper only): a structurally invalid `[modules.telemetry]`
+/// AND a malformed TOML in `.chaffra.toml` both surface as typed errors here,
+/// via `load_project_config_strict`. Taking `project_dir` as an argument also
+/// removes the `current_dir().ok()` swallow (the caller now propagates a
+/// cwd-unreadable error with `?`) and lets tests pass `dir.path()` directly
+/// without a `CwdGuard` cwd switch.
+///
+/// Scope caveat — pre-existing leniency on the live-run path: the diagnostic
+/// subcommands routed through THIS helper are strict, but the live-run analysis
+/// dispatch (`health`, `security`, `audit`, ...) still loads project config via
+/// `load_config(None, &root)`, which wraps `ChaffraConfig::load_from_dir(...)`
+/// in `unwrap_or_default()` and so silently coerces a malformed `.chaffra.toml`
+/// to the default config. That fail-open is pre-existing chaffra behavior and
+/// is outside Phase 15a.1's audience-privacy altitude (tightening it would
+/// touch every analysis subcommand). Tracked as a follow-up for a future phase;
+/// no specific issue number — the coordinator will track.
+//
+// Earlier revisions of this comment claimed the strict behavior here "matched
+// `run_with_telemetry`". That was an overclaim — `run_with_telemetry` itself
+// is strict for the telemetry precedence chain (via `merge_telemetry_config`),
+// but the surrounding live-run dispatch loads project config leniently. The
+// alignment is between this helper and the telemetry-precedence chain only,
+// not between this helper and the live-run config-load path.
 fn resolve_subcommand_telemetry(
     cli_config: &chaffra_telemetry::TelemetryConfig,
     project_dir: &Path,

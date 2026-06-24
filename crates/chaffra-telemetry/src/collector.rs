@@ -210,10 +210,12 @@ impl TelemetrySnapshot {
         let user_summary = if keep_user {
             let mut summary = self.user_summary;
             if !keep_operator {
-                summary.module_summaries.retain(|_, module| {
+                for module in summary.module_summaries.values_mut() {
                     module.duration_ms = 0;
-                    module.finding_count != 0 || !module.metrics.is_empty()
-                });
+                }
+                summary
+                    .module_summaries
+                    .retain(|_, m| m.finding_count != 0 || !m.metrics.is_empty());
             }
             summary
         } else {
