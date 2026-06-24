@@ -1301,16 +1301,22 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
         audience,
         backends,
         cli_audience_override: cli.telemetry,
+        cli_config_path: cli.config.clone(),
         ..Default::default()
     }
 }
 
-fn cmd_telemetry_status(
-    cli_config: &chaffra_telemetry::TelemetryConfig,
-    config_path: Option<&str>,
-) -> Result<String> {
+/// `--config <file>` from the CLI dispatch, carried on `cli_config` so the
+/// per-arm dispatch in `main()` does not need a second argument. The
+/// telemetry diagnostic commands and the helper `resolve_subcommand_telemetry`
+/// read the path from here instead of receiving it through the call stack.
+fn dispatch_config_path(cli_config: &chaffra_telemetry::TelemetryConfig) -> Option<&str> {
+    cli_config.cli_config_path.as_deref()
+}
+
+fn cmd_telemetry_status(cli_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
     let project_dir = std::env::current_dir().context("failed to read current directory")?;
-    cmd_telemetry_status_in(cli_config, config_path, &project_dir)
+    cmd_telemetry_status_in(cli_config, dispatch_config_path(cli_config), &project_dir)
 }
 
 fn cmd_telemetry_status_in(
@@ -1348,12 +1354,9 @@ fn cmd_telemetry_status_in(
     Ok(out)
 }
 
-fn cmd_telemetry_test(
-    cli_config: &chaffra_telemetry::TelemetryConfig,
-    config_path: Option<&str>,
-) -> Result<String> {
+fn cmd_telemetry_test(cli_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
     let project_dir = std::env::current_dir().context("failed to read current directory")?;
-    cmd_telemetry_test_in(cli_config, config_path, &project_dir)
+    cmd_telemetry_test_in(cli_config, dispatch_config_path(cli_config), &project_dir)
 }
 
 fn cmd_telemetry_test_in(
@@ -1420,12 +1423,9 @@ fn cmd_telemetry_test_in(
     Ok(out)
 }
 
-fn cmd_telemetry_inspect(
-    cli_config: &chaffra_telemetry::TelemetryConfig,
-    config_path: Option<&str>,
-) -> Result<String> {
+fn cmd_telemetry_inspect(cli_config: &chaffra_telemetry::TelemetryConfig) -> Result<String> {
     let project_dir = std::env::current_dir().context("failed to read current directory")?;
-    cmd_telemetry_inspect_in(cli_config, config_path, &project_dir)
+    cmd_telemetry_inspect_in(cli_config, dispatch_config_path(cli_config), &project_dir)
 }
 
 fn cmd_telemetry_inspect_in(
@@ -1487,25 +1487,6 @@ fn cmd_telemetry_audit_log(export: bool) -> String {
         chaffra_telemetry::audit_log::export_for_gdpr(&events)
     } else {
         chaffra_telemetry::audit_log::format_log_display(&events)
-    }
-}
-
-/// Single dispatch entry point for every `Telemetry` subaction. Returns the
-/// stdout string each action would print, or a typed error that `main()`
-/// surfaces as a nonzero exit. Extracting this lets the dispatch be exercised
-/// without going through `tokio::main` — the live `main()` arm is then one
-/// line per branch.
-fn dispatch_telemetry_action(
-    action: &TelemetryAction,
-    tel_config: &chaffra_telemetry::TelemetryConfig,
-    config_path: Option<&str>,
-) -> Result<String> {
-    match action {
-        TelemetryAction::Status => cmd_telemetry_status(tel_config, config_path),
-        TelemetryAction::Test => cmd_telemetry_test(tel_config, config_path),
-        TelemetryAction::Inspect => cmd_telemetry_inspect(tel_config, config_path),
-        TelemetryAction::Dashboard { stdout } => cmd_telemetry_dashboard(*stdout),
-        TelemetryAction::AuditLog { export } => Ok(cmd_telemetry_audit_log(*export)),
     }
 }
 
@@ -1899,15 +1880,35 @@ async fn main() -> Result<()> {
             print!("{}", cmd_workspaces(&root, format));
         }
 
-        Command::Telemetry { ref action } => {
-            match dispatch_telemetry_action(action, &tel_config, cli.config.as_deref()) {
+        Command::Telemetry { ref action } => match action {
+            TelemetryAction::Status => {
+                print!("{}", cmd_telemetry_status(&tel_config)?);
+            }
+            TelemetryAction::Test => match cmd_telemetry_test(&tel_config) {
                 Ok(output) => print!("{output}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
+            },
+            TelemetryAction::Inspect => match cmd_telemetry_inspect(&tel_config) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            },
+            TelemetryAction::Dashboard { stdout } => match cmd_telemetry_dashboard(*stdout) {
+                Ok(output) => print!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            },
+            TelemetryAction::AuditLog { export } => {
+                print!("{}", cmd_telemetry_audit_log(*export));
             }
-        }
+        },
 
         Command::Management { port } => {
             let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
@@ -3310,7 +3311,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _cwd = CwdGuard::enter(dir.path());
         let cli_config = chaffra_telemetry::TelemetryConfig::default();
-        let out = cmd_telemetry_status(&cli_config, None).unwrap();
+        let out = cmd_telemetry_status(&cli_config).unwrap();
         assert!(
             out.contains("Telemetry mode: UserOnly"),
             "wrapper must resolve cwd and report the audience, got: {out}"
@@ -3358,7 +3359,7 @@ mod tests {
             ..Default::default()
         };
         let _cwd = CwdGuard::enter(dir.path());
-        let out = cmd_telemetry_test(&tel_config, None).unwrap();
+        let out = cmd_telemetry_test(&tel_config).unwrap();
         assert!(out.contains("flushed"), "got: {out}");
     }
 
@@ -3410,7 +3411,7 @@ mod tests {
         };
         let dir = TempDir::new().unwrap();
         let _cwd = CwdGuard::enter(dir.path());
-        let out = cmd_telemetry_inspect(&tel_config, None).unwrap();
+        let out = cmd_telemetry_inspect(&tel_config).unwrap();
         assert!(
             !out.contains("chaffra.module.call_duration_ms"),
             "wrapper must project to user-only, got: {out}"
@@ -3418,74 +3419,52 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_telemetry_action_routes_every_arm() {
-        // The single-line dispatch arm in `main()` calls
-        // `dispatch_telemetry_action`. Exercise every branch here so the
-        // trust-boundary changed-line gate sees the dispatch covered without
-        // having to drive `tokio::main` from a unit test.
+    fn test_cli_config_path_threads_through_tel_config() {
+        // F6 uses `cli_config_path` on `TelemetryConfig` as a precedence
+        // hint (same #[serde(skip)] pattern as `cli_audience_override`).
+        // `cmd_telemetry_status` / `_test` / `_inspect` read the path from
+        // there via `dispatch_config_path`, so the `main()` dispatch site
+        // keeps its base-shape one-arg signature. Verify the wiring: a CLI
+        // `--config <file>` populated into `cli_config_path` is honoured by
+        // the diagnostic commands, while no path falls through to implicit
+        // `.chaffra.toml` discovery in cwd.
         let dir = TempDir::new().unwrap();
-        let _cwd = CwdGuard::enter(dir.path());
-        let path = dir.path().join("t.json");
-        let tel_config = chaffra_telemetry::TelemetryConfig {
-            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
-            backends: vec![chaffra_telemetry::BackendConfig {
-                kind: chaffra_telemetry::BackendKind::JsonFile,
-                endpoint: None,
-                path: Some(path.to_str().unwrap().to_owned()),
-                options: HashMap::new(),
-            }],
-            ..Default::default()
-        };
-
-        let status =
-            dispatch_telemetry_action(&TelemetryAction::Status, &tel_config, None).unwrap();
-        assert!(status.contains("Telemetry mode: UserOnly"), "got: {status}");
-
-        let test = dispatch_telemetry_action(&TelemetryAction::Test, &tel_config, None).unwrap();
-        assert!(test.contains("flushed"), "got: {test}");
-
-        let inspect =
-            dispatch_telemetry_action(&TelemetryAction::Inspect, &tel_config, None).unwrap();
-        assert!(!inspect.is_empty(), "inspect output empty");
-
-        // Dashboard branch: writing to a temp filename inside the tempdir cwd.
-        let dashboard = dispatch_telemetry_action(
-            &TelemetryAction::Dashboard { stdout: true },
-            &tel_config,
-            None,
-        )
-        .unwrap();
-        assert!(dashboard.contains("{"), "dashboard json malformed");
-
-        // AuditLog branch: empty when no log exists; non-error string return.
-        let audit = dispatch_telemetry_action(
-            &TelemetryAction::AuditLog { export: false },
-            &tel_config,
-            None,
-        )
-        .unwrap();
-        assert!(!audit.is_empty());
-    }
-
-    #[test]
-    fn test_dispatch_telemetry_action_propagates_bad_config_error() {
-        // Bad config must surface as an `Err` from the dispatch so `main()`
-        // exits nonzero. Asserting this branch keeps the error-path lines
-        // in `dispatch_telemetry_action` covered.
-        let dir = TempDir::new().unwrap();
-        let _cwd = CwdGuard::enter(dir.path());
+        // Implicit project file: says `on`.
         fs::write(
             dir.path().join(".chaffra.toml"),
-            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"everyone\"\n",
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"on\"\n",
         )
         .unwrap();
-        let tel_config = chaffra_telemetry::TelemetryConfig::default();
-        let err =
-            dispatch_telemetry_action(&TelemetryAction::Status, &tel_config, None).unwrap_err();
+        let explicit = dir.path().join("explicit.toml");
+        fs::write(
+            &explicit,
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"off\"\n",
+        )
+        .unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig {
+            cli_config_path: Some(explicit.to_str().unwrap().to_owned()),
+            ..Default::default()
+        };
+        // `dispatch_config_path` extracts the carried path.
+        assert_eq!(
+            dispatch_config_path(&cli_config),
+            Some(explicit.to_str().unwrap())
+        );
+        // Status routes via `cli_config_path` to the explicit file (`off`),
+        // NOT the implicit cwd file (`on`).
+        let _cwd = CwdGuard::enter(dir.path());
+        let status = cmd_telemetry_status(&cli_config).unwrap();
         assert!(
-            err.to_string()
-                .contains("invalid [modules.telemetry] configuration"),
-            "got: {err}"
+            status.contains("Telemetry mode: Off"),
+            "explicit --config audience must win, got: {status}"
+        );
+
+        // No carried path: implicit cwd `.chaffra.toml` (the `on` audience) wins.
+        let cli_no_path = chaffra_telemetry::TelemetryConfig::default();
+        let status = cmd_telemetry_status(&cli_no_path).unwrap();
+        assert!(
+            status.contains("Telemetry mode: On"),
+            "implicit cwd audience must win when no --config, got: {status}"
         );
     }
 

@@ -147,6 +147,21 @@ pub struct TelemetryConfig {
     /// payload, so the persisted telemetry schema is unchanged.
     #[serde(skip)]
     pub cli_audience_override: Option<TelemetryAudience>,
+
+    /// The global `--config <file>` path, if one was passed at the CLI.
+    ///
+    /// Carries the explicit project config path from the CLI dispatch down to
+    /// the telemetry diagnostic subcommands (`status` / `test` / `inspect`),
+    /// which need to honour the same `.chaffra.toml` a live run would use.
+    /// Threading it as a separate argument forced a signature change at the
+    /// `main()` dispatch site — same pattern as
+    /// [`cli_audience_override`](Self::cli_audience_override): a precedence
+    /// hint that lives on the telemetry-config carrier so the per-arm
+    /// dispatch in `main()` stays a one-line `print!` and does not need to
+    /// learn about CLI fields. `#[serde(skip)]` keeps it out of every
+    /// serialized snapshot and backend payload.
+    #[serde(skip)]
+    pub cli_config_path: Option<String>,
 }
 
 fn default_sampling_rate() -> f64 {
@@ -161,6 +176,7 @@ impl Default for TelemetryConfig {
             sampling_rate: 1.0,
             sampling_strategy: SamplingStrategy::default(),
             cli_audience_override: None,
+            cli_config_path: None,
         }
     }
 }
@@ -224,6 +240,7 @@ impl TelemetryConfig {
             sampling_rate,
             sampling_strategy,
             cli_audience_override: None,
+            cli_config_path: None,
         })
     }
 
