@@ -413,14 +413,17 @@ threshold = "10"
         // Assert the TYPED variant, not just the message substring: the CLI
         // strict loader and callers pattern-match on `ChaffraError::Config`,
         // so a future refactor that returned a different variant with a
-        // similar message must fail this test.
-        match err {
-            ChaffraError::Config(msg) => assert!(
-                msg.contains("failed to probe"),
-                "expected probe-error message, got: {msg}"
-            ),
-            other => panic!("expected ChaffraError::Config, got {other:?}"),
-        }
+        // similar message must fail this test. `matches!` keeps the negative
+        // arm on a single executed line — a multi-line `_ => panic!()` arm
+        // would be an uncovered changed line in this trust-boundary file.
+        assert!(
+            matches!(err, ChaffraError::Config(_)),
+            "expected ChaffraError::Config, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("failed to probe"),
+            "expected probe-error message, got: {err}"
+        );
     }
 
     #[test]

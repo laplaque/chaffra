@@ -232,26 +232,37 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
 
       * exactly one ``LF`` and one ``LH`` record (reject missing / duplicate),
       * ``LH <= LF``,
-      * ``LF >= unique DA lines`` and ``LH >= unique hit DA lines`` — the DA
-        detail must be a subset of the declared summary (reconciliation),
-      * ``(LH - covered_DA) <= (LF - unique_DA)`` — the *unseen* hits a
-        producer claims must not exceed the *unseen* instrumented lines.
-        This catches the strict-overrun case (e.g. ``LF:10 LH:10 DA:1,1
-        DA:2,0`` → unseen_hits=9 > unseen_inst=8). It does NOT catch the
-        equal-pair case (``DA:1,1; LF:N; LH:N`` for any N — unseen_hits =
-        unseen_inst = N-1 passes). That case is instead defanged by the
-        arithmetic choice in :func:`evaluate`, which uses the DA-coherent
-        metric ``Σ(covered DA) / Σ(unique DA)`` and so never reads ``LH``;
-        the producer's high declared LH cannot lift the score past the
+      * ``LF >= unique DA lines`` — the DA instrumentation detail must be a
+        subset of the declared instrumented summary (reconciliation),
+      * ``(effective_LH - covered_DA) <= (LF - unique_DA)`` — the *unseen*
+        hits a producer claims must not exceed the *unseen* instrumented
+        lines. This catches the inflation/strict-overrun case (e.g.
+        ``LF:10 LH:10 DA:1,1 DA:2,0`` → unseen_hits=9 > unseen_inst=8). It
+        does NOT catch the equal-pair case (``DA:1,1; LF:N; LH:N`` for any N —
+        unseen_hits = unseen_inst = N-1 passes). That case is instead defanged
+        by the arithmetic choice in :func:`evaluate`, which uses the
+        DA-coherent metric ``Σ(covered DA) / Σ(unique DA)`` and so never reads
+        ``LH``; the producer's high declared LH cannot lift the score past the
         DA records' demonstrated coverage.
       * no duplicate DA record for the same line,
       * at least one DA record per ACTIVE block,
       * ``end_of_record`` terminates the block.
 
-    These bounds are the strongest that the pinned producer (cargo-llvm-cov
-    0.6.21) satisfies: empirically it declares ``LF`` strictly greater than
-    the number of serialised DA lines in 72 / 88 workspace blocks, so a
-    strict ``LF == DA-count`` equality would reject legitimate output.
+    ``LH`` is NOT required to be ``>= unique hit DA lines``. LLVM's
+    ``llvm-cov export`` (the toolchain producer beneath cargo-llvm-cov) can
+    emit an ``LH`` summary that UNDERCOUNTS the DA hit detail — observed as an
+    off-by-one under feature-powerset profraw accumulation, reproduced
+    identically across cargo-llvm-cov 0.6.21 and 0.8.7. An ``LH`` below the DA
+    hit count is the opposite of coverage inflation and cannot affect the
+    DA-derived score, so the parser clamps the effective ``LH`` up to the
+    authoritative DA hit count rather than rejecting. Only ``LH`` OVERclaiming
+    (the inflation direction) is rejected, via ``LH <= LF`` and the unseen-hits
+    bound above.
+
+    The remaining bounds are the strongest the producer satisfies:
+    empirically it declares ``LF`` strictly greater than the number of
+    serialised DA lines in 72 / 88 workspace blocks, so a strict
+    ``LF == DA-count`` equality would reject legitimate output.
 
     Two SF blocks that normalise to the same repository-relative path are
     rejected as a collision. SF paths that escape ``repo_root`` start a
@@ -355,20 +366,40 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
                     f"line {line_no}: LF={block_lf} below {len(block_da_lines)} "
                     f"unique DA lines for {where!r}"
                 )
-            if block_lh < len(block_hit_lines):
-                raise MalformedInput(
-                    f"line {line_no}: LH={block_lh} below {len(block_hit_lines)} "
-                    f"unique hit DA lines for {where!r}"
-                )
-            # Reconciliation bound between the summary and the detail:
-            # the producer's *unseen* hits (LH − covered DA lines) must
-            # not exceed the producer's *unseen* instrumented lines
-            # (LF − unique DA lines). A producer cannot claim more hits
-            # behind the DA records than there is undeclared
-            # instrumentation behind them. This rejects, e.g.,
-            # `LF:10 LH:10 DA:1,1 DA:2,0` (unseen_hits=9 > unseen_inst=8).
+            # LH may UNDERCOUNT the DA detail. LLVM's `llvm-cov export`
+            # (the toolchain producer beneath cargo-llvm-cov) can emit an LH
+            # summary one or more below the number of DA lines with a nonzero
+            # hit count — observed as an off-by-one on
+            # `crates/chaffra-mcp/src/tools.rs` under the feature-powerset
+            # profraw accumulation, and reproduced identically across
+            # cargo-llvm-cov 0.6.21 and 0.8.7 (so it is an LLVM-level summary
+            # quirk, not a cargo-llvm-cov one). This is BENIGN and must not be
+            # rejected:
+            #   * The DA records are authoritative. The coverage score is
+            #     computed from them (`FileCoverage.covered_lines` /
+            #     `instrumented_lines` in `evaluate`), and `merge_lcov`
+            #     recomputes `declared_lh` from DA — the parsed LH is advisory
+            #     and never reaches the score.
+            #   * An LH BELOW the DA-hit count is the opposite of coverage
+            #     inflation; it cannot lift a file past its demonstrated
+            #     coverage. (Inflation — LH too HIGH — is still rejected by the
+            #     `LH <= LF` check above and the unseen-hits upper bound below.)
+            # So clamp the effective LH up to the authoritative DA-hit count
+            # rather than rejecting. A bounded threshold on the undercount is
+            # deliberately avoided: any constant would itself be a magic value
+            # that could reject legitimate producer output, which is the bug
+            # this guards against.
+            effective_lh = max(block_lh, len(block_hit_lines))
+            # Reconciliation bound between the (clamped) summary and the
+            # detail: the producer's *unseen* hits (effective LH − covered DA
+            # lines) must not exceed the producer's *unseen* instrumented
+            # lines (LF − unique DA lines). A producer cannot claim more hits
+            # behind the DA records than there is undeclared instrumentation
+            # behind them. This rejects, e.g., `LF:10 LH:10 DA:1,1 DA:2,0`
+            # (unseen_hits=9 > unseen_inst=8). Clamping never lowers a high LH
+            # (max with the hit count), so an inflated LH is still caught here.
             unseen_inst = block_lf - len(block_da_lines)
-            unseen_hits = block_lh - len(block_hit_lines)
+            unseen_hits = effective_lh - len(block_hit_lines)
             if unseen_hits > unseen_inst:
                 raise MalformedInput(
                     f"line {line_no}: LH={block_lh} claims {unseen_hits} hits "
@@ -378,7 +409,7 @@ def parse_lcov(text: str, repo_root: Path) -> dict[str, FileCoverage]:
             if state == "ACTIVE":
                 assert current is not None
                 current.declared_lf = block_lf
-                current.declared_lh = block_lh
+                current.declared_lh = effective_lh
             current = None
             reset_block()
             state = "IDLE"
