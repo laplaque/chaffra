@@ -92,45 +92,39 @@ pub mod metric_names {
         OPERATOR.contains(&name)
     }
 
-    /// Whether a metric NAME is an explicitly classified user-facing metric.
-    /// Exact membership in [`KNOWN_USER`] OR a runtime per-module summary of
-    /// the shape `chaffra.module.<id>.<key>` (produced only by
-    /// `TelemetryCollector::record_module_summary_metric`; never registered as
-    /// a `MetricDefinition`, so the operator-name collision risk that the
-    /// definitions completeness guard rejects pattern admission for does not
-    /// arise for these runtime points — and the `is_operator` exact-match
-    /// check above still wins for any operator name that happens to match the
-    /// per-module shape).
+    /// Whether a metric NAME is an explicitly classified user-facing metric
+    /// by EXACT membership in [`KNOWN_USER`].
     ///
-    /// This split — explicit set vs. runtime-pattern — is intentional. The
-    /// explicit set covers everything that gets REGISTERED as a definition
-    /// (the completeness test guards it). The pattern covers the runtime
-    /// per-module summary points the producer emits without a definition. A
-    /// name in neither — and not in [`OPERATOR`] — is unclassified and
-    /// blocked from a user boundary by [`crate::collector::TelemetrySnapshot::project_for_audience`].
+    /// Runtime per-module summary points of the shape
+    /// `chaffra.module.<id>.<key>` (`record_module_summary_metric`) are user
+    /// facing too, but their classification is NOT done by name shape here.
+    /// A previous revision admitted every name matching that shape, which
+    /// reopened the fail-open boundary at the gRPC ingestion seam: an
+    /// external plugin could `record_metrics` a `MetricDataPoint` named
+    /// `chaffra.module.<their-id>.<anything>` and have it cross `user-only`
+    /// untouched solely because of the pattern.
+    ///
+    /// The trusted-producer registry replaces the pattern: the collector
+    /// records the names it emits via `record_module_summary_metric` into a
+    /// runtime allowlist (`TelemetrySnapshot::known_user_runtime`), and
+    /// [`crate::collector::TelemetrySnapshot::project_for_audience`] admits
+    /// a runtime point to the user scope only when its name is either in
+    /// [`KNOWN_USER`] or in that snapshot-scoped trusted set. Spoofed names
+    /// arriving on the gRPC `record_metrics` path are not in the trusted
+    /// set and therefore fail closed under `user-only`.
+    ///
+    /// This function intentionally does NOT consult that runtime set
+    /// (it has no access to a collector); call sites that need the full
+    /// classification go through the snapshot. The completeness guard on
+    /// registered DEFINITIONS still uses this function — and that is correct:
+    /// definitions must be classified explicitly by listing in [`OPERATOR`]
+    /// or [`KNOWN_USER`], the runtime allowlist is data-point-only.
     #[must_use]
     pub fn is_known_user(name: &str) -> bool {
         if is_operator(name) {
             return false;
         }
-        if KNOWN_USER.contains(&name) {
-            return true;
-        }
-        is_per_module_summary_shape(name)
-    }
-
-    /// Match the runtime per-module summary shape `chaffra.module.<id>.<key>`
-    /// (e.g. `chaffra.module.complexity.health_score`): the prefix
-    /// `chaffra.module.` followed by at least two non-empty dot-separated
-    /// segments. Used only by [`is_known_user`] — the definitions
-    /// completeness guard intentionally does not pattern-admit, so a registered
-    /// operator metric of this shape cannot slip past it.
-    fn is_per_module_summary_shape(name: &str) -> bool {
-        let Some(rest) = name.strip_prefix("chaffra.module.") else {
-            return false;
-        };
-        let segments: Vec<&str> = rest.split('.').collect();
-        segments.len() >= 2 && segments.iter().all(|s| !s.is_empty())
+        KNOWN_USER.contains(&name)
     }
 
     #[cfg(test)]
@@ -152,12 +146,20 @@ pub mod metric_names {
         }
 
         #[test]
-        fn is_known_user_matches_per_module_summary_shape() {
-            assert!(is_known_user("chaffra.module.complexity.health_score"));
-            assert!(is_known_user("chaffra.module.dead-code.unused_functions"));
-            // A 3-segment runtime name (id + key + sub-key) still admits — the
-            // user can compose multi-part keys.
-            assert!(is_known_user("chaffra.module.foo.bar.baz"));
+        fn is_known_user_rejects_per_module_summary_shape_by_name_alone() {
+            // Critical fail-closed invariant: the name-only classifier must
+            // NOT admit per-module summary shapes. The pattern admission a
+            // previous revision used reopened the user-only boundary for
+            // every plugin-emitted `chaffra.module.<id>.<key>` data point on
+            // the gRPC ingestion path. Runtime classification for these
+            // names lives on `TelemetrySnapshot::known_user_runtime` (a
+            // trusted-producer allowlist populated by
+            // `record_module_summary_metric`), exercised end-to-end by the
+            // collector tests; `is_known_user` is intentionally pattern-blind.
+            assert!(!is_known_user("chaffra.module.complexity.health_score"));
+            assert!(!is_known_user("chaffra.module.dead-code.unused_functions"));
+            assert!(!is_known_user("chaffra.module.foo.bar.baz"));
+            assert!(!is_known_user("chaffra.module.plugin.cache_size_bytes"));
         }
 
         #[test]
@@ -169,9 +171,9 @@ pub mod metric_names {
 
         #[test]
         fn is_known_user_rejects_unclassified_runtime_metric() {
-            // A runtime metric name that is neither in KNOWN_USER nor in the
-            // per-module shape, and not in OPERATOR, must be unclassified so
-            // the projection fails closed under user-only.
+            // A runtime metric name that is not in KNOWN_USER and not in
+            // OPERATOR must be unclassified so the projection fails closed
+            // under user-only.
             assert!(!is_known_user("chaffra.future.unregistered_metric"));
             assert!(!is_known_user("chaffra.module."));
             assert!(!is_known_user("chaffra.module.only_id"));
@@ -182,8 +184,10 @@ pub mod metric_names {
         fn is_known_user_does_not_admit_operator_shaped_per_module_name() {
             // An operator metric named with the per-module shape must still
             // classify as OPERATOR via exact match (the `is_operator` short
-            // circuit at the top of `is_known_user`).
-            // Use the actual MODULE_CALL_DURATION_MS as the canonical case.
+            // circuit at the top of `is_known_user`). The previous pattern
+            // admission did not regress this case (`is_operator` ran first),
+            // but the assertion is preserved because the contract is the
+            // critical one: a name in OPERATOR is NEVER user-facing.
             assert!(is_operator(MODULE_CALL_DURATION_MS));
             assert!(!is_known_user(MODULE_CALL_DURATION_MS));
         }

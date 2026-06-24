@@ -237,12 +237,25 @@ impl ChaffraConfig {
     }
 
     /// Load configuration from the given directory, looking for `.chaffra.toml`.
+    ///
+    /// Implicit-file discovery is fail-closed on read/metadata failure:
+    /// `Path::try_exists` is used (NOT the infallible `Path::exists`, which
+    /// collapses every non-`NotFound` error to `false`). Only a true absence
+    /// (`Ok(false)`) yields the default config; permission denied, an
+    /// unreadable parent directory, a broken symlink, or any other IO error
+    /// propagates as a typed `ChaffraError::Config` so the strict loader in
+    /// the CLI actually fails closed instead of silently defaulting an
+    /// inaccessible `.chaffra.toml` to the empty config.
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
         let config_path = dir.join(CONFIG_FILE_NAME);
-        if config_path.exists() {
-            Self::load(&config_path)
-        } else {
-            Ok(Self::default())
+        match config_path.try_exists() {
+            Ok(true) => Self::load(&config_path),
+            Ok(false) => Ok(Self::default()),
+            Err(e) => Err(ChaffraError::Config(format!(
+                "failed to probe {}: {}",
+                config_path.display(),
+                e
+            ))),
         }
     }
 
@@ -354,6 +367,60 @@ threshold = "10"
         let config = ChaffraConfig::load_from_dir(&dir).unwrap();
         assert_eq!(config.health.max_cyclomatic, 25);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_from_dir_missing_returns_default() {
+        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No .chaffra.toml — load_from_dir must return the default.
+        let config = ChaffraConfig::load_from_dir(&dir).unwrap();
+        assert_eq!(config.health.max_cyclomatic, 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_dir_propagates_metadata_error() {
+        // The strict loader must distinguish "file does not exist" (return
+        // default) from "file exists but cannot be probed" (propagate). The
+        // old `Path::exists()` collapsed both cases to "treat as absent" and
+        // silently defaulted on permission/IO errors. Verify the new
+        // `try_exists()` path propagates a typed error instead.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir_no_perm");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(CONFIG_FILE_NAME);
+        std::fs::write(&cfg_path, "[health]\nmax-cyclomatic = 25\n").unwrap();
+
+        // Strip search permission on the directory so `try_exists` fails with
+        // EACCES (a non-`NotFound` error). root bypasses permission checks,
+        // so this assertion only runs when EACCES is actually reachable —
+        // probe by trying to read the file as a non-root sanity check.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        let original_mode = perms.mode();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let can_still_read = std::fs::read_to_string(&cfg_path).is_ok();
+        let result = ChaffraConfig::load_from_dir(&dir);
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(original_mode);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if !can_still_read {
+            let err = result.expect_err("unreadable parent dir must fail closed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("failed to probe"),
+                "expected typed probe error, got: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -20,8 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// alongside the metric source-tagging (proto-wire change, out of Stage 15a.1
 /// scope); until then the constant-`true` body keeps the current
 /// all-spans-operator behaviour while leaving the classification seam in place.
-// TODO(issue): classify spans individually once SpanData carries an audience
-// scope tag (deferred with metric source-tagging; proto-wire change).
+// TODO(#45): classify spans individually once SpanData carries an audience
+// scope tag. Deferred alongside the metric source-tagging contract — both
+// are proto-wire changes tracked by the same issue ("gRPC: trusted metric
+// audience classification at registration"), which adds an `audience` field
+// to `MetricDefinition` and validates `(module_id, name)` at ingestion. The
+// span variant of that work will extend the same registry-driven scope so
+// `is_operator_span` can derive its answer from the registered span schema
+// instead of the current all-spans-operator constant.
 fn is_operator_span(_span: &SpanData) -> bool {
     true
 }
@@ -41,6 +47,23 @@ pub struct TelemetrySnapshot {
     pub user_summary: UserSummary,
     /// Operator summary (call latencies, error rates).
     pub operator_summary: OperatorSummary,
+    /// Trusted-producer allowlist of user-facing runtime data-point names
+    /// emitted via [`TelemetryCollector::record_module_summary_metric`]. A
+    /// runtime data point named `chaffra.module.<id>.<key>` is admitted to
+    /// the user scope by [`Self::project_for_audience`] only when its name
+    /// is in this set (or in [`metric_names::KNOWN_USER`]).
+    ///
+    /// External plugins emitting `MetricDataPoint`s via the gRPC
+    /// `record_metrics` path land in [`Self::data_points`] but NOT in this
+    /// allowlist, so their names — even if shaped like a per-module summary
+    /// — cannot cross the user-only boundary.
+    ///
+    /// `#[serde(default)]` keeps deserialization of older snapshot payloads
+    /// (which lacked this field) working; an empty allowlist behaves as
+    /// fail-closed for unrecognised runtime names, which is the intended
+    /// upgrade semantics.
+    #[serde(default)]
+    pub known_user_runtime: HashSet<String>,
 }
 
 /// User-facing telemetry summary included in analysis output.
@@ -141,10 +164,16 @@ impl TelemetrySnapshot {
         // Under `operator-only` it is dropped for symmetry — operator-only is
         // a SPECIFIC scope, not a catch-all. Under `Off` it is dropped along
         // with everything else.
+        // User-runtime allowlist: a runtime data point name is user-facing
+        // only if it is in `KNOWN_USER` or in the trusted-producer allowlist
+        // that `record_module_summary_metric` populates. Capturing the
+        // borrow up-front keeps the closure independent of `self` so the
+        // by-value `into_iter` moves below stay valid.
+        let known_user_runtime = &self.known_user_runtime;
         let admit = |name: &str| -> bool {
             if metric_names::is_operator(name) {
                 keep_operator
-            } else if metric_names::is_known_user(name) {
+            } else if metric_names::is_known_user(name) || known_user_runtime.contains(name) {
                 keep_user
             } else {
                 // Unclassified: require BOTH scopes (i.e. `On`).
@@ -232,6 +261,11 @@ impl TelemetrySnapshot {
             } else {
                 OperatorSummary::default()
             },
+            // Preserve the trusted-producer allowlist across projection. The
+            // set is metadata about which names the trusted internal path
+            // emitted; it does not contain any per-audience payload itself
+            // and re-projecting the same snapshot must classify identically.
+            known_user_runtime: self.known_user_runtime,
         }
     }
 }
@@ -258,6 +292,12 @@ struct CollectorInner {
     files_total: u64,
     analysis_start_ms: u64,
     finding_fingerprints: HashSet<crate::churn::FindingFingerprint>,
+    /// Names of runtime data points the trusted internal path emitted via
+    /// `record_module_summary_metric`. The collector hands this set to
+    /// `TelemetrySnapshot::known_user_runtime` at snapshot time so the
+    /// projection's user-runtime classifier can fail closed for any name
+    /// arriving on the external ingestion path.
+    known_user_runtime: HashSet<String>,
 }
 
 fn now_ms() -> u64 {
@@ -416,18 +456,32 @@ impl TelemetryCollector {
     }
 
     /// Record a per-module summary metric (e.g. health_score, clone_count).
+    ///
+    /// This is the trusted internal producer for the runtime
+    /// `chaffra.module.<id>.<key>` user-facing data points. Beyond pushing
+    /// the data point itself, the name is added to the collector's
+    /// trusted-producer allowlist (`known_user_runtime`) so the snapshot
+    /// projection can distinguish it from an identically-shaped name
+    /// arriving on the gRPC `record_metrics` ingestion path (which lands
+    /// in `data_points` without touching this allowlist and therefore
+    /// fails closed under `user-only`).
     pub fn record_module_summary_metric(&self, module_id: &str, key: &str, value: f64) {
+        let name = format!("chaffra.module.{module_id}.{key}");
         let ts = now_ms();
-        self.record_data_point(MetricDataPoint {
-            name: format!("chaffra.module.{module_id}.{key}"),
-            value,
-            labels: {
-                let mut m = HashMap::new();
-                m.insert("module".to_owned(), module_id.to_owned());
-                m
-            },
-            timestamp_ms: ts,
-        });
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.known_user_runtime.insert(name.clone());
+            inner.data_points.push(MetricDataPoint {
+                name,
+                value,
+                labels: {
+                    let mut m = HashMap::new();
+                    m.insert("module".to_owned(), module_id.to_owned());
+                    m
+                },
+                timestamp_ms: ts,
+            });
+        }
     }
 
     /// Take a snapshot of all collected telemetry.
@@ -476,6 +530,7 @@ impl TelemetryCollector {
                 module_call_durations: inner.module_durations.clone(),
                 module_error_counts: inner.module_errors.clone(),
             },
+            known_user_runtime: inner.known_user_runtime.clone(),
         }
     }
 
@@ -1230,10 +1285,12 @@ mod tests {
     /// fail-closed projection). Pattern matching is intentionally omitted at
     /// the DEFINITIONS layer: a `chaffra.module.<x>.<y>`-shaped operator
     /// metric must be classified by adding it to `metric_names::OPERATOR`,
-    /// not by passing through a permissive pattern. (The runtime per-module
-    /// SHAPE is admitted in `metric_names::is_known_user`, but only for
-    /// runtime data points; a registered definition with that shape that is
-    /// neither in `OPERATOR` nor `KNOWN_USER` still fails this guard.)
+    /// not by passing through a permissive pattern. Per-module summary RUNTIME
+    /// data points are admitted through a separate, snapshot-scoped allowlist
+    /// (`TelemetrySnapshot::known_user_runtime`) that the trusted internal
+    /// producer (`record_module_summary_metric`) populates; that allowlist
+    /// is intentionally NOT consulted here because a registered DEFINITION
+    /// has to be classified explicitly regardless of any runtime emission.
     fn metric_is_classified(name: &str) -> bool {
         metric_names::is_operator(name) || metric_names::KNOWN_USER.contains(&name)
     }
@@ -1456,11 +1513,11 @@ mod tests {
     fn test_projection_user_only_admits_per_module_summary_runtime_metric() {
         // Per-module summary RUNTIME data points (`chaffra.module.<id>.<key>`)
         // are produced by `record_module_summary_metric` and are admitted by
-        // the runtime classifier (`is_known_user` shape match) — they carry
-        // user-facing analysis output (health_score, clone_count, etc.).
-        // Note this is admitted at the DATA POINT layer; an operator metric
-        // of the same shape would have been classified as OPERATOR by exact
-        // match earlier and never reach the shape check.
+        // the trusted-producer allowlist (`TelemetrySnapshot::known_user_runtime`)
+        // — they carry user-facing analysis output (health_score, clone_count,
+        // etc.). An operator metric of the same shape would have been
+        // classified as OPERATOR by exact match earlier and never reach the
+        // runtime classifier.
         let collector = TelemetryCollector::with_defaults();
         collector.record_module_summary_metric("complexity", "health_score", 88.0);
         let snap = collector
@@ -1471,6 +1528,55 @@ mod tests {
                 .iter()
                 .any(|p| p.name == "chaffra.module.complexity.health_score"),
             "per-module summary metric was dropped under user-only"
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_drops_plugin_spoofed_per_module_runtime_metric() {
+        // R2 fail-closed invariant: the runtime user classifier MUST distinguish
+        // a per-module summary point produced by the trusted internal path
+        // (`record_module_summary_metric`) from an identically-shaped point
+        // arriving via the external ingestion path (`record_data_point` /
+        // `record_data_points`, which is what the gRPC `record_metrics`
+        // handler funnels external module input through). A previous revision
+        // used a pure-shape match (`chaffra.module.<id>.<key>` admitted as
+        // user-facing) and a plugin could trivially spoof a name to cross
+        // the user-only boundary unchallenged.
+        //
+        // After R2: only names the collector itself emitted via the trusted
+        // path appear in `TelemetrySnapshot::known_user_runtime`; an external
+        // point with the same shape is NOT in that set and the projection
+        // drops it under user-only. We exercise both halves in the same
+        // snapshot to prove the discriminator is producer-source, not name.
+        let collector = TelemetryCollector::with_defaults();
+        // Trusted: emitted via the internal producer.
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        // Spoofed: same shape, but pushed as if from a plugin's gRPC
+        // `record_metrics` call (the production path lands here).
+        collector.record_data_point(MetricDataPoint {
+            name: "chaffra.module.plugin.cache_size_bytes".to_owned(),
+            value: 1024.0,
+            labels: HashMap::new(),
+            timestamp_ms: 0,
+        });
+
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.module.complexity.health_score"),
+            "trusted per-module summary metric was dropped under user-only"
+        );
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == "chaffra.module.plugin.cache_size_bytes"),
+            "spoofed per-module-shaped runtime metric leaked under user-only \
+             via name pattern admission (fail-open regression)"
         );
     }
 
