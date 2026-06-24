@@ -9,9 +9,19 @@ use std::collections::HashMap;
 /// producer (the collector, the parse-cache flush, the core definition
 /// registry) names its data points and definitions from here, and the audience
 /// classifier in [`crate::collector`] decides operator-vs-user scope from the
-/// same set. Because producer and classifier share these symbols, a rename
-/// cannot silently desynchronise the two — a typo is a compile error, not a
-/// privacy leak.
+/// same set.
+///
+/// Two distinct failure modes, two distinct guards:
+/// - A **rename** of an operator metric is a compile error, because producer
+///   and classifier share the same `const` symbol — they cannot desynchronise.
+/// - A newly **added** operator metric that the author forgets to list in
+///   [`metric_names::OPERATOR`] would silently classify as user-facing and leak
+///   under user-only. Name matching alone cannot catch that. The completeness
+///   test in [`crate::collector`] (`test_every_core_metric_is_classified`)
+///   closes the gap: it registers the core metrics and fails CI if any
+///   registered metric name is neither in `OPERATOR` nor in the explicit
+///   known-user set/pattern. (The real fix — source-tagging each metric at the
+///   producer — is deferred to a proto-wire change.)
 pub mod metric_names {
     /// Operator-scoped metric names: process- and environment-shaped telemetry
     /// (call latencies, error/connection/startup counters, cache pressure) that

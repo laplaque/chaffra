@@ -150,13 +150,19 @@ impl AnalysisModule for TelemetryModule {
             },
         });
 
-        // Flush to backends whenever telemetry is not fully disabled. This is
-        // the SAME rule the CLI `run_with_telemetry` paths use (flush the
-        // projected snapshot for any audience except `Off`): projection decides
+        // Flush to backends whenever telemetry is not fully disabled: project the
+        // snapshot and flush it for any audience except `Off`. Projection decides
         // what the payload contains, so under `user-only` the backends receive
         // exactly the user-facing fields and never any operator data, while
         // `Off` emits nothing at all. Projecting BEFORE emission guarantees raw
         // operator-only fields never cross this persistence boundary unprojected.
+        //
+        // The projection boundary is shared with the CLI `run_with_telemetry`
+        // paths, but the EMISSION rule is not identical: the CLI success path
+        // additionally gates the flush on `SamplingDecision::Emit` (rate /
+        // on-change sampling), whereas this module path flushes on every non-Off
+        // run. Sampling is applied only on the CLI success path; here the rule is
+        // simply project-then-flush whenever the audience is not `Off`.
         if !matches!(tel_config.audience, TelemetryAudience::Off) {
             let projected = snapshot.project_for_audience(tel_config.audience);
             let (active_backends, _) = backends::create_backends(&tel_config.backends);
