@@ -1231,3 +1231,83 @@ fn test_duplication_sarif_output_consumer() {
         "SARIF output must contain duplication results"
     );
 }
+
+// --- Binary-spawning tests for main() dispatch coverage ---
+//
+// `cargo llvm-cov` propagates `LLVM_PROFILE_FILE` to subprocesses, so a
+// `Command::new(env!("CARGO_BIN_EXE_chaffra"))` spawn in a test reaches the
+// `tokio::main` body and the per-command match arms with the same
+// instrumentation as the rest of the test binary. This is how the
+// trust-boundary changed-line gate gets coverage for the `cmd_telemetry_status`
+// Err-exit branch — the branch only runs from the binary entry point and
+// cannot be hit from a unit test that calls the function directly (the
+// `std::process::exit(1)` would tear down the test process).
+
+#[test]
+fn test_chaffra_telemetry_status_exits_nonzero_on_bad_config() {
+    // F7: invalid telemetry config must produce a nonzero exit from
+    // `chaffra telemetry status`, matching the behaviour of
+    // `chaffra telemetry test` / `inspect`. The Err arm in
+    // `cmd_telemetry_status` calls `std::process::exit(1)` after printing
+    // to stderr; spawn the binary to cover that branch.
+    use std::process::Command;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let bad = dir.path().join("bad.toml");
+    std::fs::write(
+        &bad,
+        "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"everyone\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chaffra"))
+        .args(["--config", bad.to_str().unwrap(), "telemetry", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn chaffra binary");
+
+    assert!(
+        !output.status.success(),
+        "chaffra telemetry status must exit nonzero on invalid telemetry config; \
+         status: {:?}, stdout: {}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid [modules.telemetry] configuration") || stderr.contains("Error:"),
+        "expected typed config error on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_chaffra_telemetry_status_succeeds_with_default_config() {
+    // Companion positive test: a clean tempdir with no `.chaffra.toml` and
+    // no `--config` flag must produce a successful `telemetry status` run
+    // (Ok branch of `cmd_telemetry_status`). Pairs with the Err-exit test
+    // above so both arms of the wrapper are reached by spawned-binary
+    // coverage.
+    use std::process::Command;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_chaffra"))
+        .args(["telemetry", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn chaffra binary");
+
+    assert!(
+        output.status.success(),
+        "chaffra telemetry status must succeed with default config; \
+         status: {:?}, stdout: {}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Telemetry mode:"),
+        "expected status report on stdout, got: {stdout}"
+    );
+}
