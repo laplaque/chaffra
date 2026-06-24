@@ -92,39 +92,61 @@ pub mod metric_names {
         OPERATOR.contains(&name)
     }
 
-    /// Whether a metric NAME is an explicitly classified user-facing metric
-    /// by EXACT membership in [`KNOWN_USER`].
+    /// Whether a metric NAME classifies as user-facing: EXACT membership in
+    /// [`KNOWN_USER`], OR the runtime per-module summary shape
+    /// `chaffra.module.<id>.<key>` produced by
+    /// `record_module_summary_metric` (e.g. `chaffra.module.complexity.health_score`).
     ///
-    /// Runtime per-module summary points of the shape
-    /// `chaffra.module.<id>.<key>` (`record_module_summary_metric`) are user
-    /// facing too, but their classification is NOT done by name shape here.
-    /// A previous revision admitted every name matching that shape, which
-    /// reopened the fail-open boundary at the gRPC ingestion seam: an
-    /// external plugin could `record_metrics` a `MetricDataPoint` named
-    /// `chaffra.module.<their-id>.<anything>` and have it cross `user-only`
-    /// untouched solely because of the pattern.
+    /// NAME alone is not a trust decision. This predicate answers "does this
+    /// name denote a user-facing metric *when produced by a trusted
+    /// in-process producer*". The provenance check is separate and lives in
+    /// the projection: [`crate::collector::TelemetrySnapshot::project_for_audience`]
+    /// forces every data point whose name arrived on the UNTRUSTED gRPC
+    /// ingestion path (tracked in `TelemetrySnapshot::untrusted_runtime`) to
+    /// the unclassified branch — admitted only under `On` — REGARDLESS of
+    /// what this predicate says about its name. So an external plugin
+    /// spoofing either a `chaffra.module.<id>.<key>` shape OR an exact
+    /// [`KNOWN_USER`] name (e.g. `chaffra.analysis.findings_total`) still
+    /// fails closed under `user-only` and `operator-only`. That is why the
+    /// shape match is safe to keep here: trusted producers pass by name, and
+    /// the untrusted seam is closed by provenance, not by withholding the
+    /// shape.
     ///
-    /// The trusted-producer registry replaces the pattern: the collector
-    /// records the names it emits via `record_module_summary_metric` into a
-    /// runtime allowlist (`TelemetrySnapshot::known_user_runtime`), and
-    /// [`crate::collector::TelemetrySnapshot::project_for_audience`] admits
-    /// a runtime point to the user scope only when its name is either in
-    /// [`KNOWN_USER`] or in that snapshot-scoped trusted set. Spoofed names
-    /// arriving on the gRPC `record_metrics` path are not in the trusted
-    /// set and therefore fail closed under `user-only`.
+    /// TODO(#45): the provenance set is the bounded mitigation pending the
+    /// proto-wire change that adds an `audience` field to `MetricDefinition`
+    /// and derives scope server-side at gRPC ingestion from a trusted
+    /// `(module_id, name)` registry. Until then a name shared by a trusted
+    /// producer and an adversarial plugin in the same run fails closed (the
+    /// safe direction): the projection cannot tell the two points apart by
+    /// name, so it drops both at any restricted boundary.
     ///
-    /// This function intentionally does NOT consult that runtime set
-    /// (it has no access to a collector); call sites that need the full
-    /// classification go through the snapshot. The completeness guard on
-    /// registered DEFINITIONS still uses this function — and that is correct:
-    /// definitions must be classified explicitly by listing in [`OPERATOR`]
-    /// or [`KNOWN_USER`], the runtime allowlist is data-point-only.
+    /// The completeness guard on registered DEFINITIONS deliberately does NOT
+    /// pattern-admit (see `metric_is_classified` in `crate::collector`): a
+    /// registered operator definition of the per-module shape must still be
+    /// listed in [`OPERATOR`] explicitly.
     #[must_use]
     pub fn is_known_user(name: &str) -> bool {
         if is_operator(name) {
             return false;
         }
-        KNOWN_USER.contains(&name)
+        if KNOWN_USER.contains(&name) {
+            return true;
+        }
+        is_per_module_summary_shape(name)
+    }
+
+    /// Match the runtime per-module summary shape `chaffra.module.<id>.<key>`:
+    /// the prefix `chaffra.module.` followed by at least two non-empty
+    /// dot-separated segments (id + key, or id + compound key). Used only by
+    /// [`is_known_user`]; the `is_operator` short-circuit at the top of that
+    /// function still wins for any operator name that happens to match the
+    /// shape (e.g. `chaffra.module.error_total`).
+    fn is_per_module_summary_shape(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix("chaffra.module.") else {
+            return false;
+        };
+        let segments: Vec<&str> = rest.split('.').collect();
+        segments.len() >= 2 && segments.iter().all(|s| !s.is_empty())
     }
 
     #[cfg(test)]
@@ -146,20 +168,20 @@ pub mod metric_names {
         }
 
         #[test]
-        fn is_known_user_rejects_per_module_summary_shape_by_name_alone() {
-            // Critical fail-closed invariant: the name-only classifier must
-            // NOT admit per-module summary shapes. The pattern admission a
-            // previous revision used reopened the user-only boundary for
-            // every plugin-emitted `chaffra.module.<id>.<key>` data point on
-            // the gRPC ingestion path. Runtime classification for these
-            // names lives on `TelemetrySnapshot::known_user_runtime` (a
-            // trusted-producer allowlist populated by
-            // `record_module_summary_metric`), exercised end-to-end by the
-            // collector tests; `is_known_user` is intentionally pattern-blind.
-            assert!(!is_known_user("chaffra.module.complexity.health_score"));
-            assert!(!is_known_user("chaffra.module.dead-code.unused_functions"));
-            assert!(!is_known_user("chaffra.module.foo.bar.baz"));
-            assert!(!is_known_user("chaffra.module.plugin.cache_size_bytes"));
+        fn is_known_user_matches_per_module_summary_shape_by_name() {
+            // NAME-level classification admits the per-module summary shape:
+            // a trusted in-process producer's `chaffra.module.<id>.<key>`
+            // point is user-facing. This is NOT a trust decision — provenance
+            // is enforced separately in `project_for_audience`, which forces
+            // any name arriving on the UNTRUSTED gRPC ingress
+            // (`untrusted_runtime`) to the unclassified branch regardless of
+            // what this predicate returns. See the collector projection tests
+            // (`test_projection_user_only_drops_plugin_spoofed_*`) for the
+            // end-to-end provenance behaviour.
+            assert!(is_known_user("chaffra.module.complexity.health_score"));
+            assert!(is_known_user("chaffra.module.dead-code.unused_functions"));
+            // Compound key (id + multi-segment key) still admits by name.
+            assert!(is_known_user("chaffra.module.foo.bar.baz"));
         }
 
         #[test]
@@ -170,13 +192,13 @@ pub mod metric_names {
         }
 
         #[test]
-        fn is_known_user_rejects_unclassified_runtime_metric() {
-            // A runtime metric name that is not in KNOWN_USER and not in
-            // OPERATOR must be unclassified so the projection fails closed
-            // under user-only.
+        fn is_known_user_rejects_malformed_and_unclassified_names() {
+            // A runtime metric name that is not in KNOWN_USER, not OPERATOR,
+            // and not a well-formed per-module shape is unclassified so the
+            // projection fails closed under user-only.
             assert!(!is_known_user("chaffra.future.unregistered_metric"));
-            assert!(!is_known_user("chaffra.module."));
-            assert!(!is_known_user("chaffra.module.only_id"));
+            assert!(!is_known_user("chaffra.module.")); // no segments
+            assert!(!is_known_user("chaffra.module.only_id")); // id but no key
             assert!(!is_known_user("custom.user.metric"));
         }
 

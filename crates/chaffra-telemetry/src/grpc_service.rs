@@ -60,7 +60,14 @@ impl telemetry_collector_server::TelemetryCollector for TelemetryGrpcService {
         let req = request.into_inner();
         let points: Vec<_> = req.data_points.iter().map(data_point_from_proto).collect();
         let count = points.len() as u64;
-        self.collector.record_data_points(points);
+        // External module submissions are UNTRUSTED: route them through the
+        // provenance-tracking ingress so the snapshot projection fails them
+        // closed at every restricted audience boundary. A plugin must not be
+        // able to cross `user-only` / `operator-only` by naming its metric
+        // after a trusted user-facing or operator metric.
+        // TODO(#45): derive audience server-side here from a trusted
+        // `(module_id, name)` registry instead of name-level provenance.
+        self.collector.record_untrusted_data_points(points);
         Ok(tonic::Response::new(
             chaffra_proto::proto::RecordMetricsResponse { accepted: count },
         ))

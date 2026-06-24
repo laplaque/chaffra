@@ -410,11 +410,17 @@ threshold = "10"
         let _ = std::fs::remove_dir_all(&dir);
 
         let err = result.expect_err("symlink loop must fail closed (not default)");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("failed to probe"),
-            "expected typed probe error, got: {msg}"
-        );
+        // Assert the TYPED variant, not just the message substring: the CLI
+        // strict loader and callers pattern-match on `ChaffraError::Config`,
+        // so a future refactor that returned a different variant with a
+        // similar message must fail this test.
+        match err {
+            ChaffraError::Config(msg) => assert!(
+                msg.contains("failed to probe"),
+                "expected probe-error message, got: {msg}"
+            ),
+            other => panic!("expected ChaffraError::Config, got {other:?}"),
+        }
     }
 
     #[test]

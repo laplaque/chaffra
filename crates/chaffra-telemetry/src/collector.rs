@@ -47,23 +47,29 @@ pub struct TelemetrySnapshot {
     pub user_summary: UserSummary,
     /// Operator summary (call latencies, error rates).
     pub operator_summary: OperatorSummary,
-    /// Trusted-producer allowlist of user-facing runtime data-point names
-    /// emitted via [`TelemetryCollector::record_module_summary_metric`]. A
-    /// runtime data point named `chaffra.module.<id>.<key>` is admitted to
-    /// the user scope by [`Self::project_for_audience`] only when its name
-    /// is in this set (or in [`metric_names::KNOWN_USER`]).
+    /// Names of data points that arrived on the UNTRUSTED external ingestion
+    /// path (the gRPC `record_metrics` handler, via
+    /// [`TelemetryCollector::record_untrusted_data_points`]). The projection
+    /// in [`Self::project_for_audience`] forces every point whose name is in
+    /// this set to the unclassified branch — admitted only under
+    /// [`TelemetryAudience::On`] — REGARDLESS of how its name classifies via
+    /// [`metric_names::is_operator`] / [`metric_names::is_known_user`]. That
+    /// is what closes the privacy boundary: an external plugin cannot cross
+    /// `user-only` (or `operator-only`) by spoofing a trusted metric name,
+    /// whether a `chaffra.module.<id>.<key>` shape or an exact `KNOWN_USER`
+    /// name like `chaffra.analysis.findings_total`.
     ///
-    /// External plugins emitting `MetricDataPoint`s via the gRPC
-    /// `record_metrics` path land in [`Self::data_points`] but NOT in this
-    /// allowlist, so their names — even if shaped like a per-module summary
-    /// — cannot cross the user-only boundary.
+    /// Provenance, not name, is the trust signal — this is the bounded form
+    /// of the gRPC-ingress audience derivation tracked by issue #45.
     ///
-    /// `#[serde(default)]` keeps deserialization of older snapshot payloads
-    /// (which lacked this field) working; an empty allowlist behaves as
-    /// fail-closed for unrecognised runtime names, which is the intended
-    /// upgrade semantics.
-    #[serde(default)]
-    pub known_user_runtime: HashSet<String>,
+    /// `#[serde(skip)]`: this set is internal projection metadata, never part
+    /// of the on-disk snapshot wire contract. It is consumed during
+    /// projection and must never be serialized — emitting it would itself
+    /// disclose which external module names were seen. On deserialization it
+    /// defaults to empty (no untrusted names known for a reloaded snapshot),
+    /// which is the safe direction: a reloaded snapshot is already projected.
+    #[serde(skip)]
+    pub untrusted_runtime: HashSet<String>,
 }
 
 /// User-facing telemetry summary included in analysis output.
@@ -164,16 +170,28 @@ impl TelemetrySnapshot {
         // Under `operator-only` it is dropped for symmetry — operator-only is
         // a SPECIFIC scope, not a catch-all. Under `Off` it is dropped along
         // with everything else.
-        // User-runtime allowlist: a runtime data point name is user-facing
-        // only if it is in `KNOWN_USER` or in the trusted-producer allowlist
-        // that `record_module_summary_metric` populates. Capturing the
-        // borrow up-front keeps the closure independent of `self` so the
-        // by-value `into_iter` moves below stay valid.
-        let known_user_runtime = &self.known_user_runtime;
+        //
+        // PROVENANCE OVERRIDES NAME. A data point whose name arrived on the
+        // untrusted external gRPC ingress (`untrusted_runtime`) is forced to
+        // the unclassified branch REGARDLESS of how its name classifies. An
+        // external plugin therefore cannot cross `user-only` (or
+        // `operator-only`) by spoofing a trusted metric name — neither a
+        // `chaffra.module.<id>.<key>` shape nor an exact `KNOWN_USER` name
+        // like `chaffra.analysis.findings_total`. Name-based classification
+        // (`is_operator` / `is_known_user`) is consulted ONLY for points from
+        // trusted in-process producers. If a name is emitted by BOTH a
+        // trusted producer and an adversarial plugin in the same run, it is
+        // in `untrusted_runtime` and both points fail closed — the safe
+        // direction, since the projection cannot tell the two apart by name
+        // (the per-point source tagging that would is issue #45).
+        let untrusted = &self.untrusted_runtime;
         let admit = |name: &str| -> bool {
-            if metric_names::is_operator(name) {
+            if untrusted.contains(name) {
+                // Untrusted provenance: unclassified, admit only under `On`.
+                keep_user && keep_operator
+            } else if metric_names::is_operator(name) {
                 keep_operator
-            } else if metric_names::is_known_user(name) || known_user_runtime.contains(name) {
+            } else if metric_names::is_known_user(name) {
                 keep_user
             } else {
                 // Unclassified: require BOTH scopes (i.e. `On`).
@@ -261,11 +279,11 @@ impl TelemetrySnapshot {
             } else {
                 OperatorSummary::default()
             },
-            // Preserve the trusted-producer allowlist across projection. The
-            // set is metadata about which names the trusted internal path
-            // emitted; it does not contain any per-audience payload itself
-            // and re-projecting the same snapshot must classify identically.
-            known_user_runtime: self.known_user_runtime,
+            // Preserve the untrusted-provenance set across projection so that
+            // re-projecting an already-projected snapshot classifies
+            // identically. It is `#[serde(skip)]`, so it never reaches any
+            // serialized output regardless.
+            untrusted_runtime: self.untrusted_runtime,
         }
     }
 }
@@ -292,12 +310,13 @@ struct CollectorInner {
     files_total: u64,
     analysis_start_ms: u64,
     finding_fingerprints: HashSet<crate::churn::FindingFingerprint>,
-    /// Names of runtime data points the trusted internal path emitted via
-    /// `record_module_summary_metric`. The collector hands this set to
-    /// `TelemetrySnapshot::known_user_runtime` at snapshot time so the
-    /// projection's user-runtime classifier can fail closed for any name
-    /// arriving on the external ingestion path.
-    known_user_runtime: HashSet<String>,
+    /// Names of data points received on the UNTRUSTED external gRPC ingress
+    /// (`record_untrusted_data_points`). Handed to
+    /// `TelemetrySnapshot::untrusted_runtime` at snapshot time so the
+    /// projection forces these names to fail closed at every restricted
+    /// audience boundary regardless of how the name classifies. Empty for a
+    /// run with no external module metric submissions (the common case).
+    untrusted_runtime: HashSet<String>,
 }
 
 fn now_ms() -> u64 {
@@ -348,9 +367,37 @@ impl TelemetryCollector {
         inner.data_points.push(point);
     }
 
-    /// Record multiple metric data points.
+    /// Record multiple metric data points from a TRUSTED in-process producer
+    /// (the parse-cache flush, churn metrics, the CLI telemetry-test point).
+    /// Names recorded here are classified by `metric_names` at projection.
+    /// External/plugin submissions must NOT use this method — see
+    /// [`Self::record_untrusted_data_points`].
     pub fn record_data_points(&self, points: Vec<MetricDataPoint>) {
         let mut inner = self.inner.lock().unwrap();
+        inner.data_points.extend(points);
+    }
+
+    /// Record data points received on the UNTRUSTED external ingestion path
+    /// (the gRPC `record_metrics` handler — external module containers).
+    ///
+    /// Each point's name is recorded in `untrusted_runtime` so the snapshot
+    /// projection forces it to fail closed at every restricted audience
+    /// boundary: an external module cannot cross `user-only` or
+    /// `operator-only` by naming its metric after a trusted user-facing or
+    /// operator metric. The points still land in `data_points` (so they are
+    /// emitted under `On`, the unrestricted audience) — provenance gates the
+    /// RESTRICTED boundaries, not collection itself.
+    ///
+    /// TODO(#45): the per-name `untrusted_runtime` set is the bounded
+    /// mitigation. The durable fix derives audience server-side from a
+    /// trusted `(module_id, name)` registry at this ingress (an `audience`
+    /// field on `MetricDefinition`), which also resolves the name-collision
+    /// case where a trusted producer and a plugin share a metric name.
+    pub fn record_untrusted_data_points(&self, points: Vec<MetricDataPoint>) {
+        let mut inner = self.inner.lock().unwrap();
+        for p in &points {
+            inner.untrusted_runtime.insert(p.name.clone());
+        }
         inner.data_points.extend(points);
     }
 
@@ -457,31 +504,25 @@ impl TelemetryCollector {
 
     /// Record a per-module summary metric (e.g. health_score, clone_count).
     ///
-    /// This is the trusted internal producer for the runtime
-    /// `chaffra.module.<id>.<key>` user-facing data points. Beyond pushing
-    /// the data point itself, the name is added to the collector's
-    /// trusted-producer allowlist (`known_user_runtime`) so the snapshot
-    /// projection can distinguish it from an identically-shaped name
-    /// arriving on the gRPC `record_metrics` ingestion path (which lands
-    /// in `data_points` without touching this allowlist and therefore
-    /// fails closed under `user-only`).
+    /// This is a TRUSTED in-process producer: built-in modules run in-process
+    /// and call this directly. The emitted `chaffra.module.<id>.<key>` name
+    /// classifies as user-facing by shape in `metric_names::is_known_user`,
+    /// so it survives `user-only`. Provenance is implicit — the name is NOT
+    /// added to `untrusted_runtime`, so the projection trusts its name
+    /// classification. (An external plugin emitting the identical shape goes
+    /// through `record_untrusted_data_points` and fails closed.)
     pub fn record_module_summary_metric(&self, module_id: &str, key: &str, value: f64) {
-        let name = format!("chaffra.module.{module_id}.{key}");
         let ts = now_ms();
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.known_user_runtime.insert(name.clone());
-            inner.data_points.push(MetricDataPoint {
-                name,
-                value,
-                labels: {
-                    let mut m = HashMap::new();
-                    m.insert("module".to_owned(), module_id.to_owned());
-                    m
-                },
-                timestamp_ms: ts,
-            });
-        }
+        self.record_data_point(MetricDataPoint {
+            name: format!("chaffra.module.{module_id}.{key}"),
+            value,
+            labels: {
+                let mut m = HashMap::new();
+                m.insert("module".to_owned(), module_id.to_owned());
+                m
+            },
+            timestamp_ms: ts,
+        });
     }
 
     /// Take a snapshot of all collected telemetry.
@@ -495,10 +536,21 @@ impl TelemetryCollector {
         for (module_id, &duration) in &inner.module_durations {
             let finding_count = inner.module_findings.get(module_id).copied().unwrap_or(0);
 
-            // Collect module-specific metrics from data points.
+            // Collect module-specific metrics from data points. Points whose
+            // name arrived on the untrusted external ingress are skipped:
+            // `user_summary` is a user-facing field, so an external plugin
+            // must not be able to inject a `chaffra.module.<id>.<key>` value
+            // here (it would otherwise bypass the projection's data_points
+            // provenance gate, which filters the top-level list but not this
+            // derived map). Trusted in-process producers
+            // (`record_module_summary_metric`) are not in `untrusted_runtime`
+            // and pass through.
             let prefix = format!("chaffra.module.{module_id}.");
             let mut metrics = HashMap::new();
             for dp in &inner.data_points {
+                if inner.untrusted_runtime.contains(&dp.name) {
+                    continue;
+                }
                 if let Some(key) = dp.name.strip_prefix(&prefix) {
                     metrics.insert(key.to_owned(), dp.value);
                 }
@@ -530,7 +582,7 @@ impl TelemetryCollector {
                 module_call_durations: inner.module_durations.clone(),
                 module_error_counts: inner.module_errors.clone(),
             },
-            known_user_runtime: inner.known_user_runtime.clone(),
+            untrusted_runtime: inner.untrusted_runtime.clone(),
         }
     }
 
@@ -1285,12 +1337,10 @@ mod tests {
     /// fail-closed projection). Pattern matching is intentionally omitted at
     /// the DEFINITIONS layer: a `chaffra.module.<x>.<y>`-shaped operator
     /// metric must be classified by adding it to `metric_names::OPERATOR`,
-    /// not by passing through a permissive pattern. Per-module summary RUNTIME
-    /// data points are admitted through a separate, snapshot-scoped allowlist
-    /// (`TelemetrySnapshot::known_user_runtime`) that the trusted internal
-    /// producer (`record_module_summary_metric`) populates; that allowlist
-    /// is intentionally NOT consulted here because a registered DEFINITION
-    /// has to be classified explicitly regardless of any runtime emission.
+    /// not by passing through the per-module shape match. Per-module summary
+    /// RUNTIME data points are admitted by shape in `is_known_user` (and
+    /// gated by provenance in the projection), but they are never registered
+    /// as DEFINITIONS, so this completeness guard does not see them.
     fn metric_is_classified(name: &str) -> bool {
         metric_names::is_operator(name) || metric_names::KNOWN_USER.contains(&name)
     }
@@ -1512,12 +1562,10 @@ mod tests {
     #[test]
     fn test_projection_user_only_admits_per_module_summary_runtime_metric() {
         // Per-module summary RUNTIME data points (`chaffra.module.<id>.<key>`)
-        // are produced by `record_module_summary_metric` and are admitted by
-        // the trusted-producer allowlist (`TelemetrySnapshot::known_user_runtime`)
+        // are produced by the TRUSTED in-process `record_module_summary_metric`
         // — they carry user-facing analysis output (health_score, clone_count,
-        // etc.). An operator metric of the same shape would have been
-        // classified as OPERATOR by exact match earlier and never reach the
-        // runtime classifier.
+        // etc.) and classify as user-facing by shape in `is_known_user`. They
+        // are NOT in `untrusted_runtime`, so the projection trusts the name.
         let collector = TelemetryCollector::with_defaults();
         collector.record_module_summary_metric("complexity", "health_score", 88.0);
         let snap = collector
@@ -1532,71 +1580,136 @@ mod tests {
     }
 
     #[test]
-    fn test_projection_user_only_drops_plugin_spoofed_per_module_runtime_metric() {
-        // R2 fail-closed invariant: the runtime user classifier MUST distinguish
-        // a per-module summary point produced by the trusted internal path
-        // (`record_module_summary_metric`) from an identically-shaped point
-        // arriving via the external ingestion path (`record_data_point` /
-        // `record_data_points`, which is what the gRPC `record_metrics`
-        // handler funnels external module input through). A previous revision
-        // used a pure-shape match (`chaffra.module.<id>.<key>` admitted as
-        // user-facing) and a plugin could trivially spoof a name to cross
-        // the user-only boundary unchallenged.
+    fn test_projection_provenance_overrides_name_for_spoofed_metrics() {
+        // R3 fail-closed invariant: PROVENANCE overrides NAME. A point that
+        // arrives on the untrusted external gRPC ingress
+        // (`record_untrusted_data_points`, what the `record_metrics` handler
+        // calls) must fail closed at every restricted boundary REGARDLESS of
+        // how its name classifies — whether it spoofs a per-module summary
+        // shape OR an exact `KNOWN_USER` name. Trusted in-process producers
+        // pass by name.
         //
-        // After R2: only names the collector itself emitted via the trusted
-        // path appear in `TelemetrySnapshot::known_user_runtime`; an external
-        // point with the same shape is NOT in that set and the projection
-        // drops it under user-only. We exercise both halves in the same
-        // snapshot to prove the discriminator is producer-source, not name.
-        //
-        // The assertions are cross-checked against all four audiences so a
-        // future regression that admits the spoofed name on ANY audience
-        // boundary fails this test:
-        // - On            → both admitted (unrestricted)
-        // - UserOnly      → only trusted admitted (privacy boundary)
-        // - OperatorOnly  → both dropped (UNCLASSIFIED at the user split,
-        //                   user scope off)
-        // - Off           → both dropped
+        // Cross-checked against all four audiences:
+        // - On            → everything admitted (unrestricted)
+        // - UserOnly      → only the trusted point (privacy boundary)
+        // - OperatorOnly  → nothing user-facing (trusted user point dropped,
+        //                   untrusted forced unclassified → user scope off)
+        // - Off           → nothing
         let make_snapshot = || {
             let collector = TelemetryCollector::with_defaults();
-            // Trusted: emitted via the internal producer.
+            // Trusted: emitted via the in-process producer.
             collector.record_module_summary_metric("complexity", "health_score", 88.0);
-            // Spoofed: same shape, but pushed as if from a plugin's gRPC
-            // `record_metrics` call (the production path lands here).
-            collector.record_data_point(MetricDataPoint {
-                name: "chaffra.module.plugin.cache_size_bytes".to_owned(),
-                value: 1024.0,
-                labels: HashMap::new(),
-                timestamp_ms: 0,
-            });
+            // Untrusted spoofs via the external gRPC ingress. Both a
+            // per-module shape AND an exact KNOWN_USER name — the R2 fix only
+            // closed the former; provenance closes both.
+            collector.record_untrusted_data_points(vec![
+                MetricDataPoint {
+                    name: "chaffra.module.plugin.cache_size_bytes".to_owned(),
+                    value: 1024.0,
+                    labels: HashMap::new(),
+                    timestamp_ms: 0,
+                },
+                MetricDataPoint {
+                    // Exact KNOWN_USER name — the explicit-set spoof.
+                    name: "chaffra.analysis.findings_total".to_owned(),
+                    value: 999.0,
+                    labels: HashMap::new(),
+                    timestamp_ms: 0,
+                },
+            ]);
             collector.snapshot()
         };
 
         let trusted = "chaffra.module.complexity.health_score";
-        let spoofed = "chaffra.module.plugin.cache_size_bytes";
+        let spoofed_shape = "chaffra.module.plugin.cache_size_bytes";
+        let spoofed_known = "chaffra.analysis.findings_total";
 
+        // (audience, trusted, spoofed_shape, spoofed_known)
         let cases = [
-            (TelemetryAudience::On, true, true),
-            (TelemetryAudience::UserOnly, true, false),
-            (TelemetryAudience::OperatorOnly, false, false),
-            (TelemetryAudience::Off, false, false),
+            (TelemetryAudience::On, true, true, true),
+            (TelemetryAudience::UserOnly, true, false, false),
+            (TelemetryAudience::OperatorOnly, false, false, false),
+            (TelemetryAudience::Off, false, false, false),
         ];
-        for (audience, expect_trusted, expect_spoofed) in cases {
+        for (audience, want_trusted, want_shape, want_known) in cases {
             let snap = make_snapshot().project_for_audience(audience);
-            let has_trusted = snap.data_points.iter().any(|p| p.name == trusted);
-            let has_spoofed = snap.data_points.iter().any(|p| p.name == spoofed);
+            let has = |n: &str| snap.data_points.iter().any(|p| p.name == n);
             assert_eq!(
-                has_trusted, expect_trusted,
-                "{audience:?}: trusted per-module summary metric \
-                 should be admitted={expect_trusted}, was {has_trusted}"
+                has(trusted),
+                want_trusted,
+                "{audience:?}: trusted per-module metric admit mismatch"
             );
             assert_eq!(
-                has_spoofed, expect_spoofed,
-                "{audience:?}: spoofed per-module-shaped runtime metric \
-                 should be admitted={expect_spoofed}, was {has_spoofed} \
-                 (a true means fail-open via name-shape pattern)"
+                has(spoofed_shape),
+                want_shape,
+                "{audience:?}: untrusted per-module-shaped spoof admit mismatch \
+                 (true at a restricted boundary = fail-open)"
+            );
+            assert_eq!(
+                has(spoofed_known),
+                want_known,
+                "{audience:?}: untrusted exact-KNOWN_USER-name spoof admit mismatch \
+                 (true under user-only = the R2 residual fail-open)"
             );
         }
+    }
+
+    #[test]
+    fn test_user_summary_metrics_map_excludes_untrusted_spoof() {
+        // The user_summary.module_summaries[*].metrics map is built by
+        // prefix-matching data point names — a parallel path to the top-level
+        // data_points list. An untrusted plugin spoofing
+        // `chaffra.module.complexity.<key>` must NOT inject a value into the
+        // user-facing metrics map for the `complexity` module, even though a
+        // (trusted) `record_module_call("complexity", ...)` gave that module a
+        // module_summaries entry.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_call("complexity", 5, false);
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        collector.record_untrusted_data_points(vec![MetricDataPoint {
+            name: "chaffra.module.complexity.spoofed_field".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 0,
+        }]);
+
+        let snap = collector.snapshot();
+        let metrics = &snap.user_summary.module_summaries["complexity"].metrics;
+        assert_eq!(
+            metrics.get("health_score"),
+            Some(&88.0),
+            "trusted per-module metric missing from user summary"
+        );
+        assert!(
+            !metrics.contains_key("spoofed_field"),
+            "untrusted spoof leaked into user_summary.module_summaries metrics map"
+        );
+    }
+
+    #[test]
+    fn test_untrusted_runtime_is_never_serialized() {
+        // `untrusted_runtime` is `#[serde(skip)]` — it is internal projection
+        // metadata (which external names were seen) and must never appear in
+        // the on-disk snapshot, under any audience.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_untrusted_data_points(vec![MetricDataPoint {
+            name: "chaffra.module.plugin.secret_name".to_owned(),
+            value: 1.0,
+            labels: HashMap::new(),
+            timestamp_ms: 0,
+        }]);
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::OperatorOnly);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("untrusted_runtime"),
+            "untrusted_runtime field leaked into serialized snapshot"
+        );
+        assert!(
+            !json.contains("secret_name"),
+            "untrusted external metric name leaked into serialized snapshot"
+        );
     }
 
     #[test]

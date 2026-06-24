@@ -102,9 +102,11 @@ narrower explicit `--telemetry user-only`. An unrecognised audience value (CLI
 or file) is rejected with an actionable error — it is never coerced to a default
 that would widen emission.
 
-Scope classification (the single source of truth is
-`chaffra_telemetry::metrics::metric_names`; producers and the projector share
-those constants so naming cannot drift):
+Scope classification has two inputs: the metric NAME and the data point's
+PROVENANCE.
+
+Name classification is driven by `chaffra_telemetry::metrics::metric_names`;
+producers and the projector share those constants so naming cannot drift:
 
 - **Operator-only data points and definitions**, matched by EXACT metric name
   (not prefix, so a per-module summary `chaffra.module.<id>.<key>` cannot
@@ -116,9 +118,32 @@ those constants so naming cannot drift):
   `cache_hit_rate` / `cache_size_bytes` / `cache_evictions`. Operator metric
   *definitions* are stripped under `user-only` too — the catalogue itself
   discloses which operator metrics exist.
+- **User-facing data points**, matched by exact membership in `KNOWN_USER`
+  (`chaffra.analysis.*`, `chaffra.findings.*`) OR the per-module summary shape
+  `chaffra.module.<id>.<key>` emitted by the in-process
+  `record_module_summary_metric` (health scores, clone counts).
+- **Unclassified names** are admitted only under `on` (both scopes) and fail
+  closed under `user-only` and `operator-only`.
 - **Spans** are module execution traces (timing/correlation) and are
   operator-scoped in full: they are stripped under `user-only` and retained
   only when the operator scope is enabled.
+
+Provenance overrides name. Built-in modules run in-process and record metrics
+through trusted collector methods, so their names are classified as above.
+External modules submit metrics over gRPC (`record_metrics`), which routes
+through `record_untrusted_data_points`; every name seen there is recorded in
+the snapshot's `untrusted_runtime` set (an internal, never-serialized field —
+`#[serde(skip)]`). The projection forces any data point whose name is in that
+set to the unclassified branch REGARDLESS of how the name classifies, so an
+external plugin cannot cross `user-only` or `operator-only` by spoofing a
+trusted user-facing or operator metric name (whether a `chaffra.module.*` shape
+or an exact `KNOWN_USER` name). This name-level provenance is the bounded
+mitigation pending issue #45, which adds an `audience` field to
+`MetricDefinition` and derives scope server-side from a trusted
+`(module_id, name)` registry at gRPC ingestion. The same provenance gate is
+applied when building the user-facing `user_summary.module_summaries[*].metrics`
+map, so a spoofed `chaffra.module.<id>.<key>` cannot leak through that derived
+field either.
 
 Projection is applied at every emission boundary — the telemetry-module backend
 flush and the CLI `run_with_telemetry` success and failure flush paths, both of
