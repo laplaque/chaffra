@@ -78,6 +78,16 @@ pub struct UserSummary {
 }
 
 /// Per-module summary for user-facing output.
+///
+/// Privacy note: the `register_core_metrics` completeness test
+/// (`test_every_core_metric_is_classified`) guards only the set of registered
+/// metric NAMES — it asserts every name lands in either `metric_names::OPERATOR`
+/// or `KNOWN_USER_METRICS`. It does NOT guard additions of new FIELDS to this
+/// struct: a new field has no metric name to classify, so it bypasses the test
+/// entirely. Whenever a field is added here, audit `project_for_audience`
+/// explicitly to decide whether the field is user-facing (kept as-is under
+/// user-only), operator-derived (must be scrubbed under user-only, like
+/// `duration_ms`), or operator-only (drop the whole entry).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModuleSummary {
     /// Duration of this module's analysis in ms.
@@ -177,18 +187,33 @@ impl TelemetrySnapshot {
         // `chaffra.module.call_duration_ms`, an OPERATOR metric). So when the
         // operator scope is off, that timing must be scrubbed out of the retained
         // user summary too — otherwise it leaks via `user_summary` even though
-        // `operator_summary` was dropped. `finding_count`, `metrics`
-        // (health_score/clone_count — user-facing analysis results), and the
-        // top-level `analysis_duration_ms` (the user headline) are NOT
-        // operator-derived and are kept. If `ModuleSummary` ever grows another
-        // operator-derived field, the `register_core_metrics` completeness test
-        // in this module forces it to be classified, surfacing the omission.
+        // `operator_summary` was dropped.
+        //
+        // The set of `module_summaries` KEYS is itself operator-scope information:
+        // the keys disclose which modules were composed into the pipeline. A
+        // module that ran but produced no findings AND no per-module metrics has
+        // no user-facing payload — its only contribution to the user summary was
+        // the duration we just scrubbed. Keeping such an entry as
+        // `{duration_ms: 0, finding_count: 0, metrics: {}}` would still leak the
+        // executed-module name. So under user-only we drop those payload-empty
+        // entries entirely; entries with findings (user-facing analysis result)
+        // or per-module metrics (user-facing analysis output like `health_score`)
+        // are kept because those carry signal the user is owed.
+        //
+        // `finding_count`, `metrics` (health_score/clone_count — user-facing
+        // analysis results), and the top-level `analysis_duration_ms` (the user
+        // headline) are NOT operator-derived and are kept. The
+        // `register_core_metrics` completeness test does NOT guard
+        // operator-derived FIELDS on this struct (only metric NAMES); a new
+        // operator-derived field requires updating this projection by hand —
+        // see the privacy note on `ModuleSummary`.
         let user_summary = if keep_user {
             let mut summary = self.user_summary;
             if !keep_operator {
-                for module in summary.module_summaries.values_mut() {
+                summary.module_summaries.retain(|_, module| {
                     module.duration_ms = 0;
-                }
+                    module.finding_count != 0 || !module.metrics.is_empty()
+                });
             }
             summary
         } else {
@@ -1072,6 +1097,81 @@ mod tests {
     }
 
     #[test]
+    fn test_projection_user_only_prunes_payload_empty_module_entries() {
+        // 1B: `module_summaries` KEYS disclose the executed-module set — that's
+        // operator-scope pipeline composition information. After the timing
+        // scrub, an entry like `{duration_ms: 0, finding_count: 0, metrics: {}}`
+        // still leaks the module name. Under user-only, drop entries that have
+        // no user-facing signal (no findings AND no metrics); keep entries that
+        // do (findings or per-module metrics).
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        // `security` ran but produced ZERO findings and no per-module metrics.
+        collector.record_module_call("security", 12, false);
+        // `complexity` ran and emitted a user-facing per-module metric, but no findings.
+        collector.record_module_call("complexity", 17, false);
+        collector.record_module_summary_metric("complexity", "health_score", 92.0);
+        // `dead-code` ran and produced a finding.
+        collector.record_module_call("dead-code", 9, false);
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev);
+
+        let raw = collector.snapshot();
+        // Sanity: all three modules are in the raw map.
+        assert!(raw.user_summary.module_summaries.contains_key("security"));
+        assert!(raw.user_summary.module_summaries.contains_key("complexity"));
+        assert!(raw.user_summary.module_summaries.contains_key("dead-code"));
+
+        let user_only = raw.project_for_audience(TelemetryAudience::UserOnly);
+        // The payload-empty `security` entry is dropped — its key would leak the
+        // executed-module set otherwise.
+        assert!(
+            !user_only
+                .user_summary
+                .module_summaries
+                .contains_key("security"),
+            "payload-empty module entry leaked the executed-module set under user-only"
+        );
+        // `complexity` survives (has a per-module metric), with timing scrubbed.
+        let complexity = &user_only.user_summary.module_summaries["complexity"];
+        assert_eq!(complexity.duration_ms, 0);
+        assert!((complexity.metrics["health_score"] - 92.0).abs() < f64::EPSILON);
+        // `dead-code` survives (has findings), with timing scrubbed.
+        let dc = &user_only.user_summary.module_summaries["dead-code"];
+        assert_eq!(dc.duration_ms, 0);
+        assert_eq!(dc.finding_count, 1);
+    }
+
+    #[test]
+    fn test_projection_on_and_operator_only_preserve_module_summaries_keys() {
+        // 1B: under On (operator scope enabled), the payload-empty entry must be
+        // preserved verbatim — pruning is strictly a user-only privacy step.
+        // Under OperatorOnly the user summary is wiped wholesale (existing
+        // behaviour), so the pruning rule is irrelevant there; we assert both.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("security", 12, false);
+        collector.record_module_call("complexity", 17, false);
+        collector.record_module_summary_metric("complexity", "health_score", 92.0);
+
+        let on = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::On);
+        // Payload-empty entry preserved when the operator scope is enabled.
+        let sec = &on.user_summary.module_summaries["security"];
+        assert_eq!(sec.duration_ms, 12);
+        assert_eq!(sec.finding_count, 0);
+        assert!(sec.metrics.is_empty());
+
+        let op_only = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::OperatorOnly);
+        // OperatorOnly wipes the user summary wholesale; no module_summaries.
+        assert!(op_only.user_summary.module_summaries.is_empty());
+    }
+
+    #[test]
     fn test_projection_operator_scopes_preserve_module_timing() {
         // Under On and operator-only the per-module timing inside the user
         // summary is preserved (operator scope is enabled). operator-only wipes
@@ -1126,6 +1226,15 @@ mod tests {
     /// as NON-operator. Source-tagging the producers is the real fix (deferred to
     /// a proto-wire change); until then this explicit set is the second half of
     /// the classification, paired with [`metric_names::OPERATOR`].
+    ///
+    /// Per-module summary names of the shape `chaffra.module.<id>.<key>` (e.g.
+    /// `chaffra.module.complexity.health_score`) are emitted as RUNTIME data
+    /// points via `record_module_summary_metric` and are NEVER registered as
+    /// `MetricDefinition`s, so they don't appear in `snapshot.definitions.keys()`
+    /// and don't need to be enumerated here. The completeness guard below
+    /// deliberately rejects ANY pattern-based admission so that a future
+    /// operator metric named `chaffra.module.<x>.<y>` (which would also match
+    /// the per-module shape) cannot slip past it silently.
     const KNOWN_USER_METRICS: &[&str] = &[
         "chaffra.analysis.duration_ms",
         "chaffra.analysis.files_total",
@@ -1137,21 +1246,14 @@ mod tests {
         "chaffra.findings.churn_rate",
     ];
 
-    /// Classify a metric name into a known scope, mirroring how
-    /// `project_for_audience` reasons about it. Returns `false` for a name that
-    /// is in NEITHER the operator set, the known-user set, nor the per-module
-    /// pattern — i.e. an unclassified metric that would silently leak under
-    /// user-only.
+    /// Classify a metric name into a known scope by EXACT membership of the two
+    /// explicit sets. Returns `false` for a name that is in neither — i.e. an
+    /// unclassified metric that would silently leak under user-only. Pattern
+    /// matching is intentionally omitted: a `chaffra.module.<x>.<y>`-shaped
+    /// operator metric must be classified by adding it to `metric_names::OPERATOR`,
+    /// not by passing through a permissive pattern.
     fn metric_is_classified(name: &str) -> bool {
-        is_operator_metric(name)
-            || KNOWN_USER_METRICS.contains(&name)
-            // Per-module summary metrics: `chaffra.module.<id>.<key>`. These are
-            // user-facing analysis results. Distinguished from the fixed operator
-            // `chaffra.module.*` names (already covered by is_operator_metric)
-            // by carrying a further `.` segment after the module id.
-            || (name.starts_with("chaffra.module.")
-                && name.matches('.').count() >= 3
-                && !is_operator_metric(name))
+        is_operator_metric(name) || KNOWN_USER_METRICS.contains(&name)
     }
 
     #[test]
@@ -1159,9 +1261,9 @@ mod tests {
         // P2 completeness guard (fail-open mitigation): register the core metric
         // definitions and assert EVERY registered name lands in a known scope.
         // A future operator metric added to `register_core_metrics` but NOT to
-        // `metric_names::OPERATOR` (and not a known-user name/pattern) would be
-        // silently classified user-facing and leak under user-only — this test
-        // turns that omission into a CI failure instead.
+        // `metric_names::OPERATOR` (and not a known-user name) would be silently
+        // classified user-facing and leak under user-only — this test turns that
+        // omission into a CI failure instead.
         let collector = TelemetryCollector::with_defaults();
         collector.register_core_metrics();
         let snap = collector.snapshot();
@@ -1172,8 +1274,8 @@ mod tests {
         for name in snap.definitions.keys() {
             assert!(
                 metric_is_classified(name),
-                "registered metric {name:?} is unclassified: it is neither in \
-                 metric_names::OPERATOR nor a known-user name/pattern. Add it to \
+                "registered metric {name:?} is unclassified: it is in neither \
+                 metric_names::OPERATOR nor KNOWN_USER_METRICS. Add it to \
                  OPERATOR (operator-scoped) or to KNOWN_USER_METRICS (user-facing) \
                  so it cannot leak under user-only."
             );
@@ -1185,12 +1287,58 @@ mod tests {
         // The guard must actually FAIL for an unknown metric, otherwise it would
         // pass vacuously and provide no protection.
         assert!(!metric_is_classified("chaffra.future.unregistered_metric"));
-        // And it must still accept the two known scopes + the per-module pattern.
+        // And it must still accept the two known scopes by exact name.
         assert!(metric_is_classified(metric_names::MODULE_CALL_DURATION_MS));
         assert!(metric_is_classified("chaffra.analysis.findings_total"));
-        assert!(metric_is_classified(
-            "chaffra.module.dead-code.unused_functions"
-        ));
+    }
+
+    #[test]
+    fn test_completeness_guard_rejects_per_module_pattern_metric() {
+        // 1A: a future operator-shaped name like `chaffra.module.host.dispatch_latency_ms`
+        // — which matches the per-module summary shape `chaffra.module.<id>.<key>`
+        // — must NOT be silently admitted as user-facing. Round-2 used a
+        // permissive pattern (`starts_with("chaffra.module.") && >=3 dots`) that
+        // would pass this name through; the round-3 fix removes that branch so
+        // the operator-shaped name lands in neither set and the guard rejects it.
+        let candidate = "chaffra.module.host.dispatch_latency_ms";
+        assert!(
+            !metric_is_classified(candidate),
+            "operator-shaped per-module metric {candidate:?} must NOT be admitted \
+             via a pattern; it has to be added to metric_names::OPERATOR explicitly. \
+             A pattern-based fallback re-introduces the silent-acceptance failure \
+             this test is here to prevent."
+        );
+
+        // And the same guard, exercised end-to-end against the registered set:
+        // injecting such a name into the registered definitions makes the
+        // completeness loop fail. We assert that on a synthetic snapshot built
+        // by hand (no need to mutate the producer) — the snapshot path mirrors
+        // exactly what `test_every_core_metric_is_classified` does.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector
+            .register_metrics(
+                "test",
+                vec![MetricDefinition {
+                    name: candidate.to_owned(),
+                    kind: MetricKind::Histogram,
+                    description: "fictitious operator metric".to_owned(),
+                    unit: "ms".to_owned(),
+                }],
+            )
+            .unwrap();
+        let snap = collector.snapshot();
+        let unclassified: Vec<&String> = snap
+            .definitions
+            .keys()
+            .filter(|n| !metric_is_classified(n))
+            .collect();
+        assert_eq!(
+            unclassified.len(),
+            1,
+            "exactly one unclassified name expected, got {unclassified:?}"
+        );
+        assert_eq!(unclassified[0], candidate);
     }
 
     #[test]
