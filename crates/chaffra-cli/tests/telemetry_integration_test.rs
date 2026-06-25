@@ -118,10 +118,17 @@ fn test_telemetry_module_in_grpc_host() {
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].id, "telemetry");
 
-    let config = ChaffraConfig::default();
+    // Pin `audience = "on"` so this gRPC-host wiring test sees the
+    // module's full output surface — both `backend-status` (operator-gated
+    // since R4-1) and `metric-summary` (always emitted, payload projected).
+    // The default audience is `user-only` (Phase 15a.1 privacy default), under
+    // which `backend-status` is intentionally withheld; this test is about
+    // gRPC plumbing, not the audience semantics, so we don't want it
+    // accidentally drifting whenever the default changes.
+    let config = ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n")
+        .expect("parse inline config");
     let result = host.analyze("telemetry", &[], &config).unwrap();
 
-    // Should have backend-status and metric-summary findings.
     assert!(result.findings.len() >= 2);
     let rule_ids: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
     assert!(rule_ids.contains(&"backend-status"));

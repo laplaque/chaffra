@@ -115,9 +115,19 @@ impl AnalysisModule for TelemetryModule {
 
         let mut findings = Vec::new();
 
-        // Emit a finding per backend with its status.
-        for status in &statuses {
-            findings.push(backend_status_finding(status));
+        // Emit a finding per backend with its status, gated on the operator
+        // scope. The backend-status finding discloses the backend kind
+        // (`JsonFile`, `Otlp`, ...), endpoint/path, and connectivity state —
+        // all operator-shaped data exactly like `OperatorSummary`. R4 fail-
+        // closed: emit ONLY when the resolved audience includes the operator
+        // scope (`On` / `OperatorOnly`); under `UserOnly` and `Off` the
+        // backend-status finding is withheld. (`metric-summary` below still
+        // emits — its payload is built from a projected snapshot so it carries
+        // only what the audience permits.)
+        if tel_config.audience.operator_enabled() {
+            for status in &statuses {
+                findings.push(backend_status_finding(status));
+            }
         }
 
         // Apply audience projection BEFORE deriving anything user-visible from
@@ -394,16 +404,20 @@ mod tests {
 
     #[test]
     fn test_module_analyze_default() {
+        // Default `TelemetryConfig` resolves to `user-only` (Phase 15a.1
+        // privacy default), which gates `backend-status` off (R4-1) — the
+        // backend kind / endpoint / connectivity state are operator-disclosing
+        // and must not cross the user-facing boundary. `metric-summary` is
+        // still emitted (projected payload).
         let module = TelemetryModule::new();
         let config = HashMap::new();
         let result = module.analyze(&[], &config).unwrap();
-        // Should have at least one backend-status finding and one metric-summary finding.
-        assert!(result.findings.len() >= 2);
         assert!(
-            result
+            !result
                 .findings
                 .iter()
-                .any(|f| f.rule_id == "backend-status")
+                .any(|f| f.rule_id == "backend-status"),
+            "backend-status finding leaked under default (user-only) audience"
         );
         assert!(
             result
@@ -411,6 +425,33 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "metric-summary")
         );
+    }
+
+    #[test]
+    fn test_backend_status_finding_gated_by_audience() {
+        // R4-1: `backend-status` discloses backend kind/endpoint/connectivity
+        // (operator-shaped data). It must surface ONLY when the resolved
+        // audience includes the operator scope (`On` / `OperatorOnly`) and
+        // must be withheld under `UserOnly` and `Off`.
+        let module = TelemetryModule::new();
+        for (label, audience, want_backend_status) in [
+            ("on", "on", true),
+            ("operator-only", "operator-only", true),
+            ("user-only", "user-only", false),
+            ("off", "off", false),
+        ] {
+            let mut config = HashMap::new();
+            config.insert("audience".to_owned(), audience.to_owned());
+            let result = module.analyze(&[], &config).unwrap();
+            let has = result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "backend-status");
+            assert_eq!(
+                has, want_backend_status,
+                "audience {label}: backend-status expected={want_backend_status}, was {has}"
+            );
+        }
     }
 
     #[test]

@@ -41,8 +41,18 @@ impl telemetry_collector_server::TelemetryCollector for TelemetryGrpcService {
             })
             .collect();
 
+        // External module definition submissions are UNTRUSTED, just like data
+        // points received on `record_metrics` (R3-3). Route them through the
+        // provenance-tracking ingress so the snapshot projection fails them
+        // closed at every restricted audience boundary. A plugin must not be
+        // able to register a definition with an exact `KNOWN_USER` /
+        // `OPERATOR` name (e.g. `chaffra.analysis.findings_total` with
+        // attacker-controlled `description`/`unit`/`kind`) and have it cross
+        // `user-only` solely because the name classifies as user-facing.
+        // TODO(#45): derive audience server-side here from a trusted
+        // `(module_id, name)` registry instead of name-level provenance.
         self.collector
-            .register_metrics(&req.module_id, definitions)
+            .register_untrusted_metrics(&req.module_id, definitions)
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
 
         Ok(tonic::Response::new(

@@ -348,7 +348,11 @@ impl TelemetryCollector {
         &self.config
     }
 
-    /// Register metric definitions from a module.
+    /// Register metric definitions from a TRUSTED in-process producer
+    /// (`register_core_metrics`, built-in module setup). Names registered here
+    /// are classified by `metric_names` at projection. External/plugin
+    /// submissions must NOT use this method — see
+    /// [`Self::register_untrusted_metrics`].
     pub fn register_metrics(
         &self,
         _module_id: &str,
@@ -356,6 +360,39 @@ impl TelemetryCollector {
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         for def in definitions {
+            inner.definitions.insert(def.name.clone(), def);
+        }
+        Ok(())
+    }
+
+    /// Register metric definitions received on the UNTRUSTED external
+    /// ingestion path (the gRPC `register_metrics` handler — external module
+    /// containers).
+    ///
+    /// Mirrors [`Self::record_untrusted_data_points`]: each definition's name
+    /// is added to `untrusted_runtime` so the snapshot projection forces the
+    /// definition to fail closed at every restricted audience boundary. A
+    /// plugin must not be able to register a definition with an exact
+    /// `KNOWN_USER` or `OPERATOR` name (e.g. `chaffra.analysis.findings_total`,
+    /// with attacker-controlled `description`/`unit`/`kind`) and have that
+    /// definition serialize under `user-only` solely because the name
+    /// classifies as user-facing — provenance gates the restricted
+    /// boundaries, not registration itself (so they still appear under `On`,
+    /// the unrestricted audience).
+    ///
+    /// TODO(#45): the per-name `untrusted_runtime` set is the bounded
+    /// mitigation. The durable fix derives audience server-side at this
+    /// ingress from a trusted `(module_id, name)` registry (an `audience`
+    /// field on `MetricDefinition`), which also resolves the name-collision
+    /// case where a trusted producer and a plugin share a metric name.
+    pub fn register_untrusted_metrics(
+        &self,
+        _module_id: &str,
+        definitions: Vec<MetricDefinition>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        for def in definitions {
+            inner.untrusted_runtime.insert(def.name.clone());
             inner.definitions.insert(def.name.clone(), def);
         }
         Ok(())
@@ -1684,6 +1721,73 @@ mod tests {
             !metrics.contains_key("spoofed_field"),
             "untrusted spoof leaked into user_summary.module_summaries metrics map"
         );
+    }
+
+    #[test]
+    fn test_projection_drops_untrusted_definition_with_known_user_name() {
+        // R4-2: external `register_metrics` submissions are untrusted. A plugin
+        // must NOT be able to register a definition with an exact `KNOWN_USER`
+        // or `OPERATOR` name (attacker-controlled `description`/`unit`/`kind`)
+        // and have it survive any restricted audience boundary solely because
+        // the name classifies as user-facing. `register_untrusted_metrics`
+        // records the name in `untrusted_runtime`, and the projection's
+        // `admit` closure forces the definition to the unclassified branch
+        // regardless of what `metric_names` says about its name.
+        let collector = TelemetryCollector::with_defaults();
+        // Trusted: in-process registration (built-in modules) classifies by
+        // name as usual.
+        collector
+            .register_metrics(
+                "trusted",
+                vec![MetricDefinition {
+                    name: "chaffra.analysis.findings_total".to_owned(),
+                    kind: MetricKind::Counter,
+                    description: "trusted".to_owned(),
+                    unit: "count".to_owned(),
+                }],
+            )
+            .unwrap();
+        // Untrusted: external plugin spoofs the same KNOWN_USER name with
+        // attacker-controlled metadata. Same name, different provenance.
+        // (We use a different name for the spoof so we can observe both
+        // outcomes in the same snapshot — name-collision would mask the
+        // distinction with the HashMap's last-write-wins.)
+        collector
+            .register_untrusted_metrics(
+                "plugin",
+                vec![MetricDefinition {
+                    name: "chaffra.findings.churn_rate".to_owned(),
+                    kind: MetricKind::Gauge,
+                    description: "<plugin-controlled description>".to_owned(),
+                    unit: "<plugin-controlled unit>".to_owned(),
+                }],
+            )
+            .unwrap();
+
+        let trusted = "chaffra.analysis.findings_total";
+        let spoofed = "chaffra.findings.churn_rate";
+
+        // (audience, trusted_def, spoofed_def)
+        let cases = [
+            (TelemetryAudience::On, true, true),
+            (TelemetryAudience::UserOnly, true, false),
+            (TelemetryAudience::OperatorOnly, false, false),
+            (TelemetryAudience::Off, false, false),
+        ];
+        for (audience, want_trusted, want_spoofed) in cases {
+            let snap = collector.snapshot().project_for_audience(audience);
+            assert_eq!(
+                snap.definitions.contains_key(trusted),
+                want_trusted,
+                "{audience:?}: trusted KNOWN_USER definition admit mismatch"
+            );
+            assert_eq!(
+                snap.definitions.contains_key(spoofed),
+                want_spoofed,
+                "{audience:?}: untrusted KNOWN_USER-named definition admit mismatch \
+                 (true under user-only = the R4-2 fail-open)"
+            );
+        }
     }
 
     #[test]

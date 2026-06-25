@@ -194,6 +194,16 @@ pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
 
     match action {
         "status" => {
+            // Backend status is operator-shaped (backend kind, endpoint/path,
+            // connectivity state). Match the `TelemetryModule::analyze`
+            // backend-status finding rule (R4-1): expose only when the
+            // resolved audience includes the operator scope (`On` /
+            // `OperatorOnly`). The MCP entry point runs against a default
+            // `TelemetryConfig`, so `user-only` (the new default) returns an
+            // empty list rather than leaking the backend catalogue.
+            if !config.audience.operator_enabled() {
+                return ToolCallResult::text("[]".to_owned());
+            }
             let (_, statuses) = chaffra_telemetry::backends::create_backends(&config.backends);
             match serde_json::to_string_pretty(&statuses) {
                 Ok(json) => ToolCallResult::text(json),
@@ -201,13 +211,28 @@ pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
             }
         }
         "snapshot" => {
-            let snapshot = collector.snapshot();
+            // R4-3: project the snapshot through the resolved audience BEFORE
+            // serializing. This was previously serializing the raw snapshot,
+            // which under default `user-only` would have exposed
+            // `operator_summary`, every operator-scoped data point/span, and
+            // the operator definition catalogue at this output boundary —
+            // exactly the leak the CLI/module flush paths gate. The same rule
+            // applies here: project before any user-facing emission.
+            let snapshot = collector.snapshot().project_for_audience(config.audience);
             match serde_json::to_string_pretty(&snapshot) {
                 Ok(json) => ToolCallResult::text(json),
                 Err(e) => ToolCallResult::error(format!("Serialization error: {e}")),
             }
         }
         "backends" => {
+            // Same gate as `status` (R4-1/R4-3 parallel path): the configured
+            // backends list is operator-shaped (kind/endpoint/path discloses
+            // where telemetry would be sent). Withhold under audiences that
+            // don't include the operator scope, matching the projection rule
+            // that drops `OperatorSummary` and operator-scoped data points.
+            if !config.audience.operator_enabled() {
+                return ToolCallResult::text("[]".to_owned());
+            }
             let backends_info: Vec<serde_json::Value> = config
                 .backends
                 .iter()

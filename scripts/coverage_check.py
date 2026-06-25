@@ -99,11 +99,15 @@ class FileCoverage:
     records directly — overall uses ``Σ(unique DA) / Σ(unique covered DA)``
     (the DA-coherent metric); changed-line gates use the DA records for
     per-line resolution. The producer's declared ``LF``/``LH`` summary is
-    structurally validated by :func:`parse_lcov` (LH<=LF, LF>=unique-DA,
-    LH>=unique-hit-DA, and the reconciliation bound) but is *not* an input to
-    the arithmetic, so an overstated summary cannot inflate the score past
-    what the DA records demonstrate. The fields are retained on the dataclass
-    for diagnostics / merge bookkeeping only.
+    structurally validated by :func:`parse_lcov` (``LH<=LF``, ``LF>=unique-DA``,
+    and the unseen-hits reconciliation bound) but is *not* an input to the
+    arithmetic, so an overstated summary cannot inflate the score past what
+    the DA records demonstrate. ``LH`` is NOT required to be
+    ``>= unique-hit-DA``: LLVM's ``llvm-cov export`` can undercount that
+    summary under powerset accumulation, which the parser tolerates by
+    clamping the effective ``LH`` up to the DA hit count (the undercount is
+    the opposite of inflation and cannot lift the score). The fields are
+    retained on the dataclass for diagnostics / merge bookkeeping only.
     """
 
     path: str
@@ -999,9 +1003,10 @@ def evaluate(
     # for that input, exactly what a single covered visible line shows.
     #
     # parse_lcov already enforces structural reconciliation against the
-    # declared LF/LH (LH<=LF, LF>=unique DA, LH>=unique hit DA,
-    # unseen_hits<=unseen_inst), so a malformed summary is still rejected;
-    # the arithmetic just doesn't depend on the summary values.
+    # declared LF/LH (LH<=LF, LF>=unique DA, unseen_hits<=unseen_inst), so a
+    # malformed-on-the-overclaim-side summary is still rejected; an LH below
+    # the DA hit count is tolerated as a producer quirk and clamped up. The
+    # arithmetic just doesn't depend on the summary values either way.
     total_lf = 0
     total_lh = 0
     for fc in eligible_lcov.values():
