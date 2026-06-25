@@ -3723,8 +3723,7 @@ mod tests {
             events.len(),
             2,
             "Off must not write an audit event; expected exactly two events \
-             (OperatorOnly Enabled + UserOnly Disabled), got {}",
-            events.len()
+             (OperatorOnly Enabled + UserOnly Disabled)"
         );
     }
 

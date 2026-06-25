@@ -147,4 +147,17 @@ mod tests {
         let result = backend.test_connection().unwrap();
         assert!(result.contains("otel-collector"));
     }
+
+    #[test]
+    fn test_otlp_backend_flush_ok() {
+        // R5-Structural coverage: exercise the `flush()` entry point.
+        // OTLP preview mode generates a JSON payload and prints to stderr.
+        let backend = OtlpBackend::new("http://localhost:4317".to_owned());
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 42, false);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
+    }
 }

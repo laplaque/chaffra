@@ -134,4 +134,22 @@ mod tests {
         let result = backend.test_connection().unwrap();
         assert!(result.contains("StatsD"));
     }
+
+    #[test]
+    fn test_statsd_backend_flush_ok() {
+        // R5-Structural coverage: exercise the `flush()` entry point with a
+        // `ProjectedSnapshot`. The StatsD flush binds a UDP socket and emits
+        // datagrams to the configured endpoint; binding 0.0.0.0:0 doesn't
+        // need network access and send_to errors are logged-not-returned, so
+        // the test asserts Ok regardless of whether anything listens on the
+        // localhost port.
+        let backend = StatsdBackend::new("127.0.0.1:8125".to_owned());
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("dead-code", 42, false);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
+    }
 }

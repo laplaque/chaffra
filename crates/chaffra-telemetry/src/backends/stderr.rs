@@ -98,4 +98,19 @@ mod tests {
         let output = backend.inspect(&snapshot).unwrap();
         assert!(output.contains("chaffra.telemetry.summary"));
     }
+
+    #[test]
+    fn test_stderr_backend_flush_ok() {
+        // R5-Structural coverage: `flush()` accepts only `ProjectedSnapshot`,
+        // so the production flush path is exercised by constructing one
+        // explicitly. The body writes JSON lines to stderr — we just assert
+        // it returns Ok without panicking.
+        let backend = StderrBackend::new();
+        let collector = TelemetryCollector::with_defaults();
+        collector.set_files_total(1);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
+    }
 }

@@ -138,4 +138,19 @@ mod tests {
         let result = backend.test_connection().unwrap();
         assert!(result.contains("9090"));
     }
+
+    #[test]
+    fn test_prometheus_backend_flush_ok() {
+        // R5-Structural coverage: exercise the `flush()` entry point with a
+        // `ProjectedSnapshot`. The Prometheus exposition flush logs the
+        // generated text size to stderr; assert Ok.
+        let backend = PrometheusBackend::new(9090);
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(10);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
+    }
 }

@@ -228,10 +228,14 @@ impl TelemetrySnapshot {
             if untrusted.contains(&span.name) {
                 // Untrusted span: require BOTH scopes (i.e. `On`).
                 keep_user && keep_operator
-            } else if is_operator_span(span) {
-                keep_operator
             } else {
-                keep_user
+                // Trusted span: classify by `is_operator_span` (uniformly
+                // `true` today). The `&& keep_operator` shape mirrors the
+                // pre-R5-1 single-branch projection; when #45 lands and
+                // `is_operator_span` becomes per-span, the projection will
+                // grow a parallel `&& keep_user` branch under the same
+                // commit that makes the case reachable.
+                is_operator_span(span) && keep_operator
             }
         };
         let spans = self.spans.into_iter().filter(admit_span).collect();

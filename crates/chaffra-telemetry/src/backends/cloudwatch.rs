@@ -121,4 +121,18 @@ mod tests {
         assert!(result.contains("my-ns"));
         assert!(result.contains("eu-west-1"));
     }
+
+    #[test]
+    fn test_cloudwatch_backend_flush_ok() {
+        // R5-Structural coverage: exercise the `flush()` entry point with a
+        // `ProjectedSnapshot`. CloudWatch preview-mode flush prints to
+        // stderr; assert Ok.
+        let backend = CloudWatchBackend::new("chaffra".to_owned(), None);
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_call("dead-code", 50, false);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
+    }
 }
