@@ -138,3 +138,72 @@ fn execute_telemetry_status_and_backends_are_gated_under_default_user_only() {
         );
     }
 }
+
+#[test]
+fn execute_telemetry_status_and_backends_are_populated_under_operator_audience() {
+    // R4-1 parallel (other branch): when the caller opts into an audience
+    // that includes the operator scope, `status` and `backends` MUST return
+    // the configured backend catalogue, not the gated `[]`. Pairs with the
+    // gated test above to pin both arms of the audience gate.
+    for action in ["status", "backends"] {
+        let result = execute_telemetry(&serde_json::json!({ "action": action, "audience": "on" }));
+        assert!(
+            result.is_error.is_none() || result.is_error == Some(false),
+            "{action} returned an error: {}",
+            result.content[0].text
+        );
+        let body = result.content[0].text.trim();
+        assert_ne!(
+            body, "[]",
+            "{action} under audience=on must NOT be gated, got: {body}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(body).expect("operator-enabled body must be JSON");
+        let arr = parsed
+            .as_array()
+            .expect("operator-enabled body is an array");
+        assert!(
+            !arr.is_empty(),
+            "{action} under audience=on must include the configured backends"
+        );
+    }
+}
+
+#[test]
+fn execute_telemetry_snapshot_respects_audience_override() {
+    // R4-3 audience-override path: `audience=on` must surface operator
+    // definitions, mirroring how the CLI's `telemetry inspect --telemetry on`
+    // exposes the full catalogue. This exercises the projection branch the
+    // default-audience test cannot reach.
+    let result = execute_telemetry(&serde_json::json!({ "action": "snapshot", "audience": "on" }));
+    assert!(
+        result.is_error.is_none() || result.is_error == Some(false),
+        "snapshot returned an error: {}",
+        result.content[0].text
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result.content[0].text).expect("snapshot JSON");
+    let definitions = parsed["definitions"]
+        .as_object()
+        .expect("definitions object");
+    assert!(
+        definitions.contains_key("chaffra.module.call_duration_ms"),
+        "operator definition missing from audience=on MCP snapshot: \
+         {definitions:?}"
+    );
+}
+
+#[test]
+fn execute_telemetry_rejects_invalid_audience() {
+    // The audience override is fail-closed: an unrecognised value is a
+    // typed error, not a silent coercion to a default. Matches the CLI's
+    // `--telemetry` and the file `[modules.telemetry] audience` semantics.
+    let result =
+        execute_telemetry(&serde_json::json!({ "action": "snapshot", "audience": "everyone" }));
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result.content[0].text.contains("Invalid audience"),
+        "expected invalid-audience error, got: {}",
+        result.content[0].text
+    );
+}

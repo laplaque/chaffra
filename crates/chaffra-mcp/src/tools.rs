@@ -21,7 +21,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "chaffra/telemetry".to_owned(),
-            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot.".to_owned(),
+            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot. Defaults to the privacy-preserving 'user-only' audience; pass 'audience' to preview operator-scoped output explicitly.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -29,6 +29,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Action to perform: 'status', 'snapshot', or 'backends'",
                         "enum": ["status", "snapshot", "backends"]
+                    },
+                    "audience": {
+                        "type": "string",
+                        "description": "Audience to project the response through: 'on' (full), 'user-only' (default), 'operator-only', or 'off'. Operator-scoped fields (backend kind/endpoint, operator metrics, span counts) are withheld at audiences without the operator scope, matching the projection the CLI/module flush paths use.",
+                        "enum": ["on", "user-only", "operator-only", "off"]
                     }
                 },
                 "required": []
@@ -188,7 +193,21 @@ pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
         .and_then(|v| v.as_str())
         .unwrap_or("status");
 
-    let config = chaffra_telemetry::TelemetryConfig::default();
+    // Optional audience override (R4-3). Without it the tool uses the
+    // Phase 15a.1 privacy default (`user-only`), matching every other entry
+    // point. An unrecognised value is a typed error rather than a silent
+    // coercion — same fail-closed posture as `TelemetryConfig::from_module_config`.
+    let mut config = chaffra_telemetry::TelemetryConfig::default();
+    if let Some(s) = params.get("audience").and_then(|v| v.as_str()) {
+        match chaffra_telemetry::TelemetryAudience::from_str_loose(s) {
+            Some(a) => config.audience = a,
+            None => {
+                return ToolCallResult::error(format!(
+                    "Invalid audience '{s}'; expected 'on', 'user-only', 'operator-only', or 'off'"
+                ));
+            }
+        }
+    }
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
     collector.register_core_metrics();
 
