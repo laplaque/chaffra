@@ -5,7 +5,7 @@
 //! writes the exposition text to a file or returns it for inspection.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::{ProjectedSnapshot, TelemetrySnapshot};
 use crate::error::Result;
 use crate::metrics::MetricKind;
 
@@ -69,7 +69,8 @@ impl TelemetryBackend for PrometheusBackend {
         "prometheus"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
+        let snapshot = snapshot.inner();
         // In a full implementation this would update an in-memory registry
         // served by the HTTP endpoint. For now, we log the exposition text
         // to signal readiness.
@@ -89,7 +90,8 @@ impl TelemetryBackend for PrometheusBackend {
         ))
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
+        let snapshot = snapshot.inner();
         Ok(self.render_exposition(snapshot))
     }
 }
@@ -107,7 +109,9 @@ mod tests {
         collector.set_files_total(10);
         collector.record_module_call("dead-code", 42, false);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
         let text = backend.render_exposition(&snapshot);
 
         assert!(text.contains("# HELP"));
@@ -120,7 +124,9 @@ mod tests {
         let backend = PrometheusBackend::new(9090);
         let collector = TelemetryCollector::with_defaults();
         collector.register_core_metrics();
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         assert!(output.contains("# HELP"));

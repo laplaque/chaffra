@@ -1,7 +1,7 @@
 //! Stderr structured log backend: JSON lines for CI ingestion.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::ProjectedSnapshot;
 use crate::error::Result;
 
 /// Writes telemetry as JSON lines to stderr.
@@ -25,7 +25,8 @@ impl TelemetryBackend for StderrBackend {
         "stderr"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
+        let snapshot = snapshot.inner();
         // Emit each data point as a separate JSON line for easy parsing.
         for dp in &snapshot.data_points {
             let line = serde_json::to_string(dp)?;
@@ -50,7 +51,8 @@ impl TelemetryBackend for StderrBackend {
         Ok("stderr is always available".to_owned())
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
+        let snapshot = snapshot.inner();
         let mut lines = Vec::new();
         for dp in &snapshot.data_points {
             lines.push(serde_json::to_string(dp)?);
@@ -89,7 +91,9 @@ mod tests {
         let backend = StderrBackend::new();
         let collector = TelemetryCollector::with_defaults();
         collector.set_files_total(3);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         assert!(output.contains("chaffra.telemetry.summary"));

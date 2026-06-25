@@ -91,7 +91,18 @@ impl telemetry_collector_server::TelemetryCollector for TelemetryGrpcService {
         let req = request.into_inner();
         let spans: Vec<_> = req.spans.iter().map(span_from_proto).collect();
         let count = spans.len() as u64;
-        self.collector.record_spans(spans);
+        // External module span submissions are UNTRUSTED, matching the
+        // `record_metrics` and `register_metrics` ingresses (R3-3 / R4-2 /
+        // R5-1). Route through the provenance-tracking ingress so the
+        // snapshot projection fails them closed at every restricted audience
+        // boundary. Today's `is_operator_span = true` makes the gate a no-op
+        // (all spans drop under `user-only` regardless), but it closes the
+        // seam ahead of `#45` — once per-span audience scoping lands, a
+        // plugin must not be able to inject a span that surfaces under
+        // `OperatorOnly` solely by spoofing a trusted name.
+        // TODO(#45): derive audience server-side here from a trusted
+        // `(module_id, name)` registry instead of name-level provenance.
+        self.collector.record_untrusted_spans(spans);
         Ok(tonic::Response::new(
             chaffra_proto::proto::RecordSpanResponse { accepted: count },
         ))

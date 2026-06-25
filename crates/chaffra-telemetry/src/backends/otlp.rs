@@ -5,7 +5,7 @@
 //! integration with external collectors.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::{ProjectedSnapshot, TelemetrySnapshot};
 use crate::error::{Result, TelemetryError};
 
 /// OTLP payload generator (preview — no network export yet).
@@ -77,7 +77,8 @@ impl TelemetryBackend for OtlpBackend {
         "otlp"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
+        let snapshot = snapshot.inner();
         let payload = self.build_payload(snapshot);
         let json = serde_json::to_string(&payload)
             .map_err(|e| TelemetryError::BackendError(format!("OTLP payload error: {e}")))?;
@@ -96,7 +97,8 @@ impl TelemetryBackend for OtlpBackend {
         ))
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
+        let snapshot = snapshot.inner();
         let payload = self.build_payload(snapshot);
         Ok(serde_json::to_string_pretty(&payload)?)
     }
@@ -113,7 +115,9 @@ mod tests {
         let backend = OtlpBackend::new("http://localhost:4317".to_owned());
         let collector = TelemetryCollector::with_defaults();
         collector.record_module_call("dead-code", 42, false);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let payload = backend.build_payload(&snapshot);
         assert!(payload["resourceMetrics"].is_array());
@@ -128,7 +132,9 @@ mod tests {
         let mut sev = HashMap::new();
         sev.insert("warning".to_owned(), 2);
         collector.record_module_findings("complexity", 2, &sev);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         assert!(output.contains("resourceMetrics"));

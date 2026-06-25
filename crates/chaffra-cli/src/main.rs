@@ -476,20 +476,28 @@ fn merge_telemetry_config(
 /// entry. The audit log file is append-only and the `read_log` /
 /// `export_for_gdpr` helpers already handle multi-event traversal.
 fn maybe_audit_log_audience(audience: chaffra_telemetry::TelemetryAudience) {
+    // R5-Audit-Off: `--telemetry off` is the operator's explicit "do not
+    // emit, write, or leave traces" instruction. Audit-log writes record
+    // best-effort process-owner attribution and a timestamp — themselves a
+    // disk-side effect the operator did not authorise. Honour the kill
+    // switch by skipping the log entirely under `Off`. Accountability is
+    // preserved for every *opted-in* audience: every other branch still
+    // emits a `TelemetryEnabled` (operator-scoped) or `TelemetryDisabled`
+    // (user-only opted in but operator off) event.
+    if matches!(audience, chaffra_telemetry::TelemetryAudience::Off) {
+        return;
+    }
     // Best-effort process-owner attribution; `audit_log` accepts `Option`.
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .filter(|s| !s.is_empty());
-    match audience {
-        chaffra_telemetry::TelemetryAudience::On
-        | chaffra_telemetry::TelemetryAudience::OperatorOnly => {
-            chaffra_telemetry::audit_log::log_telemetry_enabled(&format!("{audience:?}"), user);
-        }
-        chaffra_telemetry::TelemetryAudience::UserOnly
-        | chaffra_telemetry::TelemetryAudience::Off => {
-            chaffra_telemetry::audit_log::log_telemetry_disabled(user);
-        }
+    if audience.operator_enabled() {
+        chaffra_telemetry::audit_log::log_telemetry_enabled(&format!("{audience:?}"), user);
+    } else {
+        // `UserOnly` is the only remaining branch: user-facing summaries
+        // emit, operator scope is off.
+        chaffra_telemetry::audit_log::log_telemetry_disabled(user);
     }
 }
 
@@ -3632,21 +3640,25 @@ mod tests {
 
     #[test]
     fn test_run_with_telemetry_emits_audit_log_event_for_each_audience() {
-        // F4: replace the prior `TODO(issue)` with the wired Phase 14
-        // audit-log helper. `run_with_telemetry` calls
+        // F4 + R5-Audit-Off: `run_with_telemetry` calls
         // `maybe_audit_log_audience(effective_config.audience)` at the live
-        // boundary, BEFORE the Off short-circuit and before any flush, so
-        // every chaffra invocation appends ONE accountability event to
-        // `.chaffra-telemetry-audit.log`:
-        //   * `On` / `OperatorOnly` -> TelemetryEnabled (with audience tag),
-        //   * `UserOnly` / `Off`    -> TelemetryDisabled.
+        // boundary. Accountability is recorded for every *opted-in*
+        // audience:
+        //   * `On` / `OperatorOnly` -> TelemetryEnabled (with audience tag)
+        //   * `UserOnly`            -> TelemetryDisabled (user-facing on,
+        //                              operator off)
+        //   * `Off`                 -> NO event written. `--telemetry off`
+        //                              is the operator's explicit "do not
+        //                              emit, write, or leave traces"
+        //                              instruction; honour the kill switch
+        //                              with a zero-side-effect run.
         // The diagnostic previews (`status` / `test` / `inspect`) do NOT
         // trigger this — they don't run the workload, so they don't log.
         //
-        // One combined test exercises both branches in a single tempdir so
-        // the iteration that classifies events visits BOTH the Enabled and
-        // Disabled arms, leaving no implicitly-unreached catch-all to skew
-        // coverage on the audit-log assertions.
+        // One combined test exercises all THREE arms in a single tempdir so
+        // the iteration visits both the Enabled and Disabled cases AND the
+        // `Off`-no-event case, leaving no implicitly-unreached catch-all
+        // to skew coverage on the audit-log assertions.
         let dir = TempDir::new().unwrap();
         let _cwd = CwdGuard::enter(dir.path());
         let config = ChaffraConfig::default();
@@ -3662,8 +3674,19 @@ mod tests {
         })
         .unwrap();
 
-        // Second invocation: Off -> Disabled event (fires BEFORE the
-        // short-circuit).
+        // Second invocation: UserOnly -> Disabled event (the only branch
+        // that still writes a `TelemetryDisabled` event after R5-Audit-Off).
+        let tel_user = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            backends: vec![],
+            ..Default::default()
+        };
+        run_with_telemetry(&tel_user, &config, "health", |_collector| {
+            Ok("ok\n".to_owned())
+        })
+        .unwrap();
+
+        // Third invocation: Off -> NO event. This must not lengthen the log.
         let tel_off = chaffra_telemetry::TelemetryConfig {
             audience: chaffra_telemetry::TelemetryAudience::Off,
             backends: vec![],
@@ -3680,9 +3703,9 @@ mod tests {
         assert!(log_path.exists());
         let events = chaffra_telemetry::audit_log::read_log(&log_path);
 
-        // Classify by direct iteration with `if let` — both branches actually
-        // execute (one Enabled + one Disabled event in this test), so coverage
-        // does not flag an unreached arm.
+        // Classify by direct iteration with `if let` — both kept branches
+        // execute exactly once in this test (one Enabled + one Disabled),
+        // so coverage does not flag an unreached arm.
         let mut enabled_audiences: Vec<String> = Vec::new();
         let mut disabled_count = 0usize;
         for e in &events {
@@ -3696,7 +3719,13 @@ mod tests {
         assert_eq!(enabled_audiences.len(), 1);
         assert_eq!(enabled_audiences[0], "OperatorOnly");
         assert_eq!(disabled_count, 1);
-        assert_eq!(events.len(), 2, "expected exactly two audit events");
+        assert_eq!(
+            events.len(),
+            2,
+            "Off must not write an audit event; expected exactly two events \
+             (OperatorOnly Enabled + UserOnly Disabled), got {}",
+            events.len()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! calls in this version — use `inspect` to preview payloads.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::{ProjectedSnapshot, TelemetrySnapshot};
 use crate::error::{Result, TelemetryError};
 
 /// AWS CloudWatch payload generator (preview — no network calls yet).
@@ -57,8 +57,8 @@ impl TelemetryBackend for CloudWatchBackend {
         "cloudwatch"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
-        let payload = self.build_payload(snapshot);
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
+        let payload = self.build_payload(snapshot.inner());
         let json = serde_json::to_string(&payload)
             .map_err(|e| TelemetryError::BackendError(format!("CloudWatch payload error: {e}")))?;
         eprintln!(
@@ -77,8 +77,8 @@ impl TelemetryBackend for CloudWatchBackend {
         ))
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
-        let payload = self.build_payload(snapshot);
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
+        let payload = self.build_payload(snapshot.inner());
         Ok(serde_json::to_string_pretty(&payload)?)
     }
 }
@@ -93,7 +93,9 @@ mod tests {
         let backend = CloudWatchBackend::new("chaffra".to_owned(), Some("us-east-1".to_owned()));
         let collector = TelemetryCollector::with_defaults();
         collector.record_module_call("dead-code", 50, false);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let payload = backend.build_payload(&snapshot);
         assert_eq!(payload["Namespace"], "chaffra");
@@ -104,7 +106,9 @@ mod tests {
     fn test_cloudwatch_inspect() {
         let backend = CloudWatchBackend::new("chaffra".to_owned(), None);
         let collector = TelemetryCollector::with_defaults();
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         assert!(output.contains("chaffra"));

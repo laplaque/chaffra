@@ -21,7 +21,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "chaffra/telemetry".to_owned(),
-            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot. Defaults to the privacy-preserving 'user-only' audience; pass 'audience' to preview operator-scoped output explicitly.".to_owned(),
+            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot. Always returns the project's resolved view at the Phase 15a.1 privacy default ('user-only'); operator-scoped fields are withheld. To preview operator-scoped output, use the CLI 'chaffra telemetry inspect --telemetry <audience>'.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -29,11 +29,6 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Action to perform: 'status', 'snapshot', or 'backends'",
                         "enum": ["status", "snapshot", "backends"]
-                    },
-                    "audience": {
-                        "type": "string",
-                        "description": "Audience to project the response through: 'on' (full), 'user-only' (default), 'operator-only', or 'off'. Operator-scoped fields (backend kind/endpoint, operator metrics, span counts) are withheld at audiences without the operator scope, matching the projection the CLI/module flush paths use.",
-                        "enum": ["on", "user-only", "operator-only", "off"]
                     }
                 },
                 "required": []
@@ -185,29 +180,39 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
 
 /// Execute the chaffra/telemetry tool.
 ///
-/// Returns default configuration and backend info. Does not share state with
-/// a running analysis — use CLI `chaffra telemetry inspect` for live previews.
+/// Returns the project's resolved telemetry view. The MCP entry point ALWAYS
+/// runs against `TelemetryConfig::default()` (Phase 15a.1 privacy default:
+/// `user-only`); an MCP caller cannot widen the audience to see operator data
+/// the project default would withhold. To preview other audiences, use the
+/// CLI's `chaffra telemetry inspect --telemetry <audience>` diagnostic, which
+/// is the trusted operator-side entry point.
+///
+/// (R5-2: an earlier revision accepted an `audience` parameter on this tool
+/// to make the operator branches reachable from integration tests. That was
+/// a widening attack vector — any MCP client could pass `audience=on` and
+/// bypass the privacy default. The parameter is removed; the operator
+/// branches are exercised through the crate-internal
+/// [`execute_telemetry_with_config`] helper instead, which is not reachable
+/// from external MCP callers.)
 pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
     let action = params
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("status");
+    let config = chaffra_telemetry::TelemetryConfig::default();
+    execute_telemetry_with_config(action, &config)
+}
 
-    // Optional audience override (R4-3). Without it the tool uses the
-    // Phase 15a.1 privacy default (`user-only`), matching every other entry
-    // point. An unrecognised value is a typed error rather than a silent
-    // coercion — same fail-closed posture as `TelemetryConfig::from_module_config`.
-    let mut config = chaffra_telemetry::TelemetryConfig::default();
-    if let Some(s) = params.get("audience").and_then(|v| v.as_str()) {
-        match chaffra_telemetry::TelemetryAudience::from_str_loose(s) {
-            Some(a) => config.audience = a,
-            None => {
-                return ToolCallResult::error(format!(
-                    "Invalid audience '{s}'; expected 'on', 'user-only', 'operator-only', or 'off'"
-                ));
-            }
-        }
-    }
+/// Internal helper exposing the body of [`execute_telemetry`] with a
+/// caller-supplied `TelemetryConfig`. EXISTS FOR TESTS ONLY — production
+/// callers must go through [`execute_telemetry`], which pins the config to
+/// the project default and cannot widen the audience. Direct callers
+/// constructing their own `TelemetryConfig` are doing privileged work; the
+/// MCP transport never reaches this entry point.
+pub fn execute_telemetry_with_config(
+    action: &str,
+    config: &chaffra_telemetry::TelemetryConfig,
+) -> ToolCallResult {
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
     collector.register_core_metrics();
 

@@ -130,28 +130,50 @@ producers and the projector share those constants so naming cannot drift:
 
 Provenance overrides name. Built-in modules run in-process and record metrics
 through trusted collector methods, so their names are classified as above.
-External modules submit metrics over gRPC (`record_metrics`), which routes
-through `record_untrusted_data_points`; every name seen there is recorded in
-the snapshot's `untrusted_runtime` set (an internal, never-serialized field —
-`#[serde(skip)]`). The projection forces any data point whose name is in that
-set to the unclassified branch REGARDLESS of how the name classifies, so an
-external plugin cannot cross `user-only` or `operator-only` by spoofing a
-trusted user-facing or operator metric name (whether a `chaffra.module.*` shape
-or an exact `KNOWN_USER` name). This name-level provenance is the bounded
-mitigation pending issue #45, which adds an `audience` field to
-`MetricDefinition` and derives scope server-side from a trusted
-`(module_id, name)` registry at gRPC ingestion. The same provenance gate is
-applied when building the user-facing `user_summary.module_summaries[*].metrics`
-map, so a spoofed `chaffra.module.<id>.<key>` cannot leak through that derived
-field either.
+External modules submit telemetry over gRPC and EVERY ingress routes through
+a provenance-tracking entry point: data points via `record_untrusted_data_points`
+(R3-3), definitions via `register_untrusted_metrics` (R4-2), and spans via
+`record_untrusted_spans` (R5-1). Each writes the submitted name into the
+snapshot's `untrusted_runtime` set (an internal, never-serialized field —
+`#[serde(skip)]`). The projection forces any data point, definition, or span
+whose name is in that set to the unclassified branch REGARDLESS of how the
+name classifies, so an external plugin cannot cross `user-only` or
+`operator-only` by spoofing a trusted user-facing or operator name — whether
+a `chaffra.module.*` shape, an exact `KNOWN_USER` name like
+`chaffra.analysis.findings_total`, or a span name a per-span scoping change
+(issue #45) might make user-facing. This name-level provenance is the bounded
+mitigation pending the same #45 — an `audience` field on `MetricDefinition`
+derived server-side from a trusted `(module_id, name)` registry at gRPC
+ingestion. The same provenance gate is applied when building the user-facing
+`user_summary.module_summaries[*].metrics` map (R3-1), so a spoofed
+`chaffra.module.<id>.<key>` cannot leak through that derived field either.
 
-Projection is applied at every emission boundary — the telemetry-module backend
-flush and the CLI `run_with_telemetry` success and failure flush paths, both of
-which use the SAME rule: **flush the projected snapshot whenever the audience is
-not `off`**. Projection decides the payload contents, so under `user-only` a
-backend receives exactly the user-facing fields and never operator data, and
-`off` emits nothing. Projecting before filtering, persistence, or backend write
-guarantees operator-only fields never cross a user-facing boundary.
+Projection is enforced at the TYPE LEVEL (R5-Structural). The
+`TelemetrySnapshot::project_for_audience(self, audience) -> ProjectedSnapshot`
+method is the ONLY constructor of `ProjectedSnapshot`; the
+`TelemetryBackend::flush` and `TelemetryBackend::inspect` trait methods accept
+`&ProjectedSnapshot`, and the MCP `chaffra/telemetry snapshot` boundary
+projects before serialising. An output path that forgets to project is now a
+COMPILE ERROR — every prior review round (R3 / R4 / R5) had found a parallel
+"forgot to project at site X" leak; the newtype ends that class of bug.
+Production callers continue to use the same rule they always have: **flush
+the projected snapshot whenever the audience is not `off`**. Under `user-only`
+a backend receives exactly the user-facing fields and never operator data;
+under `off`, nothing crosses the emission boundary.
+
+Audience-gated output beyond the snapshot itself (R4):
+
+- `TelemetryModule::analyze` emits a `backend-status` finding (backend kind,
+  endpoint/path, connectivity state). That is operator-shaped, so it surfaces
+  ONLY when the resolved audience includes the operator scope (`On` /
+  `OperatorOnly`); withheld under `user-only` and `off`.
+- The MCP `chaffra/telemetry` tool's `status` and `backends` actions (backend
+  connectivity / catalogue) follow the same gate. The `snapshot` action
+  projects via `project_for_audience(config.audience)` before serializing.
+- The MCP tool ALWAYS runs at the project's default audience (`user-only`);
+  there is no caller-supplied `audience` override (R5-2). To preview other
+  audiences, use the CLI's `chaffra telemetry inspect --telemetry <audience>`
+  diagnostic, the trusted operator-side entry point.
 
 #### GDPR rationale
 
@@ -163,14 +185,22 @@ collected or forwarded unless explicitly justified. Defaulting to `user-only`
 makes operator emission an explicit, auditable opt-in rather than implicit
 behaviour.
 
-Every live `run_with_telemetry` invocation also appends one accountability
-event to `.chaffra-telemetry-audit.log`: a `TelemetryEnabled` event recording
-the resolved audience (and best-effort process-owner attribution) when
-operator telemetry is active (`on` / `operator-only`), and a `TelemetryDisabled`
-event under `user-only` / `off`. The diagnostic previews (`telemetry status`
-/ `test` / `inspect`) deliberately do not write to the audit log — they never
-ran a workload, so there is nothing to record. Inspect or export the log with
-`chaffra telemetry audit-log [--export]`.
+Every live `run_with_telemetry` invocation that is OPTED IN to telemetry
+appends one accountability event to `.chaffra-telemetry-audit.log`: a
+`TelemetryEnabled` event recording the resolved audience (and best-effort
+process-owner attribution) when operator telemetry is active (`on` /
+`operator-only`), and a `TelemetryDisabled` event under `user-only` (the
+user-facing surface emits, the operator scope is off).
+
+Under `--telemetry off` the audit log is NOT written (R5-Audit-Off). `off` is
+the operator's explicit "do not emit, write, or leave traces" instruction;
+honouring the kill switch means even the accountability trail stays silent.
+Accountability is preserved for every *opted-in* audience.
+
+The diagnostic previews (`telemetry status` / `test` / `inspect`) deliberately
+do not write to the audit log either — they never ran a workload, so there is
+nothing to record. Inspect or export the log with `chaffra telemetry
+audit-log [--export]`.
 
 ## Backends
 

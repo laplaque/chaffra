@@ -18,7 +18,10 @@
 //! (see `scripts/coverage_check.py::parse_lcov`), so the placement is no
 //! longer load-bearing — it's just idiomatic for behaviour tests.
 
-use chaffra_mcp::tools::{execute_dead_code, execute_health, execute_telemetry};
+use chaffra_mcp::tools::{
+    execute_dead_code, execute_health, execute_telemetry, execute_telemetry_with_config,
+};
+use chaffra_telemetry::{TelemetryAudience, TelemetryConfig};
 use tempfile::TempDir;
 
 /// Write a malformed `.chaffra.toml` into a fresh temp dir.
@@ -140,13 +143,73 @@ fn execute_telemetry_status_and_backends_are_gated_under_default_user_only() {
 }
 
 #[test]
-fn execute_telemetry_status_and_backends_are_populated_under_operator_audience() {
-    // R4-1 parallel (other branch): when the caller opts into an audience
-    // that includes the operator scope, `status` and `backends` MUST return
-    // the configured backend catalogue, not the gated `[]`. Pairs with the
-    // gated test above to pin both arms of the audience gate.
+fn execute_telemetry_ignores_any_caller_supplied_audience_param() {
+    // R5-2: an earlier revision (R4-3) accepted an `audience` parameter on
+    // this tool so the operator branches were reachable from integration
+    // tests; that was a widening attack vector — any MCP client could pass
+    // `audience=on` and read operator data the project's `user-only` default
+    // would have withheld. The parameter is removed; the MCP entry point
+    // ALWAYS runs at the project's resolved audience. Verify the projection
+    // remains `user-only` even when the caller attempts to pass
+    // `audience=on` / `operator-only` — no operator definitions should leak
+    // and the gated `status`/`backends` paths should still return `[]`.
+    let definitions_for = |params: &serde_json::Value| {
+        let result = execute_telemetry(params);
+        assert!(
+            result.is_error.is_none() || result.is_error == Some(false),
+            "snapshot returned an error: {}",
+            result.content[0].text
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.content[0].text).expect("snapshot JSON");
+        parsed["definitions"]
+            .as_object()
+            .expect("definitions object present")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+    };
+    let baseline_defs = definitions_for(&serde_json::json!({ "action": "snapshot" }));
+    for attempt in ["on", "operator-only"] {
+        let widened =
+            definitions_for(&serde_json::json!({ "action": "snapshot", "audience": attempt }));
+        assert_eq!(
+            widened, baseline_defs,
+            "MCP audience='{attempt}' widening attempt altered the definition \
+             set; the param must be ignored, not honored"
+        );
+        assert!(
+            !widened.contains("chaffra.module.call_duration_ms"),
+            "operator definition leaked under MCP audience='{attempt}' widening: {widened:?}"
+        );
+    }
+    // Status/backends must also stay gated against the widening attempt.
     for action in ["status", "backends"] {
-        let result = execute_telemetry(&serde_json::json!({ "action": action, "audience": "on" }));
+        for attempt in ["on", "operator-only"] {
+            let result =
+                execute_telemetry(&serde_json::json!({ "action": action, "audience": attempt }));
+            assert!(result.is_error.is_none() || result.is_error == Some(false));
+            assert_eq!(
+                result.content[0].text.trim(),
+                "[]",
+                "{action} leaked under MCP audience='{attempt}' widening attempt"
+            );
+        }
+    }
+}
+
+#[test]
+fn execute_telemetry_with_config_status_and_backends_populated_under_operator_audience() {
+    // R4-1 parallel (other branch): when the audience includes the operator
+    // scope, `status` and `backends` MUST return the configured backend
+    // catalogue, not the gated `[]`. Exercised through the crate-public
+    // internal helper (R5-2) — external MCP callers cannot reach this branch.
+    let config = TelemetryConfig {
+        audience: TelemetryAudience::On,
+        ..TelemetryConfig::default()
+    };
+    for action in ["status", "backends"] {
+        let result = execute_telemetry_with_config(action, &config);
         assert!(
             result.is_error.is_none() || result.is_error == Some(false),
             "{action} returned an error: {}",
@@ -155,7 +218,7 @@ fn execute_telemetry_status_and_backends_are_populated_under_operator_audience()
         let body = result.content[0].text.trim();
         assert_ne!(
             body, "[]",
-            "{action} under audience=on must NOT be gated, got: {body}"
+            "{action} under audience=On must NOT be gated, got: {body}"
         );
         let parsed: serde_json::Value =
             serde_json::from_str(body).expect("operator-enabled body must be JSON");
@@ -164,18 +227,21 @@ fn execute_telemetry_status_and_backends_are_populated_under_operator_audience()
             .expect("operator-enabled body is an array");
         assert!(
             !arr.is_empty(),
-            "{action} under audience=on must include the configured backends"
+            "{action} under audience=On must include the configured backends"
         );
     }
 }
 
 #[test]
-fn execute_telemetry_snapshot_respects_audience_override() {
-    // R4-3 audience-override path: `audience=on` must surface operator
-    // definitions, mirroring how the CLI's `telemetry inspect --telemetry on`
-    // exposes the full catalogue. This exercises the projection branch the
-    // default-audience test cannot reach.
-    let result = execute_telemetry(&serde_json::json!({ "action": "snapshot", "audience": "on" }));
+fn execute_telemetry_with_config_snapshot_under_operator_audience_includes_operator_defs() {
+    // R4-3 projection (other branch): under `audience=On` the snapshot must
+    // surface operator definitions registered by `register_core_metrics`.
+    // Reached through the crate-public internal helper (R5-2).
+    let config = TelemetryConfig {
+        audience: TelemetryAudience::On,
+        ..TelemetryConfig::default()
+    };
+    let result = execute_telemetry_with_config("snapshot", &config);
     assert!(
         result.is_error.is_none() || result.is_error == Some(false),
         "snapshot returned an error: {}",
@@ -188,22 +254,7 @@ fn execute_telemetry_snapshot_respects_audience_override() {
         .expect("definitions object");
     assert!(
         definitions.contains_key("chaffra.module.call_duration_ms"),
-        "operator definition missing from audience=on MCP snapshot: \
+        "operator definition missing from audience=On MCP snapshot: \
          {definitions:?}"
-    );
-}
-
-#[test]
-fn execute_telemetry_rejects_invalid_audience() {
-    // The audience override is fail-closed: an unrecognised value is a
-    // typed error, not a silent coercion to a default. Matches the CLI's
-    // `--telemetry` and the file `[modules.telemetry] audience` semantics.
-    let result =
-        execute_telemetry(&serde_json::json!({ "action": "snapshot", "audience": "everyone" }));
-    assert_eq!(result.is_error, Some(true));
-    assert!(
-        result.content[0].text.contains("Invalid audience"),
-        "expected invalid-audience error, got: {}",
-        result.content[0].text
     );
 }
