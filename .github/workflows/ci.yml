@@ -144,7 +144,7 @@ jobs:
       # cargo-llvm-cov + cargo-hack for the powerset-accumulation regression.
       # Same pins as the coverage-instrument legs; the installer action is
       # SHA-pinned at the v2 tag.
-      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+      - uses: taiki-e/install-action@ace6ebe54a6a0c86dfb5f7764b17f793b6925bc3 # v2
         with:
           tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},cargo-hack@${{ env.CARGO_HACK_VERSION }}
       # SHA-pinned to the commit at the v5 tag (currently v5.6.0). The
@@ -323,7 +323,7 @@ jobs:
         # Pins: see CARGO_LLVM_COV_VERSION / CARGO_HACK_VERSION in the
         # workflow env block. The installer action is SHA-pinned to the
         # current commit at the v2 tag.
-        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        uses: taiki-e/install-action@ace6ebe54a6a0c86dfb5f7764b17f793b6925bc3 # v2
         with:
           tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},cargo-hack@${{ env.CARGO_HACK_VERSION }}
       - name: Verify resolved head SHA matches checkout
