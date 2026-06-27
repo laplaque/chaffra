@@ -460,9 +460,13 @@ fn merge_telemetry_config(
 /// log on the LIVE path (not the diagnostic previews) where a flush will
 /// actually take place.
 ///
-/// Emission rule, one event per chaffra invocation:
+/// Emission rule, at most one event per chaffra invocation:
 /// - operator-enabled audience (`On` / `OperatorOnly`) -> `log_telemetry_enabled`
-/// - user-only / off -> `log_telemetry_disabled` (operator telemetry stayed off)
+/// - `UserOnly` -> `log_telemetry_disabled` (operator telemetry stayed off)
+/// - `Off` -> NO audit event. `--telemetry off` is an explicit "do not emit,
+///   write, or leave traces" instruction, so the audit log honours the kill
+///   switch and writes nothing (this function returns early). Accountability is
+///   preserved for the audiences that actually run a workload.
 ///
 /// `user` attribution: best-effort from the process environment (`USER` on
 /// unix, `USERNAME` on windows). The audit-log type allows `None`, so we pass
@@ -1397,7 +1401,8 @@ fn cmd_telemetry_test_in(
     project_dir: &Path,
 ) -> Result<String> {
     // Resolve through the live-run precedence chain so the diagnostic flush is
-    // projected to the audience a real run would emit at (file > flag > default).
+    // projected to the audience a real run would emit at (explicit `--telemetry`
+    // flag > file `[modules.telemetry] audience` > default).
     let tel_config = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
 
     // Off short-circuit: when the resolved audience is `Off`, the live-run
@@ -1466,7 +1471,8 @@ fn cmd_telemetry_inspect_in(
     project_dir: &Path,
 ) -> Result<String> {
     // Resolve through the live-run precedence chain so the previewed payload
-    // matches a real flush at the resolved audience (file > flag > default).
+    // matches a real flush at the resolved audience (explicit `--telemetry` flag
+    // > file `[modules.telemetry] audience` > default).
     let tel_config = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
     let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
@@ -1580,12 +1586,14 @@ where
     let effective_config = merge_telemetry_config(tel_config, project_config)?;
 
     // Emit the Phase 14 audit-log accountability event at the live boundary,
-    // BEFORE the Off short-circuit and before any backend write. The `Off`
-    // branch is still an active "telemetry was disabled" record for GDPR
-    // purposes, and `maybe_audit_log_audience` emits the appropriate
-    // `TelemetryDisabled` event under `Off`/`UserOnly`. The
-    // diagnostic-preview helpers (`status`/`test`/`inspect`) deliberately do
-    // NOT call this — they don't run the workload, so they don't log.
+    // BEFORE the Off short-circuit and before any backend write.
+    // `maybe_audit_log_audience` emits `TelemetryEnabled` for operator audiences
+    // (`On`/`OperatorOnly`) and `TelemetryDisabled` for `UserOnly`; under `Off`
+    // it writes NO event (R5-Audit-Off) — `--telemetry off` is the operator's
+    // explicit "leave no traces" instruction, so the audit log honours the kill
+    // switch. The diagnostic-preview helpers (`status`/`test`/`inspect`)
+    // deliberately do NOT call this — they don't run the workload, so they don't
+    // log.
     maybe_audit_log_audience(effective_config.audience);
 
     if matches!(

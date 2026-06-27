@@ -254,10 +254,12 @@ pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
 
 /// Internal helper exposing the body of [`execute_telemetry`] with a
 /// caller-supplied `TelemetryConfig`. EXISTS FOR TESTS ONLY — production
-/// callers must go through [`execute_telemetry`], which pins the config to
-/// the project default and cannot widen the audience. Direct callers
-/// constructing their own `TelemetryConfig` are doing privileged work; the
-/// MCP transport never reaches this entry point.
+/// callers must go through [`execute_telemetry`], which resolves the audience
+/// strictly from the project's `.chaffra.toml` (honouring a
+/// `[modules.telemetry] audience` opt-in, defaulting to `user-only`) and cannot
+/// be widened by a request parameter. Direct callers constructing their own
+/// `TelemetryConfig` are doing privileged work; the MCP transport never reaches
+/// this entry point.
 pub fn execute_telemetry_with_config(
     action: &str,
     config: &chaffra_telemetry::TelemetryConfig,
@@ -271,9 +273,10 @@ pub fn execute_telemetry_with_config(
             // connectivity state). Match the `TelemetryModule::analyze`
             // backend-status finding rule (R4-1): expose only when the
             // resolved audience includes the operator scope (`On` /
-            // `OperatorOnly`). The MCP entry point runs against a default
-            // `TelemetryConfig`, so `user-only` (the new default) returns an
-            // empty list rather than leaking the backend catalogue.
+            // `OperatorOnly`). The MCP entry point resolves the audience from
+            // the project's `.chaffra.toml`, so the default `user-only` returns
+            // an empty list, while a `[modules.telemetry] audience = "on" |
+            // "operator-only"` opt-in (R4-F1) surfaces the backend catalogue.
             if !config.audience.operator_enabled() {
                 return ToolCallResult::text("[]".to_owned());
             }
