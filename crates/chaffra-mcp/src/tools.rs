@@ -185,9 +185,11 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
 /// Execute the chaffra/telemetry tool.
 ///
 /// Returns the project's resolved telemetry view. The MCP entry point ALWAYS
-/// runs against `TelemetryConfig::default()` (Phase 15a.1 privacy default:
-/// `user-only`); an MCP caller cannot widen the audience to see operator data
-/// the project default would withhold.
+/// runs at the project's resolved audience — a project with no
+/// `[modules.telemetry]` section falls back to the Phase 15a.1 privacy default
+/// (`user-only`). An MCP caller cannot widen the audience to see operator data
+/// the project configuration would withhold (the audience is never taken from
+/// request params; see R5-2 below).
 ///
 /// Config resolution (R4-F1): the telemetry config is resolved from the
 /// project's `.chaffra.toml` through the SAME strict loader the other MCP

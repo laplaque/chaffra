@@ -170,10 +170,15 @@ Audience-gated output beyond the snapshot itself (R4):
 - The MCP `chaffra/telemetry` tool's `status` and `backends` actions (backend
   connectivity / catalogue) follow the same gate. The `snapshot` action
   projects via `project_for_audience(config.audience)` before serializing.
-- The MCP tool ALWAYS runs at the project's default audience (`user-only`);
-  there is no caller-supplied `audience` override (R5-2). To preview other
-  audiences, use the CLI's `chaffra telemetry inspect --telemetry <audience>`
-  diagnostic, the trusted operator-side entry point.
+- The MCP tool ALWAYS runs at the project's **resolved** audience: it loads the
+  `path` repository root's `.chaffra.toml` through the same strict loader as the
+  other tools and honours a `[modules.telemetry] audience` opt-in, falling back
+  to the `user-only` default when the section is absent (R4-F1). A malformed
+  config, an invalid `audience`, or an unresolvable `path` fails closed with a
+  typed error. There is no caller-supplied `audience` override — the audience is
+  never read from request params (R5-2). To preview other audiences, use the
+  CLI's `chaffra telemetry inspect --telemetry <audience>` diagnostic, the
+  trusted operator-side entry point.
 
 #### GDPR rationale
 
