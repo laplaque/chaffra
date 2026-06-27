@@ -21,7 +21,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "chaffra/telemetry".to_owned(),
-            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot. Always returns the project's resolved view at the Phase 15a.1 privacy default ('user-only'); operator-scoped fields are withheld. To preview operator-scoped output, use the CLI 'chaffra telemetry inspect --telemetry <audience>'.".to_owned(),
+            description: "Query telemetry configuration: default backend setup, available backends, and preview metrics snapshot. Resolves the project's '.chaffra.toml' [modules.telemetry] audience as the operator opt-in (default 'user-only'); operator-scoped fields are withheld unless the project file opts in. There is no request parameter to widen the audience.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -29,6 +29,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Action to perform: 'status', 'snapshot', or 'backends'",
                         "enum": ["status", "snapshot", "backends"]
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the repository root whose .chaffra.toml resolves the telemetry audience (defaults to current directory)"
                     }
                 },
                 "required": []
@@ -183,23 +187,66 @@ pub fn execute_explain(params: &serde_json::Value) -> ToolCallResult {
 /// Returns the project's resolved telemetry view. The MCP entry point ALWAYS
 /// runs against `TelemetryConfig::default()` (Phase 15a.1 privacy default:
 /// `user-only`); an MCP caller cannot widen the audience to see operator data
-/// the project default would withhold. To preview other audiences, use the
-/// CLI's `chaffra telemetry inspect --telemetry <audience>` diagnostic, which
-/// is the trusted operator-side entry point.
+/// the project default would withhold.
 ///
-/// (R5-2: an earlier revision accepted an `audience` parameter on this tool
-/// to make the operator branches reachable from integration tests. That was
-/// a widening attack vector — any MCP client could pass `audience=on` and
-/// bypass the privacy default. The parameter is removed; the operator
-/// branches are exercised through the crate-internal
-/// [`execute_telemetry_with_config`] helper instead, which is not reachable
-/// from external MCP callers.)
+/// Config resolution (R4-F1): the telemetry config is resolved from the
+/// project's `.chaffra.toml` through the SAME strict loader the other MCP
+/// tools and the CLI use — `ChaffraConfig::load_from_dir` (fail-closed on a
+/// malformed/unreadable file) followed by
+/// `TelemetryConfig::from_module_config` on the `[modules.telemetry]` section
+/// (fail-closed on an invalid `audience`). There is no parallel
+/// `TelemetryConfig::default()` path. This makes `[modules.telemetry]
+/// audience = "on" | "operator-only"` an explicit operator opt-in for this
+/// surface too, and surfaces malformed config as an error instead of
+/// silently defaulting.
+///
+/// (R5-2: the audience is NEVER taken from the request params — the only
+/// audience source is the project file, which an MCP client cannot tamper
+/// with, so a caller cannot widen past the project's configured audience.
+/// An earlier revision accepted an `audience` parameter here; that was a
+/// widening attack vector and was removed. The operator branches are
+/// exercised through the crate-internal [`execute_telemetry_with_config`]
+/// helper, which is not reachable from external MCP callers.)
 pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
     let action = params
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("status");
-    let config = chaffra_telemetry::TelemetryConfig::default();
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+    let root = match Path::new(path).canonicalize() {
+        Ok(r) => r,
+        Err(e) => return ToolCallResult::error(format!("Invalid path: {e}")),
+    };
+
+    // Strict, shared config path (fail closed) — mirrors `execute_health` /
+    // `execute_dead_code` and the CLI `load_config`.
+    let project_config = match ChaffraConfig::load_from_dir(&root) {
+        Ok(c) => c,
+        Err(e) => return ToolCallResult::error(format!("Invalid configuration: {e}")),
+    };
+
+    // Derive the telemetry config from the project's `[modules.telemetry]`
+    // section. Absent section -> `TelemetryConfig::default()` (audience =
+    // `user-only`). Present section -> `from_module_config`, which defaults
+    // the audience to `user-only` when the key is absent and fails closed on
+    // an invalid `audience` value. No CLI flag participates on this surface,
+    // so the file audience is the sole opt-in and cannot be widened by a
+    // request param.
+    let module_cfg = project_config.module_config("telemetry");
+    let config = if module_cfg.is_empty() {
+        chaffra_telemetry::TelemetryConfig::default()
+    } else {
+        match chaffra_telemetry::TelemetryConfig::from_module_config(&module_cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolCallResult::error(format!(
+                    "Invalid [modules.telemetry] configuration: {e}"
+                ));
+            }
+        }
+    };
+
     execute_telemetry_with_config(action, &config)
 }
 

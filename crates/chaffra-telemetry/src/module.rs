@@ -223,8 +223,8 @@ impl AnalysisModule for TelemetryModule {
             "metric-summary" => Ok(RuleExplanation {
                 rule_id: "metric-summary".to_owned(),
                 name: "Metric summary".to_owned(),
-                description: "Summarizes the telemetry collected during the current analysis run, including file counts, finding counts, per-module durations, and span data.".to_owned(),
-                rationale: "Provides a single finding that aggregates the full telemetry state for inspection or logging.".to_owned(),
+                description: "Summarizes the telemetry collected during the current analysis run (file counts, finding counts, and other user-facing summary fields). The finding is built from the audience-PROJECTED snapshot, so operator-scoped detail (per-module durations, operator data-point/span counts) is included only when the resolved audience permits it and is withheld under `user-only`.".to_owned(),
+                rationale: "Provides a single finding that aggregates the audience-projected telemetry state for inspection or logging.".to_owned(),
                 default_severity: Severity::Info,
                 suppression_syntax: "// chaffra:ignore metric-summary".to_owned(),
                 examples: vec![

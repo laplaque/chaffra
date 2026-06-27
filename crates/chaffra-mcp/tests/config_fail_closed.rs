@@ -39,6 +39,24 @@ fn dir_with_malformed_config() -> TempDir {
     dir
 }
 
+/// Fresh temp dir, optionally containing a `.chaffra.toml` with the given
+/// body. `None` => no config file (the project default, `user-only`, applies).
+fn dir_with_chaffra_toml(body: Option<&str>) -> TempDir {
+    let dir = TempDir::new().expect("create tempdir");
+    if let Some(b) = body {
+        std::fs::write(dir.path().join(".chaffra.toml"), b).expect("write .chaffra.toml");
+    }
+    dir
+}
+
+/// Run `chaffra/telemetry` against a specific project directory.
+fn telemetry_in(dir: &TempDir, action: &str) -> chaffra_mcp::protocol::ToolCallResult {
+    execute_telemetry(&serde_json::json!({
+        "action": action,
+        "path": dir.path().to_str().unwrap(),
+    }))
+}
+
 #[test]
 fn execute_health_fails_closed_on_malformed_config() {
     // The old `.unwrap_or_default()` silently ran against the default config.
@@ -77,171 +95,10 @@ fn execute_dead_code_fails_closed_on_malformed_config() {
     );
 }
 
-#[test]
-fn execute_telemetry_snapshot_is_projected_under_default_user_only() {
-    // R4-3: `chaffra/telemetry` action=snapshot must serialize an
-    // audience-PROJECTED snapshot, not the raw collector output. The MCP
-    // tool runs against a default `TelemetryConfig`, whose audience is
-    // `user-only` (Phase 15a.1 privacy default). Under `user-only` the
-    // projection drops `operator_summary` (set to the default empty form),
-    // all operator-scoped data points, spans, and operator-only definitions.
-    // The serialized payload must reflect that — specifically, the
-    // operator-summary fields (`module_call_durations`, `module_error_counts`)
-    // are empty in the default form, but more importantly the operator
-    // metric names registered by `register_core_metrics` (e.g.
-    // `chaffra.module.call_duration_ms`) must NOT appear in the serialized
-    // `definitions` map.
-    let result = execute_telemetry(&serde_json::json!({ "action": "snapshot" }));
-    assert!(
-        result.is_error.is_none() || result.is_error == Some(false),
-        "snapshot returned an error: {}",
-        result.content[0].text
-    );
-    let body = &result.content[0].text;
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).expect("snapshot output must be JSON");
-
-    let definitions = parsed
-        .get("definitions")
-        .and_then(|d| d.as_object())
-        .expect("definitions object present in snapshot JSON");
-    // The OPERATOR-scoped definitions registered by `register_core_metrics`
-    // must NOT appear in the user-only projected payload. Spot-check the
-    // most operator-disclosing one.
-    assert!(
-        !definitions.contains_key("chaffra.module.call_duration_ms"),
-        "operator definition leaked into user-only MCP snapshot: {definitions:?}"
-    );
-    // The user-facing definitions DO survive — sanity check that projection
-    // is "drop operator", not "drop everything".
-    assert!(
-        definitions.contains_key("chaffra.analysis.findings_total"),
-        "user-facing definition was dropped from user-only MCP snapshot: \
-         {definitions:?}"
-    );
-}
-
-#[test]
-fn execute_telemetry_status_and_backends_are_gated_under_default_user_only() {
-    // R4-1 parallel: `status` (backend connectivity) and `backends` (kind /
-    // endpoint / path) are operator-disclosing. Under the default `user-only`
-    // audience they must return an empty list rather than leak the
-    // configured backend catalogue.
-    for action in ["status", "backends"] {
-        let result = execute_telemetry(&serde_json::json!({ "action": action }));
-        assert!(
-            result.is_error.is_none() || result.is_error == Some(false),
-            "{action} returned an error: {}",
-            result.content[0].text
-        );
-        let body = result.content[0].text.trim();
-        assert_eq!(
-            body, "[]",
-            "{action} must return [] under default (user-only) audience, got: {body}"
-        );
-    }
-}
-
-#[test]
-fn execute_telemetry_ignores_any_caller_supplied_audience_param() {
-    // R5-2: an earlier revision (R4-3) accepted an `audience` parameter on
-    // this tool so the operator branches were reachable from integration
-    // tests; that was a widening attack vector — any MCP client could pass
-    // `audience=on` and read operator data the project's `user-only` default
-    // would have withheld. The parameter is removed; the MCP entry point
-    // ALWAYS runs at the project's resolved audience. Verify the projection
-    // remains `user-only` even when the caller attempts to pass
-    // `audience=on` / `operator-only` — no operator definitions should leak
-    // and the gated `status`/`backends` paths should still return `[]`.
-    let definitions_for = |params: &serde_json::Value| {
-        let result = execute_telemetry(params);
-        assert!(
-            result.is_error.is_none() || result.is_error == Some(false),
-            "snapshot returned an error: {}",
-            result.content[0].text
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result.content[0].text).expect("snapshot JSON");
-        parsed["definitions"]
-            .as_object()
-            .expect("definitions object present")
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<String>>()
-    };
-    let baseline_defs = definitions_for(&serde_json::json!({ "action": "snapshot" }));
-    for attempt in ["on", "operator-only"] {
-        let widened =
-            definitions_for(&serde_json::json!({ "action": "snapshot", "audience": attempt }));
-        assert_eq!(
-            widened, baseline_defs,
-            "MCP audience='{attempt}' widening attempt altered the definition \
-             set; the param must be ignored, not honored"
-        );
-        assert!(
-            !widened.contains("chaffra.module.call_duration_ms"),
-            "operator definition leaked under MCP audience='{attempt}' widening: {widened:?}"
-        );
-    }
-    // Status/backends must also stay gated against the widening attempt.
-    for action in ["status", "backends"] {
-        for attempt in ["on", "operator-only"] {
-            let result =
-                execute_telemetry(&serde_json::json!({ "action": action, "audience": attempt }));
-            assert!(result.is_error.is_none() || result.is_error == Some(false));
-            assert_eq!(
-                result.content[0].text.trim(),
-                "[]",
-                "{action} leaked under MCP audience='{attempt}' widening attempt"
-            );
-        }
-    }
-}
-
-#[test]
-fn execute_telemetry_with_config_status_and_backends_populated_under_operator_audience() {
-    // R4-1 parallel (other branch): when the audience includes the operator
-    // scope, `status` and `backends` MUST return the configured backend
-    // catalogue, not the gated `[]`. Exercised through the crate-public
-    // internal helper (R5-2) — external MCP callers cannot reach this branch.
-    let config = TelemetryConfig {
-        audience: TelemetryAudience::On,
-        ..TelemetryConfig::default()
-    };
-    for action in ["status", "backends"] {
-        let result = execute_telemetry_with_config(action, &config);
-        assert!(
-            result.is_error.is_none() || result.is_error == Some(false),
-            "{action} returned an error: {}",
-            result.content[0].text
-        );
-        let body = result.content[0].text.trim();
-        assert_ne!(
-            body, "[]",
-            "{action} under audience=On must NOT be gated, got: {body}"
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(body).expect("operator-enabled body must be JSON");
-        let arr = parsed
-            .as_array()
-            .expect("operator-enabled body is an array");
-        assert!(
-            !arr.is_empty(),
-            "{action} under audience=On must include the configured backends"
-        );
-    }
-}
-
-#[test]
-fn execute_telemetry_with_config_snapshot_under_operator_audience_includes_operator_defs() {
-    // R4-3 projection (other branch): under `audience=On` the snapshot must
-    // surface operator definitions registered by `register_core_metrics`.
-    // Reached through the crate-public internal helper (R5-2).
-    let config = TelemetryConfig {
-        audience: TelemetryAudience::On,
-        ..TelemetryConfig::default()
-    };
-    let result = execute_telemetry_with_config("snapshot", &config);
+/// Extract the `definitions` key-set from a telemetry `snapshot` result.
+fn snapshot_definition_keys(
+    result: &chaffra_mcp::protocol::ToolCallResult,
+) -> std::collections::BTreeSet<String> {
     assert!(
         result.is_error.is_none() || result.is_error == Some(false),
         "snapshot returned an error: {}",
@@ -249,12 +106,211 @@ fn execute_telemetry_with_config_snapshot_under_operator_audience_includes_opera
     );
     let parsed: serde_json::Value =
         serde_json::from_str(&result.content[0].text).expect("snapshot JSON");
-    let definitions = parsed["definitions"]
+    parsed["definitions"]
         .as_object()
-        .expect("definitions object");
+        .expect("definitions object present")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn execute_telemetry_snapshot_is_projected_under_default_user_only() {
+    // R4-3: `chaffra/telemetry` action=snapshot serializes an
+    // audience-PROJECTED snapshot. A project dir with NO `.chaffra.toml`
+    // resolves to the privacy default (`user-only`), under which the
+    // operator definitions registered by `register_core_metrics` (e.g.
+    // `chaffra.module.call_duration_ms`) must NOT appear, while user-facing
+    // definitions survive.
+    let dir = dir_with_chaffra_toml(None);
+    let defs = snapshot_definition_keys(&telemetry_in(&dir, "snapshot"));
     assert!(
-        definitions.contains_key("chaffra.module.call_duration_ms"),
-        "operator definition missing from audience=On MCP snapshot: \
-         {definitions:?}"
+        !defs.contains("chaffra.module.call_duration_ms"),
+        "operator definition leaked into user-only MCP snapshot: {defs:?}"
     );
+    assert!(
+        defs.contains("chaffra.analysis.findings_total"),
+        "user-facing definition dropped from user-only MCP snapshot: {defs:?}"
+    );
+}
+
+#[test]
+fn execute_telemetry_status_and_backends_gated_under_default_user_only() {
+    // R4-1 parallel: `status` / `backends` are operator-disclosing; under the
+    // default `user-only` audience (no project config) they return `[]`.
+    let dir = dir_with_chaffra_toml(None);
+    for action in ["status", "backends"] {
+        let result = telemetry_in(&dir, action);
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+        assert_eq!(
+            result.content[0].text.trim(),
+            "[]",
+            "{action} must return [] under default (user-only) audience"
+        );
+    }
+}
+
+#[test]
+fn execute_telemetry_honors_project_file_audience_opt_in() {
+    // R4-F1: `[modules.telemetry] audience = "on"` in the project's
+    // `.chaffra.toml` is an explicit operator opt-in for this MCP surface,
+    // resolved through the SAME strict loader as the other tools (no parallel
+    // `TelemetryConfig::default()` path). Under the opt-in, `status` /
+    // `backends` return the configured backend catalogue and `snapshot`
+    // surfaces operator definitions.
+    let dir = dir_with_chaffra_toml(Some("[modules.telemetry]\naudience = \"on\"\n"));
+
+    for action in ["status", "backends"] {
+        let result = telemetry_in(&dir, action);
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+        let body = result.content[0].text.trim();
+        assert_ne!(
+            body, "[]",
+            "{action} under file audience=on must NOT be gated, got: {body}"
+        );
+        let arr: serde_json::Value = serde_json::from_str(body).expect("JSON array");
+        assert!(
+            arr.as_array().is_some_and(|a| !a.is_empty()),
+            "{action} under file audience=on must include the configured backends"
+        );
+    }
+
+    let defs = snapshot_definition_keys(&telemetry_in(&dir, "snapshot"));
+    assert!(
+        defs.contains("chaffra.module.call_duration_ms"),
+        "operator definition missing from file-audience=on MCP snapshot: {defs:?}"
+    );
+}
+
+#[test]
+fn execute_telemetry_honors_project_file_audience_operator_only() {
+    // R4-F1: `operator-only` is also a valid file opt-in; `status` must
+    // surface the backend catalogue.
+    let dir = dir_with_chaffra_toml(Some("[modules.telemetry]\naudience = \"operator-only\"\n"));
+    let result = telemetry_in(&dir, "status");
+    assert!(result.is_error.is_none() || result.is_error == Some(false));
+    assert_ne!(
+        result.content[0].text.trim(),
+        "[]",
+        "status under file audience=operator-only must NOT be gated"
+    );
+}
+
+#[test]
+fn execute_telemetry_fails_closed_on_malformed_project_config() {
+    // R4-F1: a malformed `.chaffra.toml` must fail closed for this tool too,
+    // not silently default — matching `execute_health` / `execute_dead_code`.
+    let dir = dir_with_malformed_config();
+    let result = telemetry_in(&dir, "snapshot");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "chaffra/telemetry must fail closed on malformed .chaffra.toml"
+    );
+    assert!(
+        result.content[0].text.contains("Invalid configuration"),
+        "expected config error, got: {}",
+        result.content[0].text
+    );
+}
+
+#[test]
+fn execute_telemetry_fails_closed_on_invalid_audience_value() {
+    // R4-F1: an invalid `[modules.telemetry] audience` value is surfaced as
+    // an error (via `from_module_config`), never coerced to a wider default.
+    let dir = dir_with_chaffra_toml(Some("[modules.telemetry]\naudience = \"everyone\"\n"));
+    let result = telemetry_in(&dir, "snapshot");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "chaffra/telemetry must fail closed on an invalid audience value"
+    );
+    assert!(
+        result.content[0]
+            .text
+            .contains("Invalid [modules.telemetry] configuration"),
+        "expected telemetry-config error, got: {}",
+        result.content[0].text
+    );
+}
+
+#[test]
+fn execute_telemetry_rejects_unresolvable_path() {
+    // The `path` param is canonicalized (mirroring `execute_health`); a path
+    // that cannot be resolved is surfaced as an error rather than silently
+    // falling back to the current directory.
+    let result = execute_telemetry(&serde_json::json!({
+        "action": "snapshot",
+        "path": "/no/such/chaffra/dir/definitely/missing",
+    }));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "chaffra/telemetry must error on an unresolvable path"
+    );
+    assert!(
+        result.content[0].text.contains("Invalid path"),
+        "expected path error, got: {}",
+        result.content[0].text
+    );
+}
+
+#[test]
+fn execute_telemetry_ignores_caller_supplied_audience_param() {
+    // R5-2: the audience is resolved ONLY from the project file, never from
+    // request params. A caller passing `audience=on` against a default
+    // (user-only) project must NOT widen the output: definitions stay
+    // user-only and the gated actions stay `[]`. The param is simply ignored.
+    let dir = dir_with_chaffra_toml(None);
+
+    let baseline = snapshot_definition_keys(&telemetry_in(&dir, "snapshot"));
+    for attempt in ["on", "operator-only"] {
+        let widened = snapshot_definition_keys(&execute_telemetry(&serde_json::json!({
+            "action": "snapshot",
+            "path": dir.path().to_str().unwrap(),
+            "audience": attempt,
+        })));
+        assert_eq!(
+            widened, baseline,
+            "MCP audience='{attempt}' request param widened the snapshot; it must be ignored"
+        );
+        assert!(
+            !widened.contains("chaffra.module.call_duration_ms"),
+            "operator definition leaked under MCP audience='{attempt}' request param"
+        );
+    }
+    for action in ["status", "backends"] {
+        for attempt in ["on", "operator-only"] {
+            let result = execute_telemetry(&serde_json::json!({
+                "action": action,
+                "path": dir.path().to_str().unwrap(),
+                "audience": attempt,
+            }));
+            assert!(result.is_error.is_none() || result.is_error == Some(false));
+            assert_eq!(
+                result.content[0].text.trim(),
+                "[]",
+                "{action} leaked under MCP audience='{attempt}' request param"
+            );
+        }
+    }
+}
+
+#[test]
+fn execute_telemetry_with_config_status_and_backends_populated_under_operator_audience() {
+    // The crate-internal helper drives the operator branches directly (used
+    // here and reachable only in-crate). Pairs with the file-audience tests
+    // above which exercise the same branches through the public entry point.
+    let config = TelemetryConfig {
+        audience: TelemetryAudience::On,
+        ..TelemetryConfig::default()
+    };
+    for action in ["status", "backends"] {
+        let result = execute_telemetry_with_config(action, &config);
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+        let body = result.content[0].text.trim();
+        assert_ne!(body, "[]", "{action} under audience=On must NOT be gated");
+        let arr: serde_json::Value = serde_json::from_str(body).expect("JSON array");
+        assert!(arr.as_array().is_some_and(|a| !a.is_empty()));
+    }
 }

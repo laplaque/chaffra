@@ -110,9 +110,15 @@ Health score, grade, and per-file breakdown.
 
 Active configuration (redacted secrets).
 
+The default audience is `UserOnly`. The `audience` and `sampling_strategy`
+values are the `TelemetryAudience` / `SamplingStrategy` enum variant names
+(the API serializes them with their Rust debug representation), distinct from
+the kebab-case spelling accepted on input (`[modules.telemetry] audience =
+"user-only"`, `--telemetry user-only`).
+
 ```json
 {
-  "audience": "user-only",
+  "audience": "UserOnly",
   "sampling_rate": 1.0,
   "sampling_strategy": "Rate",
   "backends": ["JsonFile"]

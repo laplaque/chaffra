@@ -931,10 +931,12 @@ class TestMalformedLcovTable(CheckerTestCase):
     """
 
     # Active SF blocks require exactly one LF and exactly one LH, validated
-    # under: LH<=LF; LF>=unique DA lines; LH>=unique hit DA lines; and the
-    # reconciliation bound (LH - covered_DA) <= (LF - unique_DA). Violations
-    # exit 2 with a failure artifact. See parse_lcov's docstring for the
-    # full contract.
+    # under: LH<=LF; LF>=unique DA lines; and the unseen-hits reconciliation
+    # bound (effective_LH - covered_DA) <= (LF - unique_DA). LH is NOT
+    # required to be >= unique-hit-DA — the parser clamps an LH that
+    # undercounts the DA hit detail (a benign LLVM llvm-cov export quirk; see
+    # test_lh_undercount_is_tolerated and parse_lcov's docstring). Violations
+    # of the remaining bounds exit 2 with a failure artifact.
     CASES: list[tuple[str, str]] = [
         ("non-numeric DA hits", "SF:foo.rs\nDA:1,not-a-number\nend_of_record\n"),
         ("missing end_of_record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\n"),
