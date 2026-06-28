@@ -18,10 +18,7 @@
 //! (see `scripts/coverage_check.py::parse_lcov`), so the placement is no
 //! longer load-bearing — it's just idiomatic for behaviour tests.
 
-use chaffra_mcp::tools::{
-    execute_dead_code, execute_health, execute_telemetry, execute_telemetry_with_config,
-};
-use chaffra_telemetry::{TelemetryAudience, TelemetryConfig};
+use chaffra_mcp::tools::{execute_dead_code, execute_health, execute_telemetry};
 use tempfile::TempDir;
 
 /// Write a malformed `.chaffra.toml` into a fresh temp dir.
@@ -293,24 +290,5 @@ fn execute_telemetry_ignores_caller_supplied_audience_param() {
                 "{action} leaked under MCP audience='{attempt}' request param"
             );
         }
-    }
-}
-
-#[test]
-fn execute_telemetry_with_config_status_and_backends_populated_under_operator_audience() {
-    // The crate-internal helper drives the operator branches directly (used
-    // here and reachable only in-crate). Pairs with the file-audience tests
-    // above which exercise the same branches through the public entry point.
-    let config = TelemetryConfig {
-        audience: TelemetryAudience::On,
-        ..TelemetryConfig::default()
-    };
-    for action in ["status", "backends"] {
-        let result = execute_telemetry_with_config(action, &config);
-        assert!(result.is_error.is_none() || result.is_error == Some(false));
-        let body = result.content[0].text.trim();
-        assert_ne!(body, "[]", "{action} under audience=On must NOT be gated");
-        let arr: serde_json::Value = serde_json::from_str(body).expect("JSON array");
-        assert!(arr.as_array().is_some_and(|a| !a.is_empty()));
     }
 }

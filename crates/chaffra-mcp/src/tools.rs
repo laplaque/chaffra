@@ -252,15 +252,17 @@ pub fn execute_telemetry(params: &serde_json::Value) -> ToolCallResult {
     execute_telemetry_with_config(action, &config)
 }
 
-/// Internal helper exposing the body of [`execute_telemetry`] with a
-/// caller-supplied `TelemetryConfig`. EXISTS FOR TESTS ONLY — production
-/// callers must go through [`execute_telemetry`], which resolves the audience
-/// strictly from the project's `.chaffra.toml` (honouring a
-/// `[modules.telemetry] audience` opt-in, defaulting to `user-only`) and cannot
-/// be widened by a request parameter. Direct callers constructing their own
-/// `TelemetryConfig` are doing privileged work; the MCP transport never reaches
-/// this entry point.
-pub fn execute_telemetry_with_config(
+/// Crate-private helper holding the body of [`execute_telemetry`] for a
+/// fully-resolved `TelemetryConfig`. It is `pub(crate)`, NOT `pub`: the only
+/// externally reachable MCP telemetry entry point is [`execute_telemetry`],
+/// which resolves the audience strictly from the project's `.chaffra.toml`
+/// (honouring a `[modules.telemetry] audience` opt-in, defaulting to
+/// `user-only`) and cannot be widened by a request parameter. Keeping this
+/// helper crate-private prevents an out-of-crate caller from supplying an
+/// arbitrary `TelemetryConfig` and bypassing that project-resolved audience
+/// boundary. The operator-branch coverage that previously lived in an
+/// integration test now runs as an in-crate unit test (see `mod tests`).
+pub(crate) fn execute_telemetry_with_config(
     action: &str,
     config: &chaffra_telemetry::TelemetryConfig,
 ) -> ToolCallResult {
@@ -470,5 +472,27 @@ mod tests {
         let host = build_module_host();
         let list = host.list();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn execute_telemetry_with_config_status_and_backends_populated_under_operator_audience() {
+        // The crate-internal helper drives the operator branches directly. It is
+        // `pub(crate)`, so this MUST be an in-crate unit test — an integration
+        // test could not (and must not) reach it. Pairs with the
+        // file-`audience=on` tests in `tests/config_fail_closed.rs`, which
+        // exercise the same branches through the public `execute_telemetry`
+        // entry point.
+        let config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            ..chaffra_telemetry::TelemetryConfig::default()
+        };
+        for action in ["status", "backends"] {
+            let result = execute_telemetry_with_config(action, &config);
+            assert!(result.is_error.is_none() || result.is_error == Some(false));
+            let body = result.content[0].text.trim();
+            assert_ne!(body, "[]", "{action} under audience=On must NOT be gated");
+            let arr: serde_json::Value = serde_json::from_str(body).expect("JSON array");
+            assert!(arr.as_array().is_some_and(|a| !a.is_empty()));
+        }
     }
 }

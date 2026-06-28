@@ -342,10 +342,20 @@ chaffra telemetry audit-log   # Display telemetry audit log
 
 Tool name: `chaffra/telemetry`
 
-Actions (returns default configuration, not live analysis state):
-- `status` -- default backend configuration and availability
-- `snapshot` -- preview metrics snapshot (core metrics registered but no analysis data)
-- `backends` -- list of default backend definitions and their types
+The tool resolves the project's telemetry config strictly from the `path`
+repository root's `.chaffra.toml` (the optional `path` param defaults to the
+current directory) — the same strict loader the other MCP tools and the CLI
+use. A `[modules.telemetry] audience` opt-in is honoured; absent that, the
+audience is the `user-only` default. Operator-shaped output (`status` /
+`backends`) is withheld under `user-only` and surfaces only when the project
+file opts in with `audience = "on"` / `"operator-only"`. There is no request
+parameter that can widen the audience, and a malformed config or invalid
+`audience` fails closed with an error.
+
+Actions (project-resolved configuration, not live analysis state):
+- `status` -- configured backend availability at the resolved audience (`[]` under `user-only`)
+- `snapshot` -- audience-projected metrics snapshot (core metrics registered but no analysis data)
+- `backends` -- configured backend definitions and their types at the resolved audience (`[]` under `user-only`)
 
 ## gRPC Service
 
