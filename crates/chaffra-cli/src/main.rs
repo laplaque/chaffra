@@ -248,7 +248,10 @@ enum Command {
     /// Start a standalone management HTTP server for telemetry inspection.
     ///
     /// Serves an empty collector with core metric definitions registered.
-    /// Useful for verifying the dashboard UI, API shape, and backend connectivity.
+    /// Useful for verifying the dashboard UI and API shape. Backend status
+    /// (kind/connectivity) is operator-shaped and is disclosed only when started
+    /// with an operator audience (`--telemetry on|operator-only`); a default
+    /// (user-only) run returns an empty backends list.
     /// Co-located mode (sharing a live collector from watch/MCP/LSP) is planned.
     Management {
         /// Port to bind the management server to.

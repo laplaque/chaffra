@@ -191,6 +191,16 @@ Audience-gated output beyond the snapshot itself (R4):
   never read from request params (R5-2). To preview other audiences, use the
   CLI's `chaffra telemetry inspect --telemetry <audience>` diagnostic, the
   trusted operator-side entry point.
+- The **management HTTP server** (`chaffra management`, see
+  [`management.md`](management.md)) is an output boundary too: every handler that
+  reads the collector snapshot projects it via
+  `project_for_audience(config.audience)` before serializing, so under the default
+  `user-only` it discloses no operator data points or per-module timing/error
+  state. Backend kind/connectivity is operator-shaped *config metadata* (not part
+  of the snapshot) and carries its own `operator_enabled()` gate on the `metrics`
+  and `config` endpoints. The co-located live-collector / history integration is
+  deferred (Stage 15a.3); the audience gate on the standalone outputs is enforced
+  now.
 
 #### GDPR rationale
 
@@ -348,6 +358,17 @@ chaffra telemetry audit-log   # Display telemetry audit log
   builds let a checked-in `[modules.telemetry] audience` override the command
   line; it no longer can. In particular `--telemetry off` (or `user-only`) on
   the command line can no longer be re-enabled or widened by a committed config.
+- **A file `[modules.telemetry] backend` now takes effect on live CLI runs.**
+  Earlier builds applied the file's `audience`/sampling but dropped its
+  `backend`, so a checked-in `backend = "stderr"` was silently ignored on a live
+  CLI run (the default JSON-file sink was used instead). The file backend is now
+  honoured when no `--telemetry-backend` / `--telemetry-endpoint` is given; an
+  explicit CLI backend selector still wins (precedence: CLI backend > file
+  `backend` > default).
+- **Audience aliases tightened.** `audience` accepts only `on` / `off` /
+  `user-only` / `operator-only` (plus the snake_case `user_only` /
+  `operator_only`). The previously-accepted bare `user` / `operator` and the
+  `true` / `1` / `false` / `0` spellings now fail closed.
 - **Spans and operator metric definitions are now stripped under `user-only`.**
   Module trace/timing spans are operator-scoped, and the operator metric
   *definition* catalogue is withheld too, so a `user-only` payload no longer

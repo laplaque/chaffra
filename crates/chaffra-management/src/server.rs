@@ -295,10 +295,16 @@ mod tests {
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            !parsed["backends"].as_array().unwrap().is_empty(),
-            "backend status must be present under an operator audience: {parsed}"
+        let backends = parsed["backends"].as_array().unwrap();
+        assert_eq!(
+            backends.len(),
+            1,
+            "operator audience discloses backend status"
         );
+        assert_eq!(backends[0]["kind"], "Otlp");
+        assert!(backends[0]["name"].is_string());
+        assert!(backends[0].get("connected").is_some());
+        assert!(backends[0].get("message").is_some());
     }
 
     #[tokio::test]
@@ -342,6 +348,146 @@ mod tests {
             "operator audience discloses backend kinds"
         );
         assert_eq!(backends[0], "Otlp");
+    }
+
+    /// A collector at the given audience that has recorded an operator metric
+    /// (per-module call duration) and a module error — the operator-shaped data
+    /// the management projection must scrub under `user-only`.
+    fn state_with_operator_data(
+        audience: chaffra_telemetry::TelemetryAudience,
+    ) -> Arc<SharedState> {
+        let collector =
+            chaffra_telemetry::TelemetryCollector::new(chaffra_telemetry::TelemetryConfig {
+                audience,
+                ..Default::default()
+            });
+        // "failing" ran with a 250ms call and an error; give it a finding so the
+        // module entry is retained under user-only (payload-empty modules are
+        // dropped) and we can assert the operator FIELDS are scrubbed.
+        collector.record_module_call("failing", 250, true);
+        collector.record_module_findings(
+            "failing",
+            1,
+            &[("warning".to_owned(), 1)].into_iter().collect(),
+        );
+        Arc::new(SharedState { collector })
+    }
+
+    #[tokio::test]
+    async fn test_metrics_data_points_scrubbed_under_user_only() {
+        // R10 round-11: the management /metrics output is audience-projected, so
+        // the operator data point chaffra.module.call_duration_ms must NOT appear
+        // under the default user-only audience.
+        let app = build_router(state_with_operator_data(
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+        ));
+        let resp = app
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = parsed["data_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("call_duration_ms") || n.contains("error_total")),
+            "operator data points must be scrubbed under user-only: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_data_points_present_under_operator() {
+        // Under an operator audience the same operator data point IS disclosed.
+        let app = build_router(state_with_operator_data(
+            chaffra_telemetry::TelemetryAudience::On,
+        ));
+        let resp = app
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = parsed["data_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("call_duration_ms")),
+            "operator data points must be present under an operator audience: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modules_operator_fields_scrubbed_under_user_only() {
+        // R10 round-11: per-module duration_ms (the operator call_duration_ms)
+        // and the error-derived status read operator-shaped fields, so under
+        // user-only the projection zeroes the duration and empties the error
+        // counts → status "healthy".
+        let app = build_router(state_with_operator_data(
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+        ));
+        let resp = app
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let m = parsed["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "failing")
+            .expect("module retained (has a finding) but with operator fields scrubbed");
+        assert_eq!(
+            m["duration_ms"], 0,
+            "per-module duration must be scrubbed under user-only"
+        );
+        assert_eq!(
+            m["status"], "healthy",
+            "error status must be withheld under user-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modules_operator_fields_shown_under_operator() {
+        // Under an operator audience the duration and error status ARE disclosed.
+        let app = build_router(state_with_operator_data(
+            chaffra_telemetry::TelemetryAudience::On,
+        ));
+        let resp = app
+            .oneshot(Request::get("/api/v1/modules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let m = parsed["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "failing")
+            .expect("module present under operator audience");
+        assert_eq!(m["duration_ms"], 250);
+        assert_eq!(m["status"], "error");
     }
 
     #[tokio::test]
