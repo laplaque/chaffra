@@ -99,6 +99,9 @@ audience:
   available via `GET /api/v1/metrics` `data_points`. (Driving `/modules` and
   `/health` from the operator summary under operator-only is deferred to Stage
   15a.3 alongside the co-located integration.)
+- **`off`**: all telemetry is disabled — neither scope is enabled, so the
+  projection drops the user summary entirely and the module list is **empty**
+  (same as `operator-only` for this user-sourced endpoint).
 
 `finding_count` is user-facing and reported whenever the user scope is on.
 
@@ -140,9 +143,10 @@ New, resolved, and unchanged findings since last run.
 Health score, grade, and per-file breakdown. Audience-projected. Health scores
 come from the user-facing `chaffra.module.<id>.health_score` data points
 (`KNOWN_USER`), so they are reported under `user-only` and `on`. Under
-`operator-only` the user scope is off and these points are dropped, so `score` is
-`null` and `grade` is `—` (same user-scoped-view caveat as `/modules`; revisited
-in Stage 15a.3).
+`operator-only` **and `off`** the user scope is off and these points are dropped,
+so `score` is `null` and `grade` is `—` (same user-scoped-view caveat as
+`/modules`; the operator-only case is revisited in Stage 15a.3, and `off` simply
+disables all telemetry).
 
 ```json
 {

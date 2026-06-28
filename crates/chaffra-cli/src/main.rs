@@ -553,6 +553,38 @@ fn resolve_subcommand_telemetry(
     merge_telemetry_config(cli_config, &project_config)
 }
 
+/// Build the `chaffra management` collector with telemetry resolved through the
+/// SAME file-aware, fail-closed path as live runs and the telemetry diagnostics
+/// (R11-F1). `chaffra management` previously constructed its collector straight
+/// from the CLI-derived config, so a project's `[modules.telemetry]` audience /
+/// backend was ignored and a malformed `[modules.telemetry]` did not stop
+/// startup — a parallel config path Stage 15a.1 forbids. Routing through
+/// [`resolve_subcommand_telemetry`] makes a checked-in `audience`/`backend`
+/// govern the management collector (an explicit CLI flag still wins), and a
+/// malformed file fails closed before the server binds.
+fn build_management_collector(
+    cli_config: &chaffra_telemetry::TelemetryConfig,
+) -> Result<chaffra_telemetry::TelemetryCollector> {
+    let project_dir = std::env::current_dir().context("failed to read current directory")?;
+    build_management_collector_in(cli_config, dispatch_config_path(cli_config), &project_dir)
+}
+
+/// Testable core of [`build_management_collector`]: resolve telemetry through the
+/// shared precedence/fail-closed path for an explicit `project_dir`, then build
+/// the collector. Split out so management's config resolution is unit-tested
+/// without binding a port — the same wrapper/`_in` shape the telemetry
+/// diagnostics use.
+fn build_management_collector_in(
+    cli_config: &chaffra_telemetry::TelemetryConfig,
+    config_path: Option<&str>,
+    project_dir: &Path,
+) -> Result<chaffra_telemetry::TelemetryCollector> {
+    let resolved = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
+    let collector = chaffra_telemetry::TelemetryCollector::new(resolved);
+    collector.register_core_metrics();
+    Ok(collector)
+}
+
 fn discover_and_read_files(root: &Path, config: &ChaffraConfig) -> Vec<FileInfo> {
     let discovered = chaffra_parse::discovery::discover_files(root, &config.project.ignore);
 
@@ -2009,8 +2041,7 @@ async fn main() -> Result<()> {
         },
 
         Command::Management { port } => {
-            let collector = chaffra_telemetry::TelemetryCollector::new(tel_config);
-            collector.register_core_metrics();
+            let collector = build_management_collector(&tel_config)?;
             let config = chaffra_management::ManagementConfig { port };
             let server = chaffra_management::ManagementServer::new(config, collector);
             server.run().await?;
@@ -3508,6 +3539,98 @@ mod tests {
         assert!(
             msg.contains("failed to load .chaffra.toml"),
             "malformed TOML must surface as a typed error from the strict loader, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_management_collector_honours_file_audience() {
+        // R11-F1: `chaffra management` resolves telemetry through the SAME
+        // file-aware path as live runs/diagnostics, so a checked-in
+        // `[modules.telemetry] audience` governs the management collector.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"operator-only\"\n",
+        )
+        .unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let collector = build_management_collector_in(&cli_config, None, dir.path()).unwrap();
+        assert_eq!(
+            collector.config().audience,
+            chaffra_telemetry::TelemetryAudience::OperatorOnly,
+            "management must honour the checked-in [modules.telemetry] audience"
+        );
+    }
+
+    #[test]
+    fn test_management_collector_honours_file_backend() {
+        // R11-F1: the file `[modules.telemetry] backend` governs the management
+        // collector too (no CLI backend override present).
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\nbackend = \"stderr\"\n",
+        )
+        .unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let collector = build_management_collector_in(&cli_config, None, dir.path()).unwrap();
+        assert_eq!(
+            collector.config().backends[0].kind,
+            chaffra_telemetry::BackendKind::Stderr,
+            "management must honour the checked-in [modules.telemetry] backend"
+        );
+    }
+
+    #[test]
+    fn test_management_collector_explicit_cli_beats_file() {
+        // R11-F1: an explicit CLI `--telemetry` flag still wins over the file
+        // audience for management, matching the shared precedence rule.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"on\"\n",
+        )
+        .unwrap();
+        let cli_config = cli_config_with_flag(chaffra_telemetry::TelemetryAudience::UserOnly);
+        let collector = build_management_collector_in(&cli_config, None, dir.path()).unwrap();
+        assert_eq!(
+            collector.config().audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly,
+            "explicit CLI --telemetry must beat the file audience for management"
+        );
+    }
+
+    #[test]
+    fn test_management_collector_invalid_file_fails_closed() {
+        // R11-F1: a malformed `[modules.telemetry]` fails closed BEFORE the
+        // management server starts, instead of silently starting with defaults.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\naudience = \"everyone\"\n",
+        )
+        .unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let err = build_management_collector_in(&cli_config, None, dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid [modules.telemetry] configuration"),
+            "management must fail closed on malformed telemetry config, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_management_collector_wrapper_resolves_cwd() {
+        // Exercise the `build_management_collector` wrapper's Ok-arm (it resolves
+        // `current_dir()` then delegates to the `_in` form), pinning the cwd to a
+        // clean tempdir so the resolved audience is the deterministic default.
+        let dir = TempDir::new().unwrap();
+        let _cwd = CwdGuard::enter(dir.path());
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let collector = build_management_collector(&cli_config).unwrap();
+        assert_eq!(
+            collector.config().audience,
+            chaffra_telemetry::TelemetryAudience::UserOnly
         );
     }
 
