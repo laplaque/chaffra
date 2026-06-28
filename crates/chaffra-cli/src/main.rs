@@ -263,9 +263,13 @@ enum TelemetryAction {
     /// connectivity are operator-shaped and shown only when operator telemetry
     /// is enabled (`on` / `operator-only`); withheld under `user-only` / `off`.
     Status,
-    /// Emit a test metric and report success or failure.
+    /// Emit a test metric and report per-backend success or failure. Exercises
+    /// and names backends only under an operator audience (`on` /
+    /// `operator-only`); withheld under `user-only` / `off`.
     Test,
-    /// Dry-run: show what telemetry payload would be emitted.
+    /// Dry-run: preview the per-backend telemetry payload. Backend names and
+    /// payload are shown only under an operator audience (`on` /
+    /// `operator-only`); withheld under `user-only` / `off`.
     Inspect,
     /// Generate an import-ready Grafana dashboard JSON (Prometheus datasource).
     Dashboard {
@@ -1422,22 +1426,23 @@ fn cmd_telemetry_test_in(
     // flag > file `[modules.telemetry] audience` > default).
     let tel_config = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
 
-    // Off short-circuit: when the resolved audience is `Off`, the live-run
-    // flush rule is "no flush at all". `test` must observe the same rule
-    // before it does anything backend-visible, otherwise it diverges from
-    // the real run: the projected snapshot is empty under `Off`, but
-    // creating and writing every configured backend (a file open / network
-    // connect, etc.) still side-effects the environment and would surprise
-    // an operator who explicitly disabled telemetry. Short-circuit here so
-    // `test` is a true no-op when telemetry is `Off`, exactly matching
-    // `run_with_telemetry`'s early return.
-    if matches!(
-        tel_config.audience,
-        chaffra_telemetry::TelemetryAudience::Off
-    ) {
-        return Ok(
-            "Telemetry is Off; no backend writes are performed by `telemetry test`.\n".to_owned(),
-        );
+    // Operator gate (R8-F1, generalises the F5 `Off` no-op): exercising and
+    // reporting backends is operator-shaped. Projection scrubs the metric
+    // PAYLOAD, but NOT the backend config/status metadata this command
+    // discloses — the backend name via `[OK]/[FAIL] {name}`, and the
+    // endpoint/port/namespace a backend's `flush()` may write. That metadata is
+    // classified operator-shaped everywhere else (CLI `status`, the
+    // `backend-status` finding, MCP `status`/`backends`), so `test` must apply
+    // the same gate. Under a non-operator audience (`user-only` / `off`)
+    // withhold entirely: no backend is constructed, contacted, or named. (This
+    // also subsumes the F5 `Off` no-op — `Off` is not `operator_enabled()`.)
+    if !tel_config.audience.operator_enabled() {
+        return Ok(format!(
+            "Telemetry mode: {:?}\n\nBackend connectivity test requires operator telemetry; \
+             no backends are exercised, contacted, or named under user-only/off \
+             (use --telemetry on|operator-only).\n",
+            tel_config.audience
+        ));
     }
 
     let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
@@ -1491,6 +1496,21 @@ fn cmd_telemetry_inspect_in(
     // matches a real flush at the resolved audience (explicit `--telemetry` flag
     // > file `[modules.telemetry] audience` > default).
     let tel_config = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
+
+    // Operator gate (R8-F1), same rationale as `test`: this preview prints the
+    // backend name (`--- {name} ---`) and delegates to each backend's
+    // `inspect()`, which can embed backend config/endpoint metadata. Projection
+    // scrubs the metric payload but not that operator-shaped backend metadata,
+    // so withhold the per-backend preview under a non-operator audience.
+    if !tel_config.audience.operator_enabled() {
+        return Ok(format!(
+            "Telemetry mode: {:?}\n\nBackend payload preview requires operator telemetry; \
+             backend names and per-backend output are withheld under user-only/off \
+             (use --telemetry on|operator-only).\n",
+            tel_config.audience
+        ));
+    }
+
     let collector = chaffra_telemetry::TelemetryCollector::new(tel_config.clone());
     collector.register_core_metrics();
     collector.set_files_total(0);
@@ -3405,8 +3425,12 @@ mod tests {
         // clean tempdir.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.json");
+        // Operator audience: backend exercise/reporting is operator-gated
+        // (R8-F1), so the flush path the wrapper forwards to runs only when
+        // operator telemetry is enabled.
         let tel_config = chaffra_telemetry::TelemetryConfig {
-            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            cli_audience_override: Some(chaffra_telemetry::TelemetryAudience::On),
             backends: vec![chaffra_telemetry::BackendConfig {
                 kind: chaffra_telemetry::BackendKind::JsonFile,
                 endpoint: None,
@@ -3461,17 +3485,19 @@ mod tests {
     #[test]
     fn test_cmd_telemetry_inspect_wrapper_resolves_cwd() {
         // The top-level `cmd_telemetry_inspect` resolves cwd and forwards
-        // to `_in`. Cover the wrapper's Ok-arm.
+        // to `_in`. Cover the wrapper's Ok-arm via the operator path (the
+        // per-backend preview is operator-gated, R8-F1).
         let tel_config = chaffra_telemetry::TelemetryConfig {
-            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            cli_audience_override: Some(chaffra_telemetry::TelemetryAudience::On),
             ..Default::default()
         };
         let dir = TempDir::new().unwrap();
         let _cwd = CwdGuard::enter(dir.path());
         let out = cmd_telemetry_inspect(&tel_config).unwrap();
         assert!(
-            !out.contains("chaffra.module.call_duration_ms"),
-            "wrapper must project to user-only, got: {out}"
+            out.contains("chaffra.module.call_duration_ms"),
+            "operator audience must preview operator metrics, got: {out}"
         );
     }
 
@@ -3971,13 +3997,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_telemetry_test_projects_to_audience() {
-        // 3C: the diagnostic `telemetry test` flush is projected, so a user-only
-        // audience never writes operator data to a real backend.
+    fn test_cmd_telemetry_test_flushes_and_projects_under_operator() {
+        // Under an operator audience the test flush runs (R8-F1 gate open) and
+        // the snapshot is projected before the write. Covers the flush path.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.json");
         let tel_config = chaffra_telemetry::TelemetryConfig {
-            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            cli_audience_override: Some(chaffra_telemetry::TelemetryAudience::On),
             backends: vec![chaffra_telemetry::BackendConfig {
                 kind: chaffra_telemetry::BackendKind::JsonFile,
                 endpoint: None,
@@ -3986,37 +4013,60 @@ mod tests {
             }],
             ..Default::default()
         };
-        // Resolve from a clean project dir (no `.chaffra.toml`) so the
-        // audience stays UserOnly rather than picking up an ambient project
-        // file. 1C: pass the project_dir explicitly — no cwd switch needed.
         let out = cmd_telemetry_test_in(&tel_config, None, dir.path()).unwrap();
         assert!(out.contains("flushed"), "got: {out}");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // The synthetic test metric is user-facing; no operator definitions leak.
-        for op in chaffra_telemetry::metrics::metric_names::OPERATOR {
-            assert!(
-                parsed["definitions"].get(op).is_none(),
-                "operator definition {op} leaked from telemetry test under user-only"
-            );
-        }
+        assert!(path.exists(), "operator test must write the backend file");
     }
 
     #[test]
-    fn test_cmd_telemetry_inspect_projects_to_audience() {
-        // 3C: inspection previews the projected payload. Under user-only the
-        // simulated operator call duration must not appear.
+    fn test_cmd_telemetry_test_withholds_backend_metadata_under_user_only() {
+        // R8-F1: under the default user-only audience, `telemetry test` must not
+        // construct, contact, or NAME backends, nor disclose operator-shaped
+        // config metadata. Use a revealing OTLP endpoint and assert neither the
+        // backend kind nor the endpoint appears, and nothing is flushed.
+        let dir = TempDir::new().unwrap();
         let tel_config = chaffra_telemetry::TelemetryConfig {
             audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::Otlp,
+                endpoint: Some("http://operator-secret-host:4317".to_owned()),
+                path: None,
+                options: HashMap::new(),
+            }],
             ..Default::default()
         };
-        // Clean project dir so the resolved audience stays UserOnly (no
-        // ambient file). 1C: project_dir is explicit, no cwd switch needed.
-        let dir = TempDir::new().unwrap();
-        let out = cmd_telemetry_inspect_in(&tel_config, None, dir.path()).unwrap();
+        let out = cmd_telemetry_test_in(&tel_config, None, dir.path()).unwrap();
+        assert!(out.contains("Telemetry mode: UserOnly"), "got: {out}");
+        assert!(!out.contains("flushed"), "no flush under user-only, got: {out}");
         assert!(
-            !out.contains("chaffra.module.call_duration_ms"),
-            "operator metric previewed under user-only inspect: {out}"
+            !out.to_lowercase().contains("otlp") && !out.contains("operator-secret-host"),
+            "backend kind/endpoint leaked under user-only, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_cmd_telemetry_inspect_withholds_backend_metadata_under_user_only() {
+        // R8-F1: inspect withholds the per-backend preview (the `--- {name} ---`
+        // header and each backend's `inspect()` output, which can embed
+        // endpoint/config) under the default user-only audience.
+        let dir = TempDir::new().unwrap();
+        let tel_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::UserOnly,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::Otlp,
+                endpoint: Some("http://operator-secret-host:4317".to_owned()),
+                path: None,
+                options: HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let out = cmd_telemetry_inspect_in(&tel_config, None, dir.path()).unwrap();
+        assert!(out.contains("Telemetry mode: UserOnly"), "got: {out}");
+        assert!(
+            !out.to_lowercase().contains("otlp")
+                && !out.contains("operator-secret-host")
+                && !out.contains("chaffra.module.call_duration_ms"),
+            "backend metadata / operator preview leaked under user-only, got: {out}"
         );
     }
 

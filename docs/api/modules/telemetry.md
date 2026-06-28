@@ -170,11 +170,18 @@ Audience-gated output beyond the snapshot itself (R4):
 - The MCP `chaffra/telemetry` tool's `status` and `backends` actions (backend
   connectivity / catalogue) follow the same gate. The `snapshot` action
   projects via `project_for_audience(config.audience)` before serializing.
-- The CLI `chaffra telemetry status` command follows the same gate: it prints
-  the resolved audience, but the backend catalogue / connectivity is disclosed
-  ONLY under `On` / `OperatorOnly`. Under `user-only` / `off` it prints a
-  "withheld" line pointing at the explicit opt-in, so the CLI status boundary
-  matches the module finding and the MCP actions.
+- The CLI diagnostic commands `chaffra telemetry status` / `test` / `inspect`
+  follow the same gate. Backend kind / endpoint / connectivity is operator-shaped
+  *config metadata* — and `ProjectedSnapshot` scrubs the metric payload, not that
+  metadata — so all three withhold backend information under `user-only` / `off`
+  and disclose it only under `On` / `OperatorOnly` (R7-F3, R8-F1):
+  - `status` prints the resolved audience; the backend catalogue/connectivity is
+    withheld with a hint at the opt-in.
+  - `test` exercises and names backends only under an operator audience; under
+    `user-only` / `off` it withholds entirely (no backend is constructed,
+    contacted, or named — this also subsumes the `Off` no-op).
+  - `inspect` previews the per-backend payload only under an operator audience;
+    otherwise the backend names and per-backend output are withheld.
 - The MCP tool ALWAYS runs at the project's **resolved** audience: it loads the
   `path` repository root's `.chaffra.toml` through the same strict loader as the
   other tools and honours a `[modules.telemetry] audience` opt-in, falling back
@@ -314,8 +321,8 @@ chaffra telemetry audit-log --export   # Export as JSON array for GDPR data subj
 
 ```
 chaffra telemetry status      # Show resolved audience; backend catalogue/connectivity shown ONLY under on|operator-only (withheld under user-only/off)
-chaffra telemetry test        # Emit test metric, report success/failure
-chaffra telemetry inspect     # Dry-run: show metric payload
+chaffra telemetry test        # Emit test metric; exercises/names backends only under on|operator-only (withheld under user-only/off)
+chaffra telemetry inspect     # Dry-run payload preview; backend names/output shown only under on|operator-only (withheld under user-only/off)
 chaffra telemetry dashboard   # Generate Grafana dashboard JSON
 chaffra telemetry audit-log   # Display telemetry audit log
 
