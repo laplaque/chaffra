@@ -259,7 +259,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum TelemetryAction {
-    /// Show telemetry backends and connection status.
+    /// Show the resolved telemetry audience. Backend catalogue and
+    /// connectivity are operator-shaped and shown only when operator telemetry
+    /// is enabled (`on` / `operator-only`); withheld under `user-only` / `off`.
     Status,
     /// Emit a test metric and report success or failure.
     Test,
