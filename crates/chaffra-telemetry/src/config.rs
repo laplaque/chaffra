@@ -193,10 +193,13 @@ fn default_backends() -> Vec<BackendConfig> {
 impl TelemetryConfig {
     /// Build config from the `[modules.telemetry]` section of chaffra config.
     ///
-    /// Fails closed: an `audience` key with an unrecognised value is a typed
-    /// error, never coerced to the default. This is the single config-loading
-    /// path shared by the CLI and the telemetry module — there is no lenient
-    /// alternate path that would let a malformed `audience` widen emission.
+    /// Fails closed: an `audience`, `sampling-rate`, or `sampling-strategy` key
+    /// with an unrecognised value is a typed error, never coerced to the
+    /// default (a valid-but-out-of-range `sampling-rate` is clamped, which is
+    /// range normalisation, not a swallowed parse failure). An ABSENT key
+    /// defaults. This is the single config-loading path shared by the CLI and
+    /// the telemetry module — there is no lenient alternate path that would let
+    /// a malformed value silently take effect.
     pub fn from_module_config(config: &HashMap<String, String>) -> Result<Self, TelemetryError> {
         let audience = match config.get("audience") {
             Some(v) => TelemetryAudience::parse(v)?,
@@ -221,18 +224,40 @@ impl TelemetryConfig {
             default_backends()
         };
 
-        let sampling_rate = config
+        // Fail closed on a present-but-invalid value (mirroring `audience`):
+        // a non-numeric `sampling-rate` is a typed error, never silently
+        // coerced to the default. An ABSENT key still defaults to 1.0. A
+        // valid-but-out-of-range number is normalised by `clamp` (an explicit,
+        // tested behaviour — see `test_sampling_rate_clamped` — not a swallowed
+        // parse failure).
+        let sampling_rate = match config
             .get("sampling-rate")
             .or_else(|| config.get("sampling_rate"))
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
+        {
+            Some(v) => v
+                .parse::<f64>()
+                .map_err(|_| {
+                    TelemetryError::InvalidSamplingConfig(format!(
+                        "invalid sampling-rate {v:?} (expected a number in [0.0, 1.0])"
+                    ))
+                })?
+                .clamp(0.0, 1.0),
+            None => 1.0,
+        };
 
-        let sampling_strategy = config
+        // Same fail-closed contract for `sampling-strategy`: a present but
+        // unrecognised value is a typed error; an absent key defaults.
+        let sampling_strategy = match config
             .get("sampling-strategy")
             .or_else(|| config.get("sampling_strategy"))
-            .and_then(|v| SamplingStrategy::from_str_loose(v))
-            .unwrap_or_default();
+        {
+            Some(v) => SamplingStrategy::from_str_loose(v).ok_or_else(|| {
+                TelemetryError::InvalidSamplingConfig(format!(
+                    "invalid sampling-strategy {v:?} (expected one of: rate, on-change)"
+                ))
+            })?,
+            None => SamplingStrategy::default(),
+        };
 
         Ok(Self {
             audience,
@@ -409,6 +434,35 @@ mod tests {
         mc.insert("audience".to_owned(), "everyone".to_owned());
         let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
         assert!(matches!(err, TelemetryError::InvalidAudience(v) if v == "everyone"));
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_sampling_rate_fails_closed() {
+        // A present-but-unparseable `sampling-rate` is a typed error, never
+        // silently coerced to the 1.0 default (mirrors the `audience` contract).
+        for spelling in ["sampling-rate", "sampling_rate"] {
+            let mut mc = HashMap::new();
+            mc.insert(spelling.to_owned(), "banana".to_owned());
+            let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+            assert!(
+                matches!(err, TelemetryError::InvalidSamplingConfig(ref v) if v.contains("banana")),
+                "spelling={spelling}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_sampling_strategy_fails_closed() {
+        // Same fail-closed contract for `sampling-strategy`.
+        for spelling in ["sampling-strategy", "sampling_strategy"] {
+            let mut mc = HashMap::new();
+            mc.insert(spelling.to_owned(), "bogus".to_owned());
+            let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+            assert!(
+                matches!(err, TelemetryError::InvalidSamplingConfig(ref v) if v.contains("bogus")),
+                "spelling={spelling}, got {err:?}"
+            );
+        }
     }
 
     #[test]
