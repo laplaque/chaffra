@@ -350,6 +350,56 @@ mod tests {
         assert_eq!(backends[0], "Otlp");
     }
 
+    #[tokio::test]
+    async fn test_config_sampling_withheld_under_user_only() {
+        // R13: sampling_rate / sampling_strategy describe the operator-telemetry
+        // emission policy (operator-shaped config metadata, like backends), so
+        // they must be withheld (null) under the default user-only audience.
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed["sampling_rate"].is_null(),
+            "sampling_rate must be withheld under user-only: {parsed}"
+        );
+        assert!(
+            parsed["sampling_strategy"].is_null(),
+            "sampling_strategy must be withheld under user-only: {parsed}"
+        );
+        // The user-facing audience mode is still reported.
+        assert!(parsed["audience"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_config_sampling_disclosed_under_operator() {
+        // Under an operator-enabled audience the sampling policy IS disclosed.
+        let app = build_router(operator_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed["sampling_rate"].as_f64().is_some(),
+            "sampling_rate must be present under an operator audience: {parsed}"
+        );
+        assert!(
+            parsed["sampling_strategy"].is_string(),
+            "sampling_strategy must be present under an operator audience: {parsed}"
+        );
+    }
+
     /// A collector at the given audience that has recorded an operator metric
     /// (per-module call duration) and a module error — the operator-shaped data
     /// the management projection must scrub under `user-only`.

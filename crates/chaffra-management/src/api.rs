@@ -81,8 +81,11 @@ pub struct FileHealthEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigResponse {
     pub audience: String,
-    pub sampling_rate: f64,
-    pub sampling_strategy: String,
+    /// Operator-shaped: the operator-telemetry sampling policy. `None`
+    /// (serialized as `null`) when the resolved audience is not operator-enabled
+    /// (R13). Populated only under `on` / `operator-only`.
+    pub sampling_rate: Option<f64>,
+    pub sampling_strategy: Option<String>,
     pub backends: Vec<String>,
 }
 
@@ -293,11 +296,17 @@ pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<H
 
 pub async fn get_config(state: axum::extract::State<Arc<SharedState>>) -> Json<ConfigResponse> {
     let config = state.collector.config();
+    let operator = config.audience.operator_enabled();
 
-    // R10-F2: backend kinds are operator-shaped metadata. Disclose them only
-    // under an operator-enabled audience; under the default `user-only` (or
-    // `off`) the list is empty, matching every other backend-metadata boundary.
-    let backends = if config.audience.operator_enabled() {
+    // Backend kinds AND the sampling configuration are operator-shaped config
+    // metadata — they describe the operator-telemetry emission policy (where
+    // operator metrics go, and how often they are flushed). `project_for_audience`
+    // scrubs the snapshot payload, not config metadata, so these need their own
+    // audience gate here. Disclose them only under an operator-enabled audience;
+    // under the default `user-only` (or `off`) the backend list is empty and the
+    // sampling fields are withheld (`null`). R10-F2 (backends) + R13 (sampling).
+    // The `audience` field itself is the user-facing mode and is always reported.
+    let backends = if operator {
         config
             .backends
             .iter()
@@ -306,11 +315,19 @@ pub async fn get_config(state: axum::extract::State<Arc<SharedState>>) -> Json<C
     } else {
         Vec::new()
     };
+    let (sampling_rate, sampling_strategy) = if operator {
+        (
+            Some(config.sampling_rate),
+            Some(format!("{:?}", config.sampling_strategy)),
+        )
+    } else {
+        (None, None)
+    };
 
     Json(ConfigResponse {
         audience: format!("{:?}", config.audience),
-        sampling_rate: config.sampling_rate,
-        sampling_strategy: format!("{:?}", config.sampling_strategy),
+        sampling_rate,
+        sampling_strategy,
         backends,
     })
 }

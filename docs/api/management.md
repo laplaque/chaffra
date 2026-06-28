@@ -160,28 +160,40 @@ disables all telemetry).
 
 Active configuration (redacted secrets).
 
-The default audience is `UserOnly`. The `audience` and `sampling_strategy`
-values are the `TelemetryAudience` / `SamplingStrategy` enum variant names
-(the API serializes them with their Rust debug representation), distinct from
-the kebab-case spelling accepted on input (`[modules.telemetry] audience =
-"user-only"`, `--telemetry user-only`).
+The default audience is `UserOnly`. The `audience` value (always reported, since
+it is the user-facing mode) is the `TelemetryAudience` enum variant name (the API
+serializes it with its Rust debug representation), distinct from the kebab-case
+spelling accepted on input (`[modules.telemetry] audience = "user-only"`,
+`--telemetry user-only`).
 
-The `backends` array (backend kinds) is operator-shaped metadata: it is
-populated only under an operator-enabled audience (`on` / `operator-only`) and
-is **empty** under the default `user-only` (and under `off`), matching the
-`GET /api/v1/metrics` backend gating.
+The `backends` array (backend kinds) **and** the sampling configuration
+(`sampling_rate`, `sampling_strategy`) are operator-shaped metadata: they
+describe the operator-telemetry emission policy (where operator metrics go and
+how often they are flushed). They are disclosed only under an operator-enabled
+audience (`on` / `operator-only`). Under the default `user-only` (and under
+`off`) the `backends` array is **empty** and `sampling_rate` / `sampling_strategy`
+are **`null`** (withheld), matching the `GET /api/v1/metrics` backend gating.
 
 ```json
 {
   "audience": "UserOnly",
-  "sampling_rate": 1.0,
-  "sampling_strategy": "Rate",
+  "sampling_rate": null,
+  "sampling_strategy": null,
   "backends": []
 }
 ```
 
-Under an operator audience the `backends` array is populated (e.g.
-`["JsonFile"]`).
+Under an operator audience the sampling fields and `backends` array are
+populated, e.g.:
+
+```json
+{
+  "audience": "On",
+  "sampling_rate": 1.0,
+  "sampling_strategy": "Rate",
+  "backends": ["JsonFile"]
+}
+```
 
 ## Lifecycle
 
