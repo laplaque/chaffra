@@ -45,19 +45,24 @@ impl TelemetryAudience {
 
     /// Parse from a CLI flag / file value, returning `None` on an unknown value.
     ///
-    /// Only the four documented audience modes (plus snake_case spellings) are
-    /// accepted. Boolean/integer-style aliases (`true`/`1`/`false`/`0`) are
-    /// intentionally NOT accepted (R9-F3): `ChaffraConfig::module_config`
-    /// stringifies non-string TOML, so accepting `"true"`/`"1"` would let a
-    /// checked-in `[modules.telemetry] audience = true` (a TOML boolean) silently
-    /// become an operator opt-in. Rejecting them makes any non-string / non-mode
+    /// Only the four documented audience modes are accepted, each in its
+    /// canonical kebab-case spelling plus the snake_case equivalent
+    /// (`user_only` / `operator_only`). Bare `user` / `operator` are NOT
+    /// accepted (R10-F3): the documented vocabulary is `on` / `off` /
+    /// `user-only` / `operator-only`, so an undocumented `audience = "operator"`
+    /// must fail closed rather than silently widen to an operator opt-in.
+    /// Boolean/integer-style aliases (`true`/`1`/`false`/`0`) are likewise NOT
+    /// accepted (R9-F3): `ChaffraConfig::module_config` stringifies non-string
+    /// TOML, so accepting `"true"`/`"1"` would let a checked-in
+    /// `[modules.telemetry] audience = true` (a TOML boolean) silently become an
+    /// operator opt-in. Rejecting all of these makes any non-string / non-mode
     /// value fail closed through `parse`.
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "on" => Some(Self::On),
             "off" => Some(Self::Off),
-            "user-only" | "user_only" | "user" => Some(Self::UserOnly),
-            "operator-only" | "operator_only" | "operator" => Some(Self::OperatorOnly),
+            "user-only" | "user_only" => Some(Self::UserOnly),
+            "operator-only" | "operator_only" => Some(Self::OperatorOnly),
             _ => None,
         }
     }
@@ -170,6 +175,23 @@ pub struct TelemetryConfig {
     #[serde(skip)]
     pub cli_audience_override: Option<TelemetryAudience>,
 
+    /// Whether an explicit CLI backend selector (`--telemetry-backend` or
+    /// `--telemetry-endpoint`) was passed.
+    ///
+    /// A precedence hint with the same role as
+    /// [`cli_audience_override`](Self::cli_audience_override), but for the
+    /// backend dimension: it records whether [`backends`](Self::backends) came
+    /// from an explicit command-line selector (`true`) or merely the default
+    /// (`false`), so the config-merge step can let an explicit CLI backend win
+    /// over a checked-in `[modules.telemetry] backend` while still applying the
+    /// file backend when the CLI gave none (R10-F1). Backend precedence:
+    /// `--telemetry-backend` / `--telemetry-endpoint` > file `backend` >
+    /// default. Like the other hints it never crosses a wire or disk boundary —
+    /// `#[serde(skip)]` keeps it out of every serialized snapshot and backend
+    /// payload, so the persisted telemetry schema is unchanged.
+    #[serde(skip)]
+    pub cli_backend_override: bool,
+
     /// The global `--config <file>` path, if one was passed at the CLI.
     ///
     /// Carries the explicit project config path from the CLI dispatch down to
@@ -198,6 +220,7 @@ impl Default for TelemetryConfig {
             sampling_rate: 1.0,
             sampling_strategy: SamplingStrategy::default(),
             cli_audience_override: None,
+            cli_backend_override: false,
             cli_config_path: None,
         }
     }
@@ -296,6 +319,7 @@ impl TelemetryConfig {
             sampling_rate,
             sampling_strategy,
             cli_audience_override: None,
+            cli_backend_override: false,
             cli_config_path: None,
         })
     }
@@ -379,6 +403,25 @@ mod tests {
             Some(TelemetryAudience::OperatorOnly)
         );
         assert_eq!(TelemetryAudience::from_str_loose("bogus"), None);
+        // snake_case spellings of the two compound modes ARE accepted.
+        assert_eq!(
+            TelemetryAudience::from_str_loose("user_only"),
+            Some(TelemetryAudience::UserOnly)
+        );
+        assert_eq!(
+            TelemetryAudience::from_str_loose("operator_only"),
+            Some(TelemetryAudience::OperatorOnly)
+        );
+        // R10-F3: bare `user` / `operator` are NOT documented modes and must
+        // fail closed — an undocumented `audience = "operator"` must not widen
+        // to an operator opt-in.
+        for rejected in ["user", "operator", "USER", "Operator"] {
+            assert_eq!(
+                TelemetryAudience::from_str_loose(rejected),
+                None,
+                "bare alias {rejected} must not be accepted as an audience mode"
+            );
+        }
         // R9-F3: boolean/integer-style aliases are NOT accepted, so a
         // stringified non-string TOML `audience` value fails closed.
         for rejected in ["true", "1", "false", "0"] {
@@ -510,8 +553,10 @@ mod tests {
         // R9-F3: `ChaffraConfig::module_config` stringifies non-string TOML, so
         // `audience = true` / `audience = 1` arrive here as "true" / "1". These
         // are NOT documented modes and must fail closed — never silently become
-        // an operator opt-in (`On`).
-        for value in ["true", "1", "false", "0"] {
+        // an operator opt-in (`On`). R10-F3: bare `user` / `operator` are also
+        // undocumented and must fail closed; `audience = "operator"` must not
+        // become an `OperatorOnly` opt-in.
+        for value in ["true", "1", "false", "0", "user", "operator"] {
             let mut mc = HashMap::new();
             mc.insert("audience".to_owned(), value.to_owned());
             let err = TelemetryConfig::from_module_config(&mc).unwrap_err();

@@ -108,17 +108,27 @@ pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<
         })
         .collect();
 
-    let (_, statuses) =
-        chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
-    let backends = statuses
-        .into_iter()
-        .map(|s| BackendStatusEntry {
-            name: s.name,
-            kind: s.kind,
-            connected: s.connected,
-            message: s.message,
-        })
-        .collect();
+    // R10-F2: backend kind / endpoint / connectivity is operator-shaped
+    // config/status metadata, gated everywhere else by audience. The management
+    // collector is built from the CLI telemetry config (default `user-only`), so
+    // disclose backend status only when the operator audience is opted in;
+    // otherwise return an empty list (no operator metadata under
+    // `user-only`/`off`).
+    let backends = if state.collector.config().audience.operator_enabled() {
+        let (_, statuses) =
+            chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
+        statuses
+            .into_iter()
+            .map(|s| BackendStatusEntry {
+                name: s.name,
+                kind: s.kind,
+                connected: s.connected,
+                message: s.message,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Json(MetricsResponse {
         files_total: snapshot.user_summary.files_total,
@@ -258,15 +268,24 @@ pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<H
 pub async fn get_config(state: axum::extract::State<Arc<SharedState>>) -> Json<ConfigResponse> {
     let config = state.collector.config();
 
+    // R10-F2: backend kinds are operator-shaped metadata. Disclose them only
+    // under an operator-enabled audience; under the default `user-only` (or
+    // `off`) the list is empty, matching every other backend-metadata boundary.
+    let backends = if config.audience.operator_enabled() {
+        config
+            .backends
+            .iter()
+            .map(|b| format!("{:?}", b.kind))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Json(ConfigResponse {
         audience: format!("{:?}", config.audience),
         sampling_rate: config.sampling_rate,
         sampling_strategy: format!("{:?}", config.sampling_strategy),
-        backends: config
-            .backends
-            .iter()
-            .map(|b| format!("{:?}", b.kind))
-            .collect(),
+        backends,
     })
 }
 

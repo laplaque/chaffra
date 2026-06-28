@@ -243,6 +243,107 @@ mod tests {
         assert!(parsed["audience"].is_string());
     }
 
+    /// A collector whose telemetry config opts into the operator audience and
+    /// carries an OTLP backend, for asserting the operator-gated metadata is
+    /// disclosed only under an operator audience (R10-F2).
+    fn operator_state() -> Arc<SharedState> {
+        let config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::Otlp,
+                endpoint: Some("http://operator-host:4317".to_owned()),
+                path: None,
+                options: std::collections::HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        Arc::new(SharedState {
+            collector: chaffra_telemetry::TelemetryCollector::new(config),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_metrics_backends_empty_under_user_only() {
+        // R10-F2: the default `user-only` audience must not disclose
+        // operator-shaped backend status metadata.
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed["backends"].as_array().unwrap().is_empty(),
+            "backend status must be withheld under user-only: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_backends_populated_under_operator() {
+        // R10-F2: an operator-enabled audience discloses backend status.
+        let app = build_router(operator_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !parsed["backends"].as_array().unwrap().is_empty(),
+            "backend status must be present under an operator audience: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_backends_empty_under_user_only() {
+        // R10-F2: backend kinds are operator metadata, withheld under user-only.
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed["backends"].as_array().unwrap().is_empty(),
+            "backend kinds must be withheld under user-only: {parsed}"
+        );
+        // The non-operator config fields are still disclosed.
+        assert!(parsed["audience"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_config_backends_populated_under_operator() {
+        // R10-F2: an operator-enabled audience discloses backend kinds.
+        let app = build_router(operator_state());
+        let resp = app
+            .oneshot(Request::get("/api/v1/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let backends = parsed["backends"].as_array().unwrap();
+        assert_eq!(
+            backends.len(),
+            1,
+            "operator audience discloses backend kinds"
+        );
+        assert_eq!(backends[0], "Otlp");
+    }
+
     #[tokio::test]
     async fn test_metrics_history_endpoint() {
         let app = build_router(test_state());

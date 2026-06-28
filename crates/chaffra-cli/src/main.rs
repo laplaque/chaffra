@@ -431,6 +431,19 @@ fn merge_telemetry_config(
         // from the parsed value, but only when the key was set in the file.
         // Both the kebab- and snake-case spellings are accepted (matching
         // `from_module_config`'s own dual lookup).
+        // The file's `backend` participates only when explicitly present AND no
+        // explicit CLI backend selector (`--telemetry-backend` /
+        // `--telemetry-endpoint`) was given. Without this, a checked-in
+        // `[modules.telemetry] backend = "stderr"` was silently dropped on live
+        // CLI runs — the resolved config kept the default JSON-file backend even
+        // though the file requested otherwise, while the MCP/module paths
+        // (`from_module_config`) honoured it (R10-F1). Backend precedence:
+        // `--telemetry-backend` / `--telemetry-endpoint` > file `backend` >
+        // default. Copying `project_tel.backends` carries the file's `endpoint`
+        // / `path` alongside the backend kind, matching `from_module_config`.
+        if !cli_config.cli_backend_override && module_cfg.contains_key("backend") {
+            config.backends = project_tel.backends.clone();
+        }
         if module_cfg.contains_key("sampling-rate") || module_cfg.contains_key("sampling_rate") {
             config.sampling_rate = project_tel.sampling_rate;
         }
@@ -1320,6 +1333,11 @@ fn build_telemetry_config(cli: &Cli) -> Result<chaffra_telemetry::TelemetryConfi
         audience,
         backends,
         cli_audience_override: cli.telemetry,
+        // An explicit CLI backend selector takes precedence over a file
+        // `[modules.telemetry] backend`. Record whether one was given so
+        // `merge_telemetry_config` applies the file backend only when the CLI
+        // did not select one (R10-F1).
+        cli_backend_override: cli.telemetry_backend.is_some() || cli.telemetry_endpoint.is_some(),
         cli_config_path: cli.config.clone(),
         ..Default::default()
     })
@@ -3285,6 +3303,118 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_file_backend_applied_when_no_cli_override() {
+        // R10-F1: a checked-in `[modules.telemetry] backend` must take effect on
+        // a live CLI run when no explicit `--telemetry-backend` /
+        // `--telemetry-endpoint` was given. Previously the merge dropped the file
+        // backend and kept the default JSON-file backend, diverging from the
+        // MCP/module paths that honour `from_module_config`.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\nbackend = \"stderr\"\n",
+        )
+        .unwrap();
+        let project_config = load_config(None, dir.path()).unwrap();
+        // Default CLI config: no backend selector, so `cli_backend_override` is
+        // false and the default backend is the JSON-file sink.
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        assert!(!cli_config.cli_backend_override);
+        assert_eq!(
+            cli_config.backends[0].kind,
+            chaffra_telemetry::BackendKind::JsonFile
+        );
+
+        let merged = merge_telemetry_config(&cli_config, &project_config).unwrap();
+        assert_eq!(merged.backends.len(), 1);
+        assert_eq!(
+            merged.backends[0].kind,
+            chaffra_telemetry::BackendKind::Stderr,
+            "file backend=stderr must replace the default JSON-file backend"
+        );
+    }
+
+    #[test]
+    fn test_merge_file_backend_carries_endpoint() {
+        // The file backend's `endpoint` / `path` travel with the backend kind,
+        // matching `from_module_config` (the MCP/module path).
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\nbackend = \"otlp\"\nendpoint = \"http://localhost:4318\"\n",
+        )
+        .unwrap();
+        let project_config = load_config(None, dir.path()).unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config).unwrap();
+        assert_eq!(
+            merged.backends[0].kind,
+            chaffra_telemetry::BackendKind::Otlp
+        );
+        assert_eq!(
+            merged.backends[0].endpoint.as_deref(),
+            Some("http://localhost:4318")
+        );
+    }
+
+    #[test]
+    fn test_merge_explicit_cli_backend_beats_file_backend() {
+        // R10-F1 precedence guard: an explicit CLI backend selector wins over a
+        // checked-in file `backend`. `cli_backend_override` marks the CLI choice.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\nbackend = \"stderr\"\n",
+        )
+        .unwrap();
+        let project_config = load_config(None, dir.path()).unwrap();
+        // Simulate `--telemetry-backend otlp`: explicit backend + override marker.
+        let cli_config = chaffra_telemetry::TelemetryConfig {
+            backends: vec![chaffra_telemetry::BackendConfig {
+                kind: chaffra_telemetry::BackendKind::Otlp,
+                endpoint: Some("http://cli-host:4317".to_owned()),
+                path: None,
+                options: std::collections::HashMap::new(),
+            }],
+            cli_backend_override: true,
+            ..Default::default()
+        };
+
+        let merged = merge_telemetry_config(&cli_config, &project_config).unwrap();
+        assert_eq!(
+            merged.backends[0].kind,
+            chaffra_telemetry::BackendKind::Otlp,
+            "explicit --telemetry-backend must win over file backend=stderr"
+        );
+        assert_eq!(
+            merged.backends[0].endpoint.as_deref(),
+            Some("http://cli-host:4317")
+        );
+    }
+
+    #[test]
+    fn test_merge_absent_file_backend_keeps_cli_backend() {
+        // A `[modules.telemetry]` section without a `backend` key must NOT clobber
+        // the CLI/default backend (mirrors the sampling-key gate).
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".chaffra.toml"),
+            "[project]\nentry = []\n\n[modules.telemetry]\nsampling-rate = \"0.5\"\n",
+        )
+        .unwrap();
+        let project_config = load_config(None, dir.path()).unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+
+        let merged = merge_telemetry_config(&cli_config, &project_config).unwrap();
+        assert_eq!(
+            merged.backends[0].kind,
+            chaffra_telemetry::BackendKind::JsonFile,
+            "absent file backend must leave the default backend untouched"
+        );
+    }
+
+    #[test]
     fn test_resolve_subcommand_telemetry_reads_project_file_audience() {
         // P3: the telemetry diagnostic subcommands resolve their audience
         // through the SAME precedence chain a live run uses. With NO CLI flag, a
@@ -3649,6 +3779,17 @@ mod tests {
             config.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly
         );
+        // R10-F1: with no CLI backend selector the precedence marker is false,
+        // so a file `[modules.telemetry] backend` is free to take effect.
+        assert!(
+            !config.cli_backend_override,
+            "no --telemetry-backend/--telemetry-endpoint -> cli_backend_override must be false"
+        );
+        // And the backend is the default JSON-file sink.
+        assert_eq!(
+            config.backends[0].kind,
+            chaffra_telemetry::BackendKind::JsonFile
+        );
     }
 
     #[test]
@@ -3718,6 +3859,44 @@ mod tests {
             chaffra_telemetry::BackendKind::Stderr
         );
         assert_eq!(config.backends[0].endpoint.as_deref(), Some("ignored"));
+        // R10-F1: an explicit CLI backend selector sets the precedence marker,
+        // so `merge_telemetry_config` will let it win over a file `backend`.
+        assert!(
+            config.cli_backend_override,
+            "--telemetry-backend must set cli_backend_override"
+        );
+    }
+
+    #[test]
+    fn test_build_telemetry_config_endpoint_only_sets_otlp_and_override() {
+        // R10-F1: `--telemetry-endpoint` with no `--telemetry-backend` builds an
+        // OTLP backend AND sets the precedence marker (the `|| endpoint.is_some()`
+        // disjunct), so a checked-in file `backend` cannot override an explicit
+        // endpoint. This pins the endpoint-only construction branch.
+        let cli = Cli {
+            command: Command::Health {
+                path: ".".to_owned(),
+            },
+            format: "terminal".to_owned(),
+            config: None,
+            telemetry: None,
+            telemetry_backend: None,
+            telemetry_endpoint: Some("http://endpoint-only:4318".to_owned()),
+        };
+        let config = build_telemetry_config(&cli).unwrap();
+        assert_eq!(config.backends.len(), 1);
+        assert_eq!(
+            config.backends[0].kind,
+            chaffra_telemetry::BackendKind::Otlp
+        );
+        assert_eq!(
+            config.backends[0].endpoint.as_deref(),
+            Some("http://endpoint-only:4318")
+        );
+        assert!(
+            config.cli_backend_override,
+            "--telemetry-endpoint alone must set cli_backend_override"
+        );
     }
 
     #[test]

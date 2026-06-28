@@ -21,7 +21,7 @@ Embedded web UI (HTML/JS served from the binary, no external dependencies):
 - Current module status: registered, healthy, error
 - Last run summary: health score, finding counts by category, duration
 - Finding churn: new, resolved, unchanged since last run
-- Active telemetry backends and connection status
+- Active telemetry backends and connection status (operator audience only; withheld under the default `user-only`)
 - Active config: loaded modules, enabled rules, thresholds
 - Auto-refreshes every 10 seconds
 
@@ -31,6 +31,13 @@ Embedded web UI (HTML/JS served from the binary, no external dependencies):
 
 Current metric values.
 
+The `backends` array is operator-shaped status metadata (backend kind / endpoint
+/ connectivity). It is disclosed only when the resolved telemetry audience opts
+into operator metrics (`on` / `operator-only`). Under the default `user-only`
+(and under `off`) the array is **empty** — the management collector is built from
+the CLI telemetry config, so a default `chaffra management` run discloses no
+backend metadata.
+
 ```json
 {
   "files_total": 42,
@@ -38,10 +45,17 @@ Current metric values.
   "data_points": [
     { "name": "chaffra.module.call_duration_ms", "value": 150.0, "labels": { "module": "dead-code" } }
   ],
-  "backends": [
-    { "name": "json-file", "kind": "JsonFile", "connected": true, "message": "will write to chaffra-telemetry.json" }
-  ]
+  "backends": []
 }
+```
+
+Under an operator-enabled audience (`on` / `operator-only`) the `backends` array
+is populated, e.g.:
+
+```json
+"backends": [
+  { "name": "json-file", "kind": "JsonFile", "connected": true, "message": "will write to chaffra-telemetry.json" }
+]
 ```
 
 ### `GET /api/v1/metrics/history?window=7d`
@@ -116,14 +130,22 @@ values are the `TelemetryAudience` / `SamplingStrategy` enum variant names
 the kebab-case spelling accepted on input (`[modules.telemetry] audience =
 "user-only"`, `--telemetry user-only`).
 
+The `backends` array (backend kinds) is operator-shaped metadata: it is
+populated only under an operator-enabled audience (`on` / `operator-only`) and
+is **empty** under the default `user-only` (and under `off`), matching the
+`GET /api/v1/metrics` backend gating.
+
 ```json
 {
   "audience": "UserOnly",
   "sampling_rate": 1.0,
   "sampling_strategy": "Rate",
-  "backends": ["JsonFile"]
+  "backends": []
 }
 ```
+
+Under an operator audience the `backends` array is populated (e.g.
+`["JsonFile"]`).
 
 ## Lifecycle
 
