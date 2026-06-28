@@ -189,9 +189,15 @@ impl AnalysisModule for TelemetryModule {
         if !matches!(tel_config.audience, TelemetryAudience::Off) {
             let (active_backends, _) = backends::create_backends(&tel_config.backends);
             for backend in &active_backends {
-                if let Err(e) = backend.flush(&projected) {
-                    eprintln!("[telemetry] backend '{}' flush error: {e}", backend.name());
-                }
+                // Swallow flush errors here, matching the CLI `flush_projected`
+                // sibling that shares this projection boundary. Reporting WHICH
+                // backend failed (`backend.name()` is the operator-shaped kind)
+                // or THAT one failed (connectivity state) would disclose
+                // operator-shaped backend metadata on stderr under a non-operator
+                // audience like `user-only` — the R9-F1 class, one call up the
+                // stack. Backend error diagnostics stay on the operator-gated
+                // `telemetry test` / `status` surfaces.
+                let _ = backend.flush(&projected);
             }
         }
 
