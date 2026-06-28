@@ -331,7 +331,16 @@ impl TelemetrySnapshot {
 /// `#[serde(transparent)]` keeps the serialized shape byte-for-byte identical
 /// to the inner `TelemetrySnapshot`, so backends, on-disk snapshot files, and
 /// the gRPC wire contract are unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Intentionally NOT `Deserialize` (R9-F2): deriving it would expose a public
+/// serde constructor (`from_str` / `from_value`) that wraps raw, UNprojected
+/// input in a `ProjectedSnapshot`, defeating the guarantee that
+/// `project_for_audience` is the only constructor and letting unprojected data
+/// satisfy `TelemetryBackend::flush/inspect`. Only `Serialize` is needed —
+/// backends serialize the projected snapshot OUT; nothing deserializes back
+/// into the wrapper (the inner `TelemetrySnapshot` keeps `Deserialize` for the
+/// on-disk / wire contract).
+#[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub struct ProjectedSnapshot(pub(crate) TelemetrySnapshot);
 

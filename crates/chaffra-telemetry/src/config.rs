@@ -43,11 +43,19 @@ impl TelemetryAudience {
         Self::from_str_loose(s).ok_or_else(|| TelemetryError::InvalidAudience(s.to_owned()))
     }
 
-    /// Parse from a CLI flag value, returning `None` on an unknown value.
+    /// Parse from a CLI flag / file value, returning `None` on an unknown value.
+    ///
+    /// Only the four documented audience modes (plus snake_case spellings) are
+    /// accepted. Boolean/integer-style aliases (`true`/`1`/`false`/`0`) are
+    /// intentionally NOT accepted (R9-F3): `ChaffraConfig::module_config`
+    /// stringifies non-string TOML, so accepting `"true"`/`"1"` would let a
+    /// checked-in `[modules.telemetry] audience = true` (a TOML boolean) silently
+    /// become an operator opt-in. Rejecting them makes any non-string / non-mode
+    /// value fail closed through `parse`.
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "on" | "true" | "1" => Some(Self::On),
-            "off" | "false" | "0" => Some(Self::Off),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
             "user-only" | "user_only" | "user" => Some(Self::UserOnly),
             "operator-only" | "operator_only" | "operator" => Some(Self::OperatorOnly),
             _ => None,
@@ -243,43 +251,44 @@ impl TelemetryConfig {
         // valid-but-out-of-range number is normalised by `clamp` (an explicit,
         // tested behaviour — see `test_sampling_rate_clamped` — not a swallowed
         // parse failure).
-        let sampling_rate = match config
-            .get("sampling-rate")
-            .or_else(|| config.get("sampling_rate"))
-        {
-            Some(v) => {
+        //
+        // EVERY present spelling is validated (R9-F4): a present-but-invalid
+        // alternate spelling must fail closed even when the preferred spelling
+        // is valid, so the short-circuiting `get(...).or_else(get(...))` is
+        // replaced by a loop over both spellings. Iterate snake-case first so
+        // the canonical kebab-case spelling wins when both are present + valid.
+        let mut sampling_rate = 1.0;
+        for key in ["sampling_rate", "sampling-rate"] {
+            if let Some(v) = config.get(key) {
                 let parsed = v.parse::<f64>().map_err(|_| {
                     TelemetryError::InvalidSamplingConfig(format!(
-                        "invalid sampling-rate {v:?} (expected a number in [0.0, 1.0])"
+                        "invalid {key} {v:?} (expected a number in [0.0, 1.0])"
                     ))
                 })?;
                 // `f64::parse` accepts `NaN` / `inf` / `-inf`, and `clamp`
                 // preserves `NaN` — reject non-finite values rather than carry
-                // an undefined rate into sampling decisions. A finite
-                // out-of-range value is still clamped (range normalisation).
+                // an undefined rate into sampling decisions.
                 if !parsed.is_finite() {
                     return Err(TelemetryError::InvalidSamplingConfig(format!(
-                        "non-finite sampling-rate {v:?} (expected a finite number in [0.0, 1.0])"
+                        "non-finite {key} {v:?} (expected a finite number in [0.0, 1.0])"
                     )));
                 }
-                parsed.clamp(0.0, 1.0)
+                sampling_rate = parsed.clamp(0.0, 1.0);
             }
-            None => 1.0,
-        };
+        }
 
-        // Same fail-closed contract for `sampling-strategy`: a present but
-        // unrecognised value is a typed error; an absent key defaults.
-        let sampling_strategy = match config
-            .get("sampling-strategy")
-            .or_else(|| config.get("sampling_strategy"))
-        {
-            Some(v) => SamplingStrategy::from_str_loose(v).ok_or_else(|| {
-                TelemetryError::InvalidSamplingConfig(format!(
-                    "invalid sampling-strategy {v:?} (expected one of: rate, on-change)"
-                ))
-            })?,
-            None => SamplingStrategy::default(),
-        };
+        // Same fail-closed, validate-every-spelling contract for
+        // `sampling-strategy`.
+        let mut sampling_strategy = SamplingStrategy::default();
+        for key in ["sampling_strategy", "sampling-strategy"] {
+            if let Some(v) = config.get(key) {
+                sampling_strategy = SamplingStrategy::from_str_loose(v).ok_or_else(|| {
+                    TelemetryError::InvalidSamplingConfig(format!(
+                        "invalid {key} {v:?} (expected one of: rate, on-change)"
+                    ))
+                })?;
+            }
+        }
 
         Ok(Self {
             audience,
@@ -370,6 +379,15 @@ mod tests {
             Some(TelemetryAudience::OperatorOnly)
         );
         assert_eq!(TelemetryAudience::from_str_loose("bogus"), None);
+        // R9-F3: boolean/integer-style aliases are NOT accepted, so a
+        // stringified non-string TOML `audience` value fails closed.
+        for rejected in ["true", "1", "false", "0"] {
+            assert_eq!(
+                TelemetryAudience::from_str_loose(rejected),
+                None,
+                "alias {rejected} must not be accepted as an audience mode"
+            );
+        }
     }
 
     #[test]
@@ -485,6 +503,47 @@ mod tests {
                 "spelling={spelling}, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_from_module_config_non_string_audience_fails_closed() {
+        // R9-F3: `ChaffraConfig::module_config` stringifies non-string TOML, so
+        // `audience = true` / `audience = 1` arrive here as "true" / "1". These
+        // are NOT documented modes and must fail closed — never silently become
+        // an operator opt-in (`On`).
+        for value in ["true", "1", "false", "0"] {
+            let mut mc = HashMap::new();
+            mc.insert("audience".to_owned(), value.to_owned());
+            let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+            assert!(
+                matches!(err, TelemetryError::InvalidAudience(ref v) if v == value),
+                "audience={value} must fail closed, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_duplicate_sampling_spelling_fails_closed() {
+        // R9-F4: when both spellings are present, a present-but-invalid
+        // alternate spelling must fail closed even though the preferred spelling
+        // is valid (the old `get().or_else(get())` short-circuited past it).
+        let mut mc = HashMap::new();
+        mc.insert("sampling-rate".to_owned(), "0.5".to_owned()); // valid
+        mc.insert("sampling_rate".to_owned(), "banana".to_owned()); // invalid
+        let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+        assert!(
+            matches!(err, TelemetryError::InvalidSamplingConfig(ref v) if v.contains("banana")),
+            "present invalid sampling_rate alias must fail closed, got {err:?}"
+        );
+
+        let mut mc = HashMap::new();
+        mc.insert("sampling-strategy".to_owned(), "rate".to_owned()); // valid
+        mc.insert("sampling_strategy".to_owned(), "bogus".to_owned()); // invalid
+        let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+        assert!(
+            matches!(err, TelemetryError::InvalidSamplingConfig(ref v) if v.contains("bogus")),
+            "present invalid sampling_strategy alias must fail closed, got {err:?}"
+        );
     }
 
     #[test]

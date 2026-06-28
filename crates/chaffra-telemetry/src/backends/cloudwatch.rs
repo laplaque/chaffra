@@ -50,6 +50,16 @@ impl CloudWatchBackend {
             "MetricData": metric_data
         })
     }
+
+    /// Audience-neutral flush log line (R9-F1): omits the operator-shaped
+    /// `namespace`, since the live flush path runs under `user-only` too. The
+    /// namespace stays on the operator-gated `test_connection` / `inspect`
+    /// surfaces.
+    fn flush_log_line(byte_len: usize) -> String {
+        format!(
+            "[cloudwatch] preview: generated {byte_len} byte PutMetricData payload (network export not yet implemented)"
+        )
+    }
 }
 
 impl TelemetryBackend for CloudWatchBackend {
@@ -61,11 +71,7 @@ impl TelemetryBackend for CloudWatchBackend {
         let payload = self.build_payload(snapshot.inner());
         let json = serde_json::to_string(&payload)
             .map_err(|e| TelemetryError::BackendError(format!("CloudWatch payload error: {e}")))?;
-        eprintln!(
-            "[cloudwatch] preview: generated {} byte PutMetricData payload for namespace '{}' (network export not yet implemented)",
-            json.len(),
-            self.namespace
-        );
+        eprintln!("{}", Self::flush_log_line(json.len()));
         Ok(())
     }
 
@@ -134,5 +140,16 @@ mod tests {
             .snapshot()
             .project_for_audience(crate::config::TelemetryAudience::On);
         backend.flush(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn test_cloudwatch_flush_log_omits_namespace() {
+        // R9-F1: the operator-shaped namespace must not appear in the flush log.
+        let backend = CloudWatchBackend::new("operator-secret-namespace".to_owned(), None);
+        let line = CloudWatchBackend::flush_log_line(123);
+        assert!(
+            !line.contains(&backend.namespace) && !line.contains("operator-secret-namespace"),
+            "flush log leaked the CloudWatch namespace: {line}"
+        );
     }
 }

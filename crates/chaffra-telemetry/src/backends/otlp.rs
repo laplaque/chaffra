@@ -70,6 +70,19 @@ impl OtlpBackend {
             }]
         })
     }
+
+    /// Audience-neutral flush log line (R9-F1). The live `run_with_telemetry`
+    /// path flushes under any non-`Off` audience, including the default
+    /// `user-only`, so the flush log must NOT disclose the operator-shaped OTLP
+    /// `endpoint`. It takes only the payload byte length — structurally it
+    /// cannot reference `self.endpoint`. The endpoint stays available on the
+    /// operator-gated surfaces (`test_connection` → `telemetry status`,
+    /// `inspect`).
+    fn flush_log_line(byte_len: usize) -> String {
+        format!(
+            "[otlp] preview: generated {byte_len} byte OTLP payload (network export not yet implemented)"
+        )
+    }
 }
 
 impl TelemetryBackend for OtlpBackend {
@@ -82,11 +95,7 @@ impl TelemetryBackend for OtlpBackend {
         let payload = self.build_payload(snapshot);
         let json = serde_json::to_string(&payload)
             .map_err(|e| TelemetryError::BackendError(format!("OTLP payload error: {e}")))?;
-        eprintln!(
-            "[otlp] preview: generated {} byte OTLP payload for {} (network export not yet implemented)",
-            json.len(),
-            self.endpoint
-        );
+        eprintln!("{}", Self::flush_log_line(json.len()));
         Ok(())
     }
 
@@ -159,5 +168,17 @@ mod tests {
             .snapshot()
             .project_for_audience(crate::config::TelemetryAudience::On);
         backend.flush(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn test_otlp_flush_log_omits_endpoint() {
+        // R9-F1: the live `run_with_telemetry` path flushes under `user-only`,
+        // so the flush log must not disclose the operator-shaped endpoint.
+        let backend = OtlpBackend::new("http://operator-secret-host:4317".to_owned());
+        let line = OtlpBackend::flush_log_line(123);
+        assert!(
+            !line.contains(&backend.endpoint) && !line.contains("operator-secret-host"),
+            "flush log leaked the OTLP endpoint: {line}"
+        );
     }
 }

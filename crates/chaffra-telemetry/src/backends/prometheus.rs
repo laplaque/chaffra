@@ -62,6 +62,13 @@ impl PrometheusBackend {
 
         output
     }
+
+    /// Audience-neutral flush log line (R9-F1): omits the operator-shaped
+    /// `port`, since the live flush path runs under `user-only` too. The port
+    /// stays on the operator-gated `test_connection` / `inspect` surfaces.
+    fn flush_log_line(byte_len: usize) -> String {
+        format!("[prometheus] exposition ready ({byte_len} bytes)")
+    }
 }
 
 impl TelemetryBackend for PrometheusBackend {
@@ -75,11 +82,7 @@ impl TelemetryBackend for PrometheusBackend {
         // served by the HTTP endpoint. For now, we log the exposition text
         // to signal readiness.
         let text = self.render_exposition(snapshot);
-        eprintln!(
-            "[prometheus] exposition ready ({} bytes, port {})",
-            text.len(),
-            self.port
-        );
+        eprintln!("{}", Self::flush_log_line(text.len()));
         Ok(())
     }
 
@@ -152,5 +155,16 @@ mod tests {
             .snapshot()
             .project_for_audience(crate::config::TelemetryAudience::On);
         backend.flush(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn test_prometheus_flush_log_omits_port() {
+        // R9-F1: the operator-shaped port must not appear in the live flush log.
+        let backend = PrometheusBackend::new(59090);
+        let line = PrometheusBackend::flush_log_line(123);
+        assert!(
+            !line.contains(&backend.port.to_string()),
+            "flush log leaked the Prometheus port: {line}"
+        );
     }
 }
