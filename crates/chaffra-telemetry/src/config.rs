@@ -84,7 +84,21 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
-    /// Parse from a CLI flag value.
+    /// Parse from a CLI/file value, failing closed on an unknown value.
+    ///
+    /// Mirrors [`TelemetryAudience::parse`]: a present-but-unrecognised backend
+    /// is a typed error rather than `None`, so neither the file
+    /// (`[modules.telemetry] backend`) nor the CLI (`--telemetry-backend`) path
+    /// can silently coerce a typo (`otlpz`) into the default JSON-file backend.
+    pub fn parse(s: &str) -> Result<Self, TelemetryError> {
+        Self::from_str_loose(s).ok_or_else(|| {
+            TelemetryError::InvalidBackendConfig(format!(
+                "unknown backend {s:?} (expected one of: json-file, stderr, prometheus, otlp, statsd, cloudwatch)"
+            ))
+        })
+    }
+
+    /// Parse from a CLI flag value, returning `None` on an unknown value.
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().replace('_', "-").as_str() {
             "json-file" | "json" | "file" => Some(Self::JsonFile),
@@ -193,35 +207,34 @@ fn default_backends() -> Vec<BackendConfig> {
 impl TelemetryConfig {
     /// Build config from the `[modules.telemetry]` section of chaffra config.
     ///
-    /// Fails closed: an `audience`, `sampling-rate`, or `sampling-strategy` key
-    /// with an unrecognised value is a typed error, never coerced to the
-    /// default (a valid-but-out-of-range `sampling-rate` is clamped, which is
-    /// range normalisation, not a swallowed parse failure). An ABSENT key
-    /// defaults. This is the single config-loading path shared by the CLI and
-    /// the telemetry module — there is no lenient alternate path that would let
-    /// a malformed value silently take effect.
+    /// Fails closed: a `backend`, `audience`, `sampling-rate`, or
+    /// `sampling-strategy` key with an unrecognised value is a typed error,
+    /// never coerced to the default (a valid-but-out-of-range `sampling-rate`
+    /// is clamped, which is range normalisation, not a swallowed parse failure;
+    /// a non-finite `sampling-rate` is rejected). An ABSENT key defaults. This
+    /// is the single config-loading path shared by the CLI and the telemetry
+    /// module — there is no lenient alternate path that would let a malformed
+    /// value silently take effect.
     pub fn from_module_config(config: &HashMap<String, String>) -> Result<Self, TelemetryError> {
         let audience = match config.get("audience") {
             Some(v) => TelemetryAudience::parse(v)?,
             None => TelemetryAudience::default(),
         };
 
-        let backend_kind = config
-            .get("backend")
-            .and_then(|v| BackendKind::from_str_loose(v));
-
         let endpoint = config.get("endpoint").cloned();
         let path = config.get("path").cloned();
 
-        let backends = if let Some(kind) = backend_kind {
-            vec![BackendConfig {
-                kind,
+        // Fail closed on a present-but-invalid `backend` (mirroring `audience`):
+        // an unrecognised value is a typed error, never silently coerced to the
+        // default JSON-file backend. An ABSENT key still uses `default_backends`.
+        let backends = match config.get("backend") {
+            Some(v) => vec![BackendConfig {
+                kind: BackendKind::parse(v)?,
                 endpoint,
                 path,
                 options: HashMap::new(),
-            }]
-        } else {
-            default_backends()
+            }],
+            None => default_backends(),
         };
 
         // Fail closed on a present-but-invalid value (mirroring `audience`):
@@ -234,14 +247,23 @@ impl TelemetryConfig {
             .get("sampling-rate")
             .or_else(|| config.get("sampling_rate"))
         {
-            Some(v) => v
-                .parse::<f64>()
-                .map_err(|_| {
+            Some(v) => {
+                let parsed = v.parse::<f64>().map_err(|_| {
                     TelemetryError::InvalidSamplingConfig(format!(
                         "invalid sampling-rate {v:?} (expected a number in [0.0, 1.0])"
                     ))
-                })?
-                .clamp(0.0, 1.0),
+                })?;
+                // `f64::parse` accepts `NaN` / `inf` / `-inf`, and `clamp`
+                // preserves `NaN` — reject non-finite values rather than carry
+                // an undefined rate into sampling decisions. A finite
+                // out-of-range value is still clamped (range normalisation).
+                if !parsed.is_finite() {
+                    return Err(TelemetryError::InvalidSamplingConfig(format!(
+                        "non-finite sampling-rate {v:?} (expected a finite number in [0.0, 1.0])"
+                    )));
+                }
+                parsed.clamp(0.0, 1.0)
+            }
             None => 1.0,
         };
 
@@ -461,6 +483,34 @@ mod tests {
             assert!(
                 matches!(err, TelemetryError::InvalidSamplingConfig(ref v) if v.contains("bogus")),
                 "spelling={spelling}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_module_config_invalid_backend_fails_closed() {
+        // A present-but-unrecognised `backend` is a typed error, never silently
+        // coerced to the default JSON-file backend.
+        let mut mc = HashMap::new();
+        mc.insert("backend".to_owned(), "otlpz".to_owned());
+        let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+        assert!(
+            matches!(err, TelemetryError::InvalidBackendConfig(ref v) if v.contains("otlpz")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_from_module_config_non_finite_sampling_rate_fails_closed() {
+        // `f64::parse` accepts NaN/inf/-inf; these are present-but-invalid and
+        // must fail closed rather than carry a non-finite rate into sampling.
+        for value in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            let mut mc = HashMap::new();
+            mc.insert("sampling-rate".to_owned(), value.to_owned());
+            let err = TelemetryConfig::from_module_config(&mc).unwrap_err();
+            assert!(
+                matches!(err, TelemetryError::InvalidSamplingConfig(ref v) if v.contains("non-finite")),
+                "value={value}, got {err:?}"
             );
         }
     }

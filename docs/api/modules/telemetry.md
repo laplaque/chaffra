@@ -170,6 +170,11 @@ Audience-gated output beyond the snapshot itself (R4):
 - The MCP `chaffra/telemetry` tool's `status` and `backends` actions (backend
   connectivity / catalogue) follow the same gate. The `snapshot` action
   projects via `project_for_audience(config.audience)` before serializing.
+- The CLI `chaffra telemetry status` command follows the same gate: it prints
+  the resolved audience, but the backend catalogue / connectivity is disclosed
+  ONLY under `On` / `OperatorOnly`. Under `user-only` / `off` it prints a
+  "withheld" line pointing at the explicit opt-in, so the CLI status boundary
+  matches the module finding and the MCP actions.
 - The MCP tool ALWAYS runs at the project's **resolved** audience: it loads the
   `path` repository root's `.chaffra.toml` through the same strict loader as the
   other tools and honours a `[modules.telemetry] audience` opt-in, falling back
@@ -252,6 +257,13 @@ sampling-rate = 1.0          # 0.0–1.0
 sampling-strategy = "rate"   # rate | on-change
 ```
 
+All values **fail closed**: a present-but-unrecognised `audience`, `backend`,
+or `sampling-strategy`, or a non-numeric / non-finite (`NaN`/`inf`)
+`sampling-rate`, is surfaced as a typed configuration error rather than coerced
+to a default. (A finite but out-of-range `sampling-rate` is clamped to
+`[0.0, 1.0]`.) The same typed parsers back the CLI flags — `--telemetry`,
+`--telemetry-backend` — so an invalid flag value errors identically.
+
 ## Parse Cache Metrics (helper API)
 
 Library helper for tracking incremental parse cache effectiveness. Provides atomic counters and a `flush_to_collector()` method for integration into cache-aware code paths.
@@ -301,7 +313,7 @@ chaffra telemetry audit-log --export   # Export as JSON array for GDPR data subj
 ## CLI
 
 ```
-chaffra telemetry status      # Show backends and connection status
+chaffra telemetry status      # Show resolved audience; backend catalogue/connectivity shown ONLY under on|operator-only (withheld under user-only/off)
 chaffra telemetry test        # Emit test metric, report success/failure
 chaffra telemetry inspect     # Dry-run: show metric payload
 chaffra telemetry dashboard   # Generate Grafana dashboard JSON

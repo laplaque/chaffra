@@ -1279,7 +1279,7 @@ fn cmd_migrate(tool_name: &str, project_dir: &Path, write: bool) -> Result<Strin
     Ok(out)
 }
 
-fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
+fn build_telemetry_config(cli: &Cli) -> Result<chaffra_telemetry::TelemetryConfig> {
     // `cli.telemetry` is the parsed `--telemetry` flag (`None` when omitted).
     // The base audience is the flag value or the privacy-preserving `user-only`
     // default; the project file's `audience` (if any) is layered on later in
@@ -1288,16 +1288,17 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
     let audience = cli.telemetry.unwrap_or_default();
 
     let backends = if let Some(ref backend_str) = cli.telemetry_backend {
-        if let Some(kind) = chaffra_telemetry::BackendKind::from_str_loose(backend_str) {
-            vec![chaffra_telemetry::BackendConfig {
-                kind,
-                endpoint: cli.telemetry_endpoint.clone(),
-                path: None,
-                options: HashMap::new(),
-            }]
-        } else {
-            chaffra_telemetry::TelemetryConfig::default().backends
-        }
+        // Fail closed on a present-but-invalid `--telemetry-backend`, through
+        // the SAME typed parser the file path uses — no lenient default
+        // fallback that would silently run JSON-file telemetry for a typo.
+        let kind = chaffra_telemetry::BackendKind::parse(backend_str)
+            .map_err(|e| anyhow::anyhow!("invalid --telemetry-backend: {e}"))?;
+        vec![chaffra_telemetry::BackendConfig {
+            kind,
+            endpoint: cli.telemetry_endpoint.clone(),
+            path: None,
+            options: HashMap::new(),
+        }]
     } else if let Some(ref endpoint) = cli.telemetry_endpoint {
         vec![chaffra_telemetry::BackendConfig {
             kind: chaffra_telemetry::BackendKind::Otlp,
@@ -1309,13 +1310,13 @@ fn build_telemetry_config(cli: &Cli) -> chaffra_telemetry::TelemetryConfig {
         chaffra_telemetry::TelemetryConfig::default().backends
     };
 
-    chaffra_telemetry::TelemetryConfig {
+    Ok(chaffra_telemetry::TelemetryConfig {
         audience,
         backends,
         cli_audience_override: cli.telemetry,
         cli_config_path: cli.config.clone(),
         ..Default::default()
-    }
+    })
 }
 
 /// `--config <file>` from the CLI dispatch, carried on `cli_config` so the
@@ -1372,8 +1373,22 @@ fn cmd_telemetry_status_in(
     let resolved = resolve_subcommand_telemetry(cli_config, config_path, project_dir)?;
     let mut out = String::new();
     out.push_str(&format!("Telemetry mode: {:?}\n\n", resolved.audience));
-    out.push_str("Backends:\n");
 
+    // Backend kind / endpoint / connectivity is operator-shaped, exactly like
+    // the `TelemetryModule::analyze` `backend-status` finding (R4-1) and the MCP
+    // `status` / `backends` actions (R4-3). Gate this CLI output boundary the
+    // same way: disclose the backend catalogue only when the resolved audience
+    // includes the operator scope. Under `user-only` / `off` the catalogue is
+    // withheld, with a hint at the explicit opt-in.
+    if !resolved.audience.operator_enabled() {
+        out.push_str(
+            "Backends: (withheld — operator telemetry is not enabled at this audience; \
+             use --telemetry on|operator-only or [modules.telemetry] audience to view)\n",
+        );
+        return Ok(out);
+    }
+
+    out.push_str("Backends:\n");
     let (_, statuses) = chaffra_telemetry::backends::create_backends(&resolved.backends);
     for status in &statuses {
         let icon = if status.connected { "OK" } else { "FAIL" };
@@ -1661,7 +1676,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_str_loose(&cli.format).unwrap_or(OutputFormat::Terminal);
     let formatter = create_formatter(format);
-    let tel_config = build_telemetry_config(&cli);
+    let tel_config = build_telemetry_config(&cli)?;
 
     match cli.command {
         Command::Health { path } => {
@@ -3601,7 +3616,7 @@ mod tests {
             telemetry_backend: None,
             telemetry_endpoint: None,
         };
-        let config = build_telemetry_config(&cli);
+        let config = build_telemetry_config(&cli).unwrap();
         assert_eq!(
             config.audience,
             chaffra_telemetry::TelemetryAudience::UserOnly
@@ -3620,7 +3635,7 @@ mod tests {
             telemetry_backend: None,
             telemetry_endpoint: None,
         };
-        let config = build_telemetry_config(&cli);
+        let config = build_telemetry_config(&cli).unwrap();
         assert_eq!(
             config.audience,
             chaffra_telemetry::TelemetryAudience::OperatorOnly
@@ -3629,6 +3644,87 @@ mod tests {
         assert_eq!(
             config.cli_audience_override,
             Some(chaffra_telemetry::TelemetryAudience::OperatorOnly)
+        );
+    }
+
+    #[test]
+    fn test_build_telemetry_config_invalid_backend_fails_closed() {
+        // A present-but-invalid `--telemetry-backend` is a hard error, routed
+        // through the same typed `BackendKind::parse` the file path uses — no
+        // silent fallback to the default JSON-file backend.
+        let cli = Cli {
+            command: Command::Health {
+                path: ".".to_owned(),
+            },
+            format: "terminal".to_owned(),
+            config: None,
+            telemetry: None,
+            telemetry_backend: Some("otlpz".to_owned()),
+            telemetry_endpoint: None,
+        };
+        let err = build_telemetry_config(&cli).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --telemetry-backend"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_telemetry_config_valid_backend() {
+        // A valid `--telemetry-backend` is parsed through the typed parser and
+        // produces exactly that backend (no default fallback).
+        let cli = Cli {
+            command: Command::Health {
+                path: ".".to_owned(),
+            },
+            format: "terminal".to_owned(),
+            config: None,
+            telemetry: None,
+            telemetry_backend: Some("stderr".to_owned()),
+            telemetry_endpoint: Some("ignored".to_owned()),
+        };
+        let config = build_telemetry_config(&cli).unwrap();
+        assert_eq!(config.backends.len(), 1);
+        assert_eq!(
+            config.backends[0].kind,
+            chaffra_telemetry::BackendKind::Stderr
+        );
+        assert_eq!(config.backends[0].endpoint.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn test_telemetry_status_withholds_backends_under_user_only() {
+        // F3: backend kind/connectivity is operator-shaped, so `telemetry
+        // status` withholds it under the default `user-only` audience, matching
+        // MCP `status`/`backends` and the `backend-status` finding.
+        let dir = TempDir::new().unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig::default();
+        let out = cmd_telemetry_status_in(&cli_config, None, dir.path()).unwrap();
+        assert!(out.contains("Telemetry mode: UserOnly"), "got: {out}");
+        assert!(
+            out.contains("withheld"),
+            "user-only status must withhold backend metadata, got: {out}"
+        );
+        assert!(
+            !out.contains("[OK]") && !out.contains("[FAIL]"),
+            "no backend connectivity may appear under user-only, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_status_shows_backends_under_operator() {
+        // Under an explicit operator opt-in the catalogue IS disclosed.
+        let dir = TempDir::new().unwrap();
+        let cli_config = chaffra_telemetry::TelemetryConfig {
+            audience: chaffra_telemetry::TelemetryAudience::On,
+            cli_audience_override: Some(chaffra_telemetry::TelemetryAudience::On),
+            ..Default::default()
+        };
+        let out = cmd_telemetry_status_in(&cli_config, None, dir.path()).unwrap();
+        assert!(out.contains("Telemetry mode: On"), "got: {out}");
+        assert!(
+            out.contains("Backends:") && !out.contains("withheld"),
+            "operator status must list the backend catalogue, got: {out}"
         );
     }
 
