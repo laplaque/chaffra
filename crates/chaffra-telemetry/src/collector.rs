@@ -316,9 +316,16 @@ impl TelemetrySnapshot {
 
 /// A [`TelemetrySnapshot`] that has been projected through a specific
 /// audience. The ONLY way to construct one is via
-/// [`TelemetrySnapshot::project_for_audience`]; the inner snapshot is
-/// `pub(crate)` so callers outside `chaffra-telemetry` cannot wrap a raw
-/// snapshot or extract the inner without going through projection.
+/// [`TelemetrySnapshot::project_for_audience`]: the inner snapshot field is
+/// PRIVATE (R12-F1), so no code — not even another module inside
+/// `chaffra-telemetry`, where the backend/module output boundaries live — can
+/// wrap a raw, unprojected snapshot in a `ProjectedSnapshot` and satisfy
+/// `TelemetryBackend::flush/inspect`. Read access for in-crate serialization is
+/// via [`Self::inner`]; external callers read fields through the immutable
+/// [`std::ops::Deref`] impl. The field was previously `pub(crate)`, which left
+/// the tuple constructor reachable from the very crate that owns the output
+/// boundaries — a same-crate bypass of the structural guard this newtype exists
+/// to enforce.
 ///
 /// This newtype is the structural fix R5 added: the
 /// [`crate::backends::TelemetryBackend::flush`] /
@@ -342,7 +349,7 @@ impl TelemetrySnapshot {
 /// on-disk / wire contract).
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
-pub struct ProjectedSnapshot(pub(crate) TelemetrySnapshot);
+pub struct ProjectedSnapshot(TelemetrySnapshot);
 
 impl ProjectedSnapshot {
     /// Reference the inner projected [`TelemetrySnapshot`]. `pub(crate)` so
