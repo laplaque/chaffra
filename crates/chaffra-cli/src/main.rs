@@ -4037,7 +4037,10 @@ mod tests {
         };
         let out = cmd_telemetry_test_in(&tel_config, None, dir.path()).unwrap();
         assert!(out.contains("Telemetry mode: UserOnly"), "got: {out}");
-        assert!(!out.contains("flushed"), "no flush under user-only, got: {out}");
+        assert!(
+            !out.contains("flushed"),
+            "no flush under user-only, got: {out}"
+        );
         assert!(
             !out.to_lowercase().contains("otlp") && !out.contains("operator-secret-host"),
             "backend kind/endpoint leaked under user-only, got: {out}"
