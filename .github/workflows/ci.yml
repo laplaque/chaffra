@@ -152,7 +152,7 @@ jobs:
       # workflow under the repository's existing major-tag style; keep
       # that style for the ones the repository was already trusting at
       # the major tag.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Run unit tests
@@ -306,7 +306,7 @@ jobs:
       # Guarantees a `python3` on every runner (including Windows, which does
       # not reliably expose `python3` by default) for the LCOV path
       # normalization step below. SHA-pinned to the commit at the v5 tag.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Install protoc (Linux)
@@ -447,7 +447,7 @@ jobs:
           ref: ${{ needs.coverage-prep.outputs.head }}
           fetch-depth: 0
       # SHA-pinned to the commit at the v5 tag (currently v5.6.0).
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.COVERAGE_PYTHON_VERSION }}
       - name: Verify resolved head SHA matches checkout
