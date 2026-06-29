@@ -196,11 +196,15 @@ Audience-gated output beyond the snapshot itself (R4):
   reads the collector snapshot projects it via
   `project_for_audience(config.audience)` before serializing, so under the default
   `user-only` it discloses no operator data points or per-module timing/error
-  state. Backend kind/connectivity is operator-shaped *config metadata* (not part
-  of the snapshot) and carries its own `operator_enabled()` gate on the `metrics`
-  and `config` endpoints. The co-located live-collector / history integration is
-  deferred (Stage 15a.3); the audience gate on the standalone outputs is enforced
-  now.
+  state. Backend kind/connectivity **and the sampling configuration**
+  (`sampling_rate` / `sampling_strategy`) are operator-shaped *config metadata*
+  (not part of the snapshot) and carry their own `operator_enabled()` gate: the
+  `/metrics` and `/config` backend lists are empty and the `/config` sampling
+  fields are `null` under `user-only` / `off` (R10-F2, R13). `chaffra management`
+  also resolves its telemetry config through the same shared fail-closed loader as
+  the live runs (R11-F1), so a checked-in `[modules.telemetry]` audience/backend
+  governs it. The co-located live-collector / history integration is deferred
+  (Stage 15a.3); the audience gate on the standalone outputs is enforced now.
 
 #### GDPR rationale
 
