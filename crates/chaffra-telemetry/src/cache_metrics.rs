@@ -1,4 +1,5 @@
 use crate::collector::TelemetryCollector;
+use crate::metrics::metric_names;
 use crate::metrics::{MetricDefinition, MetricKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,31 +72,31 @@ impl ParseCacheMetrics {
 
         let points = vec![
             MetricDataPoint {
-                name: "chaffra.parse.cache_hits".to_owned(),
+                name: metric_names::PARSE_CACHE_HITS.to_owned(),
                 value: self.hits() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
             },
             MetricDataPoint {
-                name: "chaffra.parse.cache_misses".to_owned(),
+                name: metric_names::PARSE_CACHE_MISSES.to_owned(),
                 value: self.misses() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
             },
             MetricDataPoint {
-                name: "chaffra.parse.cache_hit_rate".to_owned(),
+                name: metric_names::PARSE_CACHE_HIT_RATE.to_owned(),
                 value: self.hit_rate(),
                 labels: HashMap::new(),
                 timestamp_ms: ts,
             },
             MetricDataPoint {
-                name: "chaffra.parse.cache_size_bytes".to_owned(),
+                name: metric_names::PARSE_CACHE_SIZE_BYTES.to_owned(),
                 value: self.size_bytes() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
             },
             MetricDataPoint {
-                name: "chaffra.parse.cache_evictions".to_owned(),
+                name: metric_names::PARSE_CACHE_EVICTIONS.to_owned(),
                 value: self.evictions() as f64,
                 labels: HashMap::new(),
                 timestamp_ms: ts,
@@ -115,31 +116,31 @@ impl Default for ParseCacheMetrics {
 pub fn register_cache_metrics(collector: &TelemetryCollector) {
     let definitions = vec![
         MetricDefinition {
-            name: "chaffra.parse.cache_hits".to_owned(),
+            name: metric_names::PARSE_CACHE_HITS.to_owned(),
             kind: MetricKind::Counter,
             description: "Files served from parse cache".to_owned(),
             unit: "count".to_owned(),
         },
         MetricDefinition {
-            name: "chaffra.parse.cache_misses".to_owned(),
+            name: metric_names::PARSE_CACHE_MISSES.to_owned(),
             kind: MetricKind::Counter,
             description: "Files re-parsed (cache miss)".to_owned(),
             unit: "count".to_owned(),
         },
         MetricDefinition {
-            name: "chaffra.parse.cache_hit_rate".to_owned(),
+            name: metric_names::PARSE_CACHE_HIT_RATE.to_owned(),
             kind: MetricKind::Gauge,
             description: "Cache hit rate (hits / total)".to_owned(),
             unit: "ratio".to_owned(),
         },
         MetricDefinition {
-            name: "chaffra.parse.cache_size_bytes".to_owned(),
+            name: metric_names::PARSE_CACHE_SIZE_BYTES.to_owned(),
             kind: MetricKind::Gauge,
             description: "Current parse cache memory usage".to_owned(),
             unit: "bytes".to_owned(),
         },
         MetricDefinition {
-            name: "chaffra.parse.cache_evictions".to_owned(),
+            name: metric_names::PARSE_CACHE_EVICTIONS.to_owned(),
             kind: MetricKind::Counter,
             description: "Parse cache entries evicted".to_owned(),
             unit: "count".to_owned(),

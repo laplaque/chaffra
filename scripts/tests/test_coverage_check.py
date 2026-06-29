@@ -394,6 +394,30 @@ class TestDeclaredSummaryCannotInflateOverall(CheckerTestCase):
         self.assertEqual(report["status"], "malformed_input")
         self.assertIn("hits unaccounted", report["detail"])
 
+    def test_lh_undercount_is_tolerated(self) -> None:
+        # LLVM's `llvm-cov export` can emit an LH summary BELOW the number of
+        # DA lines with a nonzero hit count (observed off-by-one under the
+        # feature-powerset profraw accumulation; reproduced across
+        # cargo-llvm-cov 0.6.21 and 0.8.7, so it is an LLVM-level quirk). LH is
+        # advisory — the score is DA-derived — and an undercount is the
+        # OPPOSITE of inflation, so the parser clamps the effective LH up to
+        # the DA hit count and accepts the block rather than rejecting it.
+        #
+        # config.rs: 3 DA lines all hit, but LH:2 (undercount by one). The
+        # block must parse and the DA detail (3/3 covered) must drive the
+        # score — not the malformed-exit path the bound used to take.
+        lcov = (
+            "SF:crates/chaffra-core/src/config.rs\n"
+            "DA:1,1\nDA:2,1\nDA:3,1\nLF:3\nLH:2\nend_of_record\n"
+        )
+        diff = diff_text([(BASIC_TRUST_BOUNDARY_FILE, [(1, 1), (2, 1), (3, 1)])])
+        rc, report, _ = self.run_check(lcov=lcov, policy=basic_policy(), diff=diff)
+        self.assertNotEqual(rc, coverage_check.EXIT_MALFORMED)
+        # DA detail is authoritative: all 3 instrumented lines covered.
+        self.assertEqual(report["overall"]["instrumented_lines"], 3)
+        self.assertEqual(report["overall"]["covered_lines"], 3)
+        self.assertAlmostEqual(report["overall"]["percent"], 100.0, places=2)
+
 
 class TestSyntheticSfPathsAreDropped(CheckerTestCase):
     """H5: a producer that emits an in-tree-looking but untracked SF path
@@ -907,10 +931,12 @@ class TestMalformedLcovTable(CheckerTestCase):
     """
 
     # Active SF blocks require exactly one LF and exactly one LH, validated
-    # under: LH<=LF; LF>=unique DA lines; LH>=unique hit DA lines; and the
-    # reconciliation bound (LH - covered_DA) <= (LF - unique_DA). Violations
-    # exit 2 with a failure artifact. See parse_lcov's docstring for the
-    # full contract.
+    # under: LH<=LF; LF>=unique DA lines; and the unseen-hits reconciliation
+    # bound (effective_LH - covered_DA) <= (LF - unique_DA). LH is NOT
+    # required to be >= unique-hit-DA — the parser clamps an LH that
+    # undercounts the DA hit detail (a benign LLVM llvm-cov export quirk; see
+    # test_lh_undercount_is_tolerated and parse_lcov's docstring). Violations
+    # of the remaining bounds exit 2 with a failure artifact.
     CASES: list[tuple[str, str]] = [
         ("non-numeric DA hits", "SF:foo.rs\nDA:1,not-a-number\nend_of_record\n"),
         ("missing end_of_record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\n"),
@@ -923,7 +949,10 @@ class TestMalformedLcovTable(CheckerTestCase):
         ("duplicate LH record", "SF:foo.rs\nDA:1,1\nLF:1\nLH:1\nLH:1\nend_of_record\n"),
         ("LH > LF", "SF:foo.rs\nDA:1,1\nLF:1\nLH:5\nend_of_record\n"),
         ("LF below unique DA lines", "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:1\nLH:2\nend_of_record\n"),
-        ("LH below unique hit DA lines", "SF:foo.rs\nDA:1,1\nDA:2,1\nLF:2\nLH:1\nend_of_record\n"),
+        # NOTE: `LH below unique hit DA lines` is intentionally NOT a malformed
+        # case — LLVM's llvm-cov export can undercount LH (the opposite of
+        # inflation), which the parser now clamps and accepts. See
+        # `TestDeclaredSummaryCannotInflateOverall.test_lh_undercount_is_tolerated`.
         # Reconciliation bound: unseen_hits=LH-covered_DA (2-0=2) must
         # not exceed unseen_inst=LF-unique_DA (2-1=1). Producer claims hits
         # behind the DA records that exceed the undeclared instrumentation.

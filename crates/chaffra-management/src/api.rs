@@ -81,8 +81,11 @@ pub struct FileHealthEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigResponse {
     pub audience: String,
-    pub sampling_rate: f64,
-    pub sampling_strategy: String,
+    /// Operator-shaped: the operator-telemetry sampling policy. `None`
+    /// (serialized as `null`) when the resolved audience is not operator-enabled
+    /// (R13). Populated only under `on` / `operator-only`.
+    pub sampling_rate: Option<f64>,
+    pub sampling_strategy: Option<String>,
     pub backends: Vec<String>,
 }
 
@@ -97,7 +100,17 @@ fn default_window() -> String {
 }
 
 pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<MetricsResponse> {
-    let snapshot = state.collector.snapshot();
+    let audience = state.collector.config().audience;
+    // The management dashboard is an output boundary like the CLI, MCP, and
+    // backend-flush paths, so it must project the snapshot through the resolved
+    // audience before disclosing it. Reusing the audited type-level guard
+    // (`project_for_audience`) — rather than a hand-rolled per-field filter —
+    // scrubs operator-shaped payload (operator `data_points`, per-module timing)
+    // under the default `user-only`, with no risk of the projection logic and a
+    // bespoke management filter drifting apart. The remaining co-located
+    // live-collector / history integration is Stage 15a.3; the audience gate on
+    // the standalone outputs is enforced here now.
+    let snapshot = state.collector.snapshot().project_for_audience(audience);
     let data_points = snapshot
         .data_points
         .iter()
@@ -108,17 +121,26 @@ pub async fn get_metrics(state: axum::extract::State<Arc<SharedState>>) -> Json<
         })
         .collect();
 
-    let (_, statuses) =
-        chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
-    let backends = statuses
-        .into_iter()
-        .map(|s| BackendStatusEntry {
-            name: s.name,
-            kind: s.kind,
-            connected: s.connected,
-            message: s.message,
-        })
-        .collect();
+    // R10-F2: backend kind / endpoint / connectivity is operator-shaped
+    // config/status *metadata* (not part of the snapshot payload), so it carries
+    // its own audience gate. The management collector is built from the CLI
+    // telemetry config (default `user-only`), so disclose backend status only
+    // when the operator audience is opted in; otherwise return an empty list.
+    let backends = if audience.operator_enabled() {
+        let (_, statuses) =
+            chaffra_telemetry::backends::create_backends(&state.collector.config().backends);
+        statuses
+            .into_iter()
+            .map(|s| BackendStatusEntry {
+                name: s.name,
+                kind: s.kind,
+                connected: s.connected,
+                message: s.message,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Json(MetricsResponse {
         files_total: snapshot.user_summary.files_total,
@@ -141,7 +163,12 @@ pub async fn get_metrics_history(
 }
 
 pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<ModulesResponse> {
-    let snapshot = state.collector.snapshot();
+    // Project so operator-shaped fields are scrubbed under `user-only`: the
+    // per-module `duration_ms` is the operator `chaffra.module.call_duration_ms`
+    // (zeroed by projection), and the error-derived `status` reads
+    // `operator_summary.module_error_counts` (emptied by projection → "healthy").
+    let audience = state.collector.config().audience;
+    let snapshot = state.collector.snapshot().project_for_audience(audience);
     let modules = snapshot
         .user_summary
         .module_summaries
@@ -174,7 +201,12 @@ pub async fn get_modules(state: axum::extract::State<Arc<SharedState>>) -> Json<
 pub async fn get_findings_summary(
     state: axum::extract::State<Arc<SharedState>>,
 ) -> Json<FindingsSummaryResponse> {
-    let snapshot = state.collector.snapshot();
+    // Project for output-boundary consistency. Finding counts are user-facing
+    // (`KNOWN_USER`) so they survive `user-only`; routing every handler through
+    // the guard keeps management uniform and fail-closed if an operator-shaped
+    // field is ever added to the user summary.
+    let audience = state.collector.config().audience;
+    let snapshot = state.collector.snapshot().project_for_audience(audience);
     let total = snapshot
         .user_summary
         .findings_by_module
@@ -191,7 +223,11 @@ pub async fn get_findings_summary(
 pub async fn get_findings_churn(
     state: axum::extract::State<Arc<SharedState>>,
 ) -> Json<FindingsChurnResponse> {
-    let snapshot = state.collector.snapshot();
+    // Project: churn data points (`chaffra.findings.{new,resolved,unchanged,
+    // churn_rate}`) are `KNOWN_USER` and survive `user-only`; the projection
+    // strips any operator-classified point that would otherwise be readable here.
+    let audience = state.collector.config().audience;
+    let snapshot = state.collector.snapshot().project_for_audience(audience);
     let churn_new = snapshot
         .data_points
         .iter()
@@ -226,7 +262,10 @@ pub async fn get_findings_churn(
 }
 
 pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<HealthResponse> {
-    let snapshot = state.collector.snapshot();
+    // Project: per-module `health_score` points (`chaffra.module.<id>.health_score`)
+    // are `KNOWN_USER` (user-facing analysis output) and survive `user-only`.
+    let audience = state.collector.config().audience;
+    let snapshot = state.collector.snapshot().project_for_audience(audience);
     let health_scores: Vec<f64> = snapshot
         .data_points
         .iter()
@@ -257,16 +296,39 @@ pub async fn get_health(state: axum::extract::State<Arc<SharedState>>) -> Json<H
 
 pub async fn get_config(state: axum::extract::State<Arc<SharedState>>) -> Json<ConfigResponse> {
     let config = state.collector.config();
+    let operator = config.audience.operator_enabled();
 
-    Json(ConfigResponse {
-        audience: format!("{:?}", config.audience),
-        sampling_rate: config.sampling_rate,
-        sampling_strategy: format!("{:?}", config.sampling_strategy),
-        backends: config
+    // Backend kinds AND the sampling configuration are operator-shaped config
+    // metadata — they describe the operator-telemetry emission policy (where
+    // operator metrics go, and how often they are flushed). `project_for_audience`
+    // scrubs the snapshot payload, not config metadata, so these need their own
+    // audience gate here. Disclose them only under an operator-enabled audience;
+    // under the default `user-only` (or `off`) the backend list is empty and the
+    // sampling fields are withheld (`null`). R10-F2 (backends) + R13 (sampling).
+    // The `audience` field itself is the user-facing mode and is always reported.
+    let backends = if operator {
+        config
             .backends
             .iter()
             .map(|b| format!("{:?}", b.kind))
-            .collect(),
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let (sampling_rate, sampling_strategy) = if operator {
+        (
+            Some(config.sampling_rate),
+            Some(format!("{:?}", config.sampling_strategy)),
+        )
+    } else {
+        (None, None)
+    };
+
+    Json(ConfigResponse {
+        audience: format!("{:?}", config.audience),
+        sampling_rate,
+        sampling_strategy,
+        backends,
     })
 }
 

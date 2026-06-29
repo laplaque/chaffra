@@ -1,7 +1,11 @@
 //! Telemetry backend sink implementations.
 //!
-//! Each backend receives a `TelemetrySnapshot` and writes it to
-//! the appropriate target (file, stderr, HTTP endpoint, etc.).
+//! Each backend receives a `ProjectedSnapshot` — a `TelemetrySnapshot` that
+//! has been filtered through a specific audience — and writes it to the
+//! appropriate target (file, stderr, HTTP endpoint, etc.). The newtype is
+//! the structural fix R5 added: callers cannot pass a raw, unprojected
+//! snapshot to a backend, because the only way to construct a
+//! `ProjectedSnapshot` is via `TelemetrySnapshot::project_for_audience`.
 
 pub mod cloudwatch;
 pub mod json_file;
@@ -10,7 +14,7 @@ pub mod prometheus;
 pub mod statsd;
 pub mod stderr;
 
-use crate::collector::TelemetrySnapshot;
+use crate::collector::ProjectedSnapshot;
 use crate::config::{BackendConfig, BackendKind};
 use crate::error::{Result, TelemetryError};
 
@@ -19,14 +23,14 @@ pub trait TelemetryBackend: Send + Sync + std::fmt::Debug {
     /// Backend name for status reporting.
     fn name(&self) -> &str;
 
-    /// Flush the given snapshot to this backend.
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()>;
+    /// Flush the given audience-projected snapshot to this backend.
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()>;
 
     /// Test connectivity (used by `chaffra telemetry test`).
     fn test_connection(&self) -> Result<String>;
 
     /// Generate a dry-run payload preview (used by `chaffra telemetry inspect`).
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String>;
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String>;
 }
 
 /// Create a backend from its configuration.

@@ -1,12 +1,36 @@
 //! Telemetry collector: aggregates metrics and spans from all modules.
 
-use crate::config::TelemetryConfig;
+use crate::config::{TelemetryAudience, TelemetryConfig};
 use crate::error::Result;
+use crate::metrics::metric_names;
 use crate::metrics::{MetricDataPoint, MetricDefinition, MetricKind, SpanData};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Whether a span is operator-scoped. Spans are module execution traces
+/// (timing/correlation) — operator-level telemetry by nature — so today EVERY
+/// span is operator-scoped and withheld from any audience without the operator
+/// scope, exactly like the operator data points.
+///
+/// This is intentionally a per-span predicate rather than a blanket
+/// "drop all spans" branch: the intent is that spans become individually
+/// classifiable once they carry a scope tag. That source-tagging is deferred
+/// alongside the metric source-tagging (proto-wire change, out of Stage 15a.1
+/// scope); until then the constant-`true` body keeps the current
+/// all-spans-operator behaviour while leaving the classification seam in place.
+// TODO(#45): classify spans individually once SpanData carries an audience
+// scope tag. Deferred alongside the metric source-tagging contract — both
+// are proto-wire changes tracked by the same issue ("gRPC: trusted metric
+// audience classification at registration"), which adds an `audience` field
+// to `MetricDefinition` and validates `(module_id, name)` at ingestion. The
+// span variant of that work will extend the same registry-driven scope so
+// `is_operator_span` can derive its answer from the registered span schema
+// instead of the current all-spans-operator constant.
+fn is_operator_span(_span: &SpanData) -> bool {
+    true
+}
 
 /// Aggregated telemetry snapshot from a single analysis run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +47,29 @@ pub struct TelemetrySnapshot {
     pub user_summary: UserSummary,
     /// Operator summary (call latencies, error rates).
     pub operator_summary: OperatorSummary,
+    /// Names of data points that arrived on the UNTRUSTED external ingestion
+    /// path (the gRPC `record_metrics` handler, via
+    /// [`TelemetryCollector::record_untrusted_data_points`]). The projection
+    /// in [`Self::project_for_audience`] forces every point whose name is in
+    /// this set to the unclassified branch — admitted only under
+    /// [`TelemetryAudience::On`] — REGARDLESS of how its name classifies via
+    /// [`metric_names::is_operator`] / [`metric_names::is_known_user`]. That
+    /// is what closes the privacy boundary: an external plugin cannot cross
+    /// `user-only` (or `operator-only`) by spoofing a trusted metric name,
+    /// whether a `chaffra.module.<id>.<key>` shape or an exact `KNOWN_USER`
+    /// name like `chaffra.analysis.findings_total`.
+    ///
+    /// Provenance, not name, is the trust signal — this is the bounded form
+    /// of the gRPC-ingress audience derivation tracked by issue #45.
+    ///
+    /// `#[serde(skip)]`: this set is internal projection metadata, never part
+    /// of the on-disk snapshot wire contract. It is consumed during
+    /// projection and must never be serialized — emitting it would itself
+    /// disclose which external module names were seen. On deserialization it
+    /// defaults to empty (no untrusted names known for a reloaded snapshot),
+    /// which is the safe direction: a reloaded snapshot is already projected.
+    #[serde(skip)]
+    pub untrusted_runtime: HashSet<String>,
 }
 
 /// User-facing telemetry summary included in analysis output.
@@ -41,6 +88,16 @@ pub struct UserSummary {
 }
 
 /// Per-module summary for user-facing output.
+///
+/// Privacy note: the `register_core_metrics` completeness test
+/// (`test_every_core_metric_is_classified`) guards only the set of registered
+/// metric NAMES — it asserts every name lands in either `metric_names::OPERATOR`
+/// or `KNOWN_USER_METRICS`. It does NOT guard additions of new FIELDS to this
+/// struct: a new field has no metric name to classify, so it bypasses the test
+/// entirely. Whenever a field is added here, audit `project_for_audience`
+/// explicitly to decide whether the field is user-facing (kept as-is under
+/// user-only), operator-derived (must be scrubbed under user-only, like
+/// `duration_ms`), or operator-only (drop the whole entry).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModuleSummary {
     /// Duration of this module's analysis in ms.
@@ -58,6 +115,262 @@ pub struct OperatorSummary {
     pub module_call_durations: HashMap<String, u64>,
     /// Per-module error counts.
     pub module_error_counts: HashMap<String, u64>,
+}
+
+impl TelemetrySnapshot {
+    /// Project this snapshot down to exactly what the given audience is allowed
+    /// to see, consuming the snapshot and returning the projected one. This is
+    /// the privacy boundary: it MUST be applied before any filtering,
+    /// aggregation, persistence, history recording, or backend emission so that
+    /// operator-only fields never cross a user-facing boundary even temporarily.
+    ///
+    /// Taking `self` by value avoids a defensive deep clone of the whole
+    /// snapshot on the per-run emission hot path: every caller already owns a
+    /// freshly produced snapshot, so the projection filters and moves the
+    /// retained data instead of cloning it.
+    ///
+    /// Scope is classified at the field level: operator data points
+    /// ([`metric_names::is_operator`]), spans ([`is_operator_span`] — all spans are
+    /// module execution traces, hence operator-level), and operator metric
+    /// DEFINITIONS are all gated on the operator scope. Keeping operator
+    /// definitions out of a user-only payload matters too: the definition
+    /// catalogue itself discloses which operator metrics exist.
+    ///
+    /// Semantics for every audience mode:
+    /// - [`TelemetryAudience::On`]: keep everything (user + operator).
+    /// - [`TelemetryAudience::UserOnly`]: drop `operator_summary`, every
+    ///   operator-only data point, every span, and every operator-only
+    ///   definition; keep the user summary and user-facing data points/definitions,
+    ///   but scrub the operator-derived per-module timing
+    ///   (`user_summary.module_summaries[*].duration_ms`) out of the retained
+    ///   user summary so it cannot leak through the user-facing field.
+    /// - [`TelemetryAudience::OperatorOnly`]: drop `user_summary`; keep the
+    ///   operator summary and all data points/spans/definitions.
+    /// - [`TelemetryAudience::Off`]: drop both summaries and all data
+    ///   points/spans/definitions, leaving only the timestamp shell.
+    ///
+    /// Returns a [`ProjectedSnapshot`] — the type-level guard that ends the
+    /// "forgot to project at an output boundary" class of bug (R5-Structural).
+    /// The R3 / R4 / R5 review rounds each found one of these at adjacent
+    /// sites; constructing a `ProjectedSnapshot` is now the ONLY way to call
+    /// [`crate::backends::TelemetryBackend::flush`] /
+    /// [`crate::backends::TelemetryBackend::inspect`], so an output path that
+    /// skips projection is a compile error rather than an audit finding.
+    #[must_use]
+    pub fn project_for_audience(self, audience: TelemetryAudience) -> ProjectedSnapshot {
+        let keep_user = audience.user_enabled();
+        let keep_operator = audience.operator_enabled();
+
+        // Classification is three-way, not two-way: every name is either
+        // OPERATOR (gated on the operator scope), KNOWN_USER (gated on the
+        // user scope), or UNCLASSIFIED. A previous version of this filter
+        // collapsed UNCLASSIFIED into the user branch (`else => keep_user`),
+        // which was fail-OPEN at the privacy boundary: a runtime/external
+        // metric whose name was neither in `OPERATOR` nor `KNOWN_USER` would
+        // cross the user-only boundary unchallenged. The completeness test
+        // catches that for REGISTERED definitions, but runtime data points
+        // from plugins or future producers were unguarded.
+        //
+        // The fix is fail-CLOSED: an unclassified metric is admitted only
+        // under `On` (the unrestricted scope: BOTH user and operator scopes
+        // enabled). Under `user-only` it is dropped — there is no explicit
+        // user scope on the metric, so it cannot cross a user-only boundary.
+        // Under `operator-only` it is dropped for symmetry — operator-only is
+        // a SPECIFIC scope, not a catch-all. Under `Off` it is dropped along
+        // with everything else.
+        //
+        // PROVENANCE OVERRIDES NAME. A data point whose name arrived on the
+        // untrusted external gRPC ingress (`untrusted_runtime`) is forced to
+        // the unclassified branch REGARDLESS of how its name classifies. An
+        // external plugin therefore cannot cross `user-only` (or
+        // `operator-only`) by spoofing a trusted metric name — neither a
+        // `chaffra.module.<id>.<key>` shape nor an exact `KNOWN_USER` name
+        // like `chaffra.analysis.findings_total`. Name-based classification
+        // (`is_operator` / `is_known_user`) is consulted ONLY for points from
+        // trusted in-process producers. If a name is emitted by BOTH a
+        // trusted producer and an adversarial plugin in the same run, it is
+        // in `untrusted_runtime` and both points fail closed — the safe
+        // direction, since the projection cannot tell the two apart by name
+        // (the per-point source tagging that would is issue #45).
+        let untrusted = &self.untrusted_runtime;
+        let admit = |name: &str| -> bool {
+            if untrusted.contains(name) {
+                // Untrusted provenance: unclassified, admit only under `On`.
+                keep_user && keep_operator
+            } else if metric_names::is_operator(name) {
+                keep_operator
+            } else if metric_names::is_known_user(name) {
+                keep_user
+            } else {
+                // Unclassified: require BOTH scopes (i.e. `On`).
+                keep_user && keep_operator
+            }
+        };
+
+        let data_points = self
+            .data_points
+            .into_iter()
+            .filter(|dp| admit(&dp.name))
+            .collect();
+
+        // Spans carry the same provenance gate data points and definitions do
+        // (R5-1, parallel to R3-3/R4-2). A trusted span (in-process producer)
+        // classifies by `is_operator_span` — today uniformly `true`, with
+        // `TODO(#45)` for per-span scoping. An untrusted span (arrived on the
+        // external `record_untrusted_spans` ingress, called by the gRPC
+        // `record_span` handler) is forced to the unclassified branch:
+        // admitted ONLY under `On` so a plugin cannot inject a span that
+        // surfaces under `OperatorOnly`. The untrusted gate is a no-op while
+        // `is_operator_span` is constant, but it closes the seam ahead of the
+        // proto-wire span-scope change tracked by `#45` — exactly the
+        // forward-compatibility argument R4-2 made for `register_metrics`.
+        let admit_span = |span: &SpanData| -> bool {
+            if untrusted.contains(&span.name) {
+                // Untrusted span: require BOTH scopes (i.e. `On`).
+                keep_user && keep_operator
+            } else {
+                // Trusted span: classify by `is_operator_span` (uniformly
+                // `true` today). The `&& keep_operator` shape mirrors the
+                // pre-R5-1 single-branch projection; when #45 lands and
+                // `is_operator_span` becomes per-span, the projection will
+                // grow a parallel `&& keep_user` branch under the same
+                // commit that makes the case reachable.
+                is_operator_span(span) && keep_operator
+            }
+        };
+        let spans = self.spans.into_iter().filter(admit_span).collect();
+
+        // Definitions are kept per-scope too: a user-facing definition survives
+        // whenever the user scope is on, an operator definition only when the
+        // operator scope is on. Under `Off` neither scope is enabled, so the
+        // catalogue is emptied. Definitions classify with the same three-way
+        // admit rule as data points: an unregistered/unclassified definition
+        // is admitted only when BOTH scopes are enabled (i.e. `On`).
+        let definitions = self
+            .definitions
+            .into_iter()
+            .filter(|(name, _)| admit(name))
+            .collect();
+
+        // The user summary survives whenever the user scope is on, but it carries
+        // one operator-derived field per module: `ModuleSummary.duration_ms` is
+        // the same per-module analysis timing as
+        // `operator_summary.module_call_durations` (named
+        // `chaffra.module.call_duration_ms`, an OPERATOR metric). So when the
+        // operator scope is off, that timing must be scrubbed out of the retained
+        // user summary too — otherwise it leaks via `user_summary` even though
+        // `operator_summary` was dropped.
+        //
+        // The set of `module_summaries` KEYS is itself operator-scope information:
+        // the keys disclose which modules were composed into the pipeline. A
+        // module that ran but produced no findings AND no per-module metrics has
+        // no user-facing payload — its only contribution to the user summary was
+        // the duration we just scrubbed. Keeping such an entry as
+        // `{duration_ms: 0, finding_count: 0, metrics: {}}` would still leak the
+        // executed-module name. So under user-only we drop those payload-empty
+        // entries entirely; entries with findings (user-facing analysis result)
+        // or per-module metrics (user-facing analysis output like `health_score`)
+        // are kept because those carry signal the user is owed.
+        //
+        // `finding_count`, `metrics` (health_score/clone_count — user-facing
+        // analysis results), and the top-level `analysis_duration_ms` (the user
+        // headline) are NOT operator-derived and are kept. The
+        // `register_core_metrics` completeness test does NOT guard
+        // operator-derived FIELDS on this struct (only metric NAMES); a new
+        // operator-derived field requires updating this projection by hand —
+        // see the privacy note on `ModuleSummary`.
+        let user_summary = if keep_user {
+            let mut summary = self.user_summary;
+            if !keep_operator {
+                for module in summary.module_summaries.values_mut() {
+                    module.duration_ms = 0;
+                }
+                summary
+                    .module_summaries
+                    .retain(|_, m| m.finding_count != 0 || !m.metrics.is_empty());
+            }
+            summary
+        } else {
+            UserSummary::default()
+        };
+
+        ProjectedSnapshot(Self {
+            timestamp_ms: self.timestamp_ms,
+            definitions,
+            data_points,
+            spans,
+            user_summary,
+            operator_summary: if keep_operator {
+                self.operator_summary
+            } else {
+                OperatorSummary::default()
+            },
+            // Preserve the untrusted-provenance set across projection so that
+            // re-projecting an already-projected snapshot classifies
+            // identically. It is `#[serde(skip)]`, so it never reaches any
+            // serialized output regardless.
+            untrusted_runtime: self.untrusted_runtime,
+        })
+    }
+}
+
+/// A [`TelemetrySnapshot`] that has been projected through a specific
+/// audience. The ONLY way to construct one is via
+/// [`TelemetrySnapshot::project_for_audience`]: the inner snapshot field is
+/// PRIVATE (R12-F1), so no code — not even another module inside
+/// `chaffra-telemetry`, where the backend/module output boundaries live — can
+/// wrap a raw, unprojected snapshot in a `ProjectedSnapshot` and satisfy
+/// `TelemetryBackend::flush/inspect`. Read access for in-crate serialization is
+/// via [`Self::inner`]; external callers read fields through the immutable
+/// [`std::ops::Deref`] impl. The field was previously `pub(crate)`, which left
+/// the tuple constructor reachable from the very crate that owns the output
+/// boundaries — a same-crate bypass of the structural guard this newtype exists
+/// to enforce.
+///
+/// This newtype is the structural fix R5 added: the
+/// [`crate::backends::TelemetryBackend::flush`] /
+/// [`crate::backends::TelemetryBackend::inspect`] trait signatures take
+/// `&ProjectedSnapshot`, so an output path that forgets to project no longer
+/// compiles. The R3 / R4 / R5 review rounds each found a "forgot to project"
+/// bug at an adjacent site (MCP snapshot, backend-status finding, audit log
+/// under Off); making it a type error ends the class.
+///
+/// `#[serde(transparent)]` keeps the serialized shape byte-for-byte identical
+/// to the inner `TelemetrySnapshot`, so backends, on-disk snapshot files, and
+/// the gRPC wire contract are unchanged.
+///
+/// Intentionally NOT `Deserialize` (R9-F2): deriving it would expose a public
+/// serde constructor (`from_str` / `from_value`) that wraps raw, UNprojected
+/// input in a `ProjectedSnapshot`, defeating the guarantee that
+/// `project_for_audience` is the only constructor and letting unprojected data
+/// satisfy `TelemetryBackend::flush/inspect`. Only `Serialize` is needed —
+/// backends serialize the projected snapshot OUT; nothing deserializes back
+/// into the wrapper (the inner `TelemetrySnapshot` keeps `Deserialize` for the
+/// on-disk / wire contract).
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct ProjectedSnapshot(TelemetrySnapshot);
+
+impl ProjectedSnapshot {
+    /// Reference the inner projected [`TelemetrySnapshot`]. `pub(crate)` so
+    /// backends in the same crate can pass it to serializers without going
+    /// through `Deref`; callers outside `chaffra-telemetry` reach the same
+    /// fields via the immutable [`std::ops::Deref`] impl below.
+    pub(crate) fn inner(&self) -> &TelemetrySnapshot {
+        &self.0
+    }
+}
+
+/// Read-only access to the projected snapshot's fields. The newtype itself
+/// is the type-level guard ("you can only get one via projection"); once you
+/// have one, reading the projected fields is exactly what you want, so we
+/// expose them transparently. `DerefMut` is deliberately NOT implemented —
+/// post-projection mutation would defeat the contract.
+impl std::ops::Deref for ProjectedSnapshot {
+    type Target = TelemetrySnapshot;
+    fn deref(&self) -> &TelemetrySnapshot {
+        &self.0
+    }
 }
 
 /// Thread-safe telemetry collector.
@@ -82,6 +395,13 @@ struct CollectorInner {
     files_total: u64,
     analysis_start_ms: u64,
     finding_fingerprints: HashSet<crate::churn::FindingFingerprint>,
+    /// Names of data points received on the UNTRUSTED external gRPC ingress
+    /// (`record_untrusted_data_points`). Handed to
+    /// `TelemetrySnapshot::untrusted_runtime` at snapshot time so the
+    /// projection forces these names to fail closed at every restricted
+    /// audience boundary regardless of how the name classifies. Empty for a
+    /// run with no external module metric submissions (the common case).
+    untrusted_runtime: HashSet<String>,
 }
 
 fn now_ms() -> u64 {
@@ -113,7 +433,11 @@ impl TelemetryCollector {
         &self.config
     }
 
-    /// Register metric definitions from a module.
+    /// Register metric definitions from a TRUSTED in-process producer
+    /// (`register_core_metrics`, built-in module setup). Names registered here
+    /// are classified by `metric_names` at projection. External/plugin
+    /// submissions must NOT use this method — see
+    /// [`Self::register_untrusted_metrics`].
     pub fn register_metrics(
         &self,
         _module_id: &str,
@@ -126,15 +450,76 @@ impl TelemetryCollector {
         Ok(())
     }
 
+    /// Register metric definitions received on the UNTRUSTED external
+    /// ingestion path (the gRPC `register_metrics` handler — external module
+    /// containers).
+    ///
+    /// Mirrors [`Self::record_untrusted_data_points`]: each definition's name
+    /// is added to `untrusted_runtime` so the snapshot projection forces the
+    /// definition to fail closed at every restricted audience boundary. A
+    /// plugin must not be able to register a definition with an exact
+    /// `KNOWN_USER` or `OPERATOR` name (e.g. `chaffra.analysis.findings_total`,
+    /// with attacker-controlled `description`/`unit`/`kind`) and have that
+    /// definition serialize under `user-only` solely because the name
+    /// classifies as user-facing — provenance gates the restricted
+    /// boundaries, not registration itself (so they still appear under `On`,
+    /// the unrestricted audience).
+    ///
+    /// TODO(#45): the per-name `untrusted_runtime` set is the bounded
+    /// mitigation. The durable fix derives audience server-side at this
+    /// ingress from a trusted `(module_id, name)` registry (an `audience`
+    /// field on `MetricDefinition`), which also resolves the name-collision
+    /// case where a trusted producer and a plugin share a metric name.
+    pub fn register_untrusted_metrics(
+        &self,
+        _module_id: &str,
+        definitions: Vec<MetricDefinition>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        for def in definitions {
+            inner.untrusted_runtime.insert(def.name.clone());
+            inner.definitions.insert(def.name.clone(), def);
+        }
+        Ok(())
+    }
+
     /// Record a single metric data point.
     pub fn record_data_point(&self, point: MetricDataPoint) {
         let mut inner = self.inner.lock().unwrap();
         inner.data_points.push(point);
     }
 
-    /// Record multiple metric data points.
+    /// Record multiple metric data points from a TRUSTED in-process producer
+    /// (the parse-cache flush, churn metrics, the CLI telemetry-test point).
+    /// Names recorded here are classified by `metric_names` at projection.
+    /// External/plugin submissions must NOT use this method — see
+    /// [`Self::record_untrusted_data_points`].
     pub fn record_data_points(&self, points: Vec<MetricDataPoint>) {
         let mut inner = self.inner.lock().unwrap();
+        inner.data_points.extend(points);
+    }
+
+    /// Record data points received on the UNTRUSTED external ingestion path
+    /// (the gRPC `record_metrics` handler — external module containers).
+    ///
+    /// Each point's name is recorded in `untrusted_runtime` so the snapshot
+    /// projection forces it to fail closed at every restricted audience
+    /// boundary: an external module cannot cross `user-only` or
+    /// `operator-only` by naming its metric after a trusted user-facing or
+    /// operator metric. The points still land in `data_points` (so they are
+    /// emitted under `On`, the unrestricted audience) — provenance gates the
+    /// RESTRICTED boundaries, not collection itself.
+    ///
+    /// TODO(#45): the per-name `untrusted_runtime` set is the bounded
+    /// mitigation. The durable fix derives audience server-side from a
+    /// trusted `(module_id, name)` registry at this ingress (an `audience`
+    /// field on `MetricDefinition`), which also resolves the name-collision
+    /// case where a trusted producer and a plugin share a metric name.
+    pub fn record_untrusted_data_points(&self, points: Vec<MetricDataPoint>) {
+        let mut inner = self.inner.lock().unwrap();
+        for p in &points {
+            inner.untrusted_runtime.insert(p.name.clone());
+        }
         inner.data_points.extend(points);
     }
 
@@ -144,9 +529,37 @@ impl TelemetryCollector {
         inner.spans.push(span);
     }
 
-    /// Record multiple spans.
+    /// Record multiple spans from a TRUSTED in-process producer. Classification
+    /// uses `is_operator_span` at projection. External submissions must NOT use
+    /// this method — see [`Self::record_untrusted_spans`].
     pub fn record_spans(&self, spans: Vec<SpanData>) {
         let mut inner = self.inner.lock().unwrap();
+        inner.spans.extend(spans);
+    }
+
+    /// Record spans received on the UNTRUSTED external ingestion path (the
+    /// gRPC `record_span` handler — external module containers).
+    ///
+    /// Mirrors [`Self::record_untrusted_data_points`] /
+    /// [`Self::register_untrusted_metrics`]: each span's name is added to
+    /// `untrusted_runtime` so the snapshot projection forces the span to
+    /// fail closed at every restricted audience boundary (admitted only
+    /// under `On`). A plugin must not be able to inject a span that surfaces
+    /// under `OperatorOnly` simply by spoofing a trusted name.
+    ///
+    /// The gate is a no-op while `is_operator_span` is uniformly `true`
+    /// (every trusted span is operator-scoped and dropped under restricted
+    /// audiences), but it closes the seam ahead of `#45` — once spans carry
+    /// individual scope tags and a trusted span can be user-facing, this
+    /// route prevents an untrusted spoof from masquerading.
+    ///
+    /// TODO(#45): per-point span source-tagging at producer/proto level
+    /// supersedes this name-level allowlist.
+    pub fn record_untrusted_spans(&self, spans: Vec<SpanData>) {
+        let mut inner = self.inner.lock().unwrap();
+        for s in &spans {
+            inner.untrusted_runtime.insert(s.name.clone());
+        }
         inner.spans.extend(spans);
     }
 
@@ -163,7 +576,7 @@ impl TelemetryCollector {
         // Record as data points.
         let ts = now_ms();
         inner.data_points.push(MetricDataPoint {
-            name: "chaffra.module.call_duration_ms".to_owned(),
+            name: metric_names::MODULE_CALL_DURATION_MS.to_owned(),
             value: duration_ms as f64,
             labels: {
                 let mut m = HashMap::new();
@@ -176,7 +589,7 @@ impl TelemetryCollector {
         if had_error {
             let error_count = inner.module_errors.get(module_id).copied().unwrap_or(1);
             inner.data_points.push(MetricDataPoint {
-                name: "chaffra.module.error_total".to_owned(),
+                name: metric_names::MODULE_ERROR_TOTAL.to_owned(),
                 value: error_count as f64,
                 labels: {
                     let mut m = HashMap::new();
@@ -240,6 +653,14 @@ impl TelemetryCollector {
     }
 
     /// Record a per-module summary metric (e.g. health_score, clone_count).
+    ///
+    /// This is a TRUSTED in-process producer: built-in modules run in-process
+    /// and call this directly. The emitted `chaffra.module.<id>.<key>` name
+    /// classifies as user-facing by shape in `metric_names::is_known_user`,
+    /// so it survives `user-only`. Provenance is implicit — the name is NOT
+    /// added to `untrusted_runtime`, so the projection trusts its name
+    /// classification. (An external plugin emitting the identical shape goes
+    /// through `record_untrusted_data_points` and fails closed.)
     pub fn record_module_summary_metric(&self, module_id: &str, key: &str, value: f64) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
@@ -265,10 +686,21 @@ impl TelemetryCollector {
         for (module_id, &duration) in &inner.module_durations {
             let finding_count = inner.module_findings.get(module_id).copied().unwrap_or(0);
 
-            // Collect module-specific metrics from data points.
+            // Collect module-specific metrics from data points. Points whose
+            // name arrived on the untrusted external ingress are skipped:
+            // `user_summary` is a user-facing field, so an external plugin
+            // must not be able to inject a `chaffra.module.<id>.<key>` value
+            // here (it would otherwise bypass the projection's data_points
+            // provenance gate, which filters the top-level list but not this
+            // derived map). Trusted in-process producers
+            // (`record_module_summary_metric`) are not in `untrusted_runtime`
+            // and pass through.
             let prefix = format!("chaffra.module.{module_id}.");
             let mut metrics = HashMap::new();
             for dp in &inner.data_points {
+                if inner.untrusted_runtime.contains(&dp.name) {
+                    continue;
+                }
                 if let Some(key) = dp.name.strip_prefix(&prefix) {
                     metrics.insert(key.to_owned(), dp.value);
                 }
@@ -300,6 +732,7 @@ impl TelemetryCollector {
                 module_call_durations: inner.module_durations.clone(),
                 module_error_counts: inner.module_errors.clone(),
             },
+            untrusted_runtime: inner.untrusted_runtime.clone(),
         }
     }
 
@@ -316,7 +749,7 @@ impl TelemetryCollector {
     pub fn record_module_load_error(&self, module_id: &str, error_type: &str) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.module.load_error_total".to_owned(),
+            name: metric_names::MODULE_LOAD_ERROR_TOTAL.to_owned(),
             value: 1.0,
             labels: {
                 let mut m = HashMap::new();
@@ -332,7 +765,7 @@ impl TelemetryCollector {
     pub fn record_config_parse_error(&self) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.config.parse_error_total".to_owned(),
+            name: metric_names::CONFIG_PARSE_ERROR_TOTAL.to_owned(),
             value: 1.0,
             labels: HashMap::new(),
             timestamp_ms: ts,
@@ -343,7 +776,7 @@ impl TelemetryCollector {
     pub fn record_plugin_connect_error(&self, module_id: &str) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.plugin.connect_error_total".to_owned(),
+            name: metric_names::PLUGIN_CONNECT_ERROR_TOTAL.to_owned(),
             value: 1.0,
             labels: {
                 let mut m = HashMap::new();
@@ -358,7 +791,7 @@ impl TelemetryCollector {
     pub fn record_module_startup(&self, module_id: &str, duration_ms: u64) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.module.startup_duration_ms".to_owned(),
+            name: metric_names::MODULE_STARTUP_DURATION_MS.to_owned(),
             value: duration_ms as f64,
             labels: {
                 let mut m = HashMap::new();
@@ -373,7 +806,7 @@ impl TelemetryCollector {
     pub fn record_startup_total(&self, duration_ms: u64) {
         let ts = now_ms();
         self.record_data_point(MetricDataPoint {
-            name: "chaffra.startup.total_duration_ms".to_owned(),
+            name: metric_names::STARTUP_TOTAL_DURATION_MS.to_owned(),
             value: duration_ms as f64,
             labels: HashMap::new(),
             timestamp_ms: ts,
@@ -455,13 +888,13 @@ impl TelemetryCollector {
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.call_duration_ms".to_owned(),
+                name: metric_names::MODULE_CALL_DURATION_MS.to_owned(),
                 kind: MetricKind::Histogram,
                 description: "Per-module call duration".to_owned(),
                 unit: "ms".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.error_total".to_owned(),
+                name: metric_names::MODULE_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "Per-module error count".to_owned(),
                 unit: "count".to_owned(),
@@ -491,31 +924,31 @@ impl TelemetryCollector {
                 unit: "ratio".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.load_error_total".to_owned(),
+                name: metric_names::MODULE_LOAD_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "Module load failures by module_id and error_type".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.config.parse_error_total".to_owned(),
+                name: metric_names::CONFIG_PARSE_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "Config parse failures".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.plugin.connect_error_total".to_owned(),
+                name: metric_names::PLUGIN_CONNECT_ERROR_TOTAL.to_owned(),
                 kind: MetricKind::Counter,
                 description: "External module gRPC connection failures".to_owned(),
                 unit: "count".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.module.startup_duration_ms".to_owned(),
+                name: metric_names::MODULE_STARTUP_DURATION_MS.to_owned(),
                 kind: MetricKind::Histogram,
                 description: "Per-module initialization time".to_owned(),
                 unit: "ms".to_owned(),
             },
             MetricDefinition {
-                name: "chaffra.startup.total_duration_ms".to_owned(),
+                name: metric_names::STARTUP_TOTAL_DURATION_MS.to_owned(),
                 kind: MetricKind::Gauge,
                 description: "Total time from process start to all modules ready".to_owned(),
                 unit: "ms".to_owned(),
@@ -767,6 +1200,835 @@ mod tests {
                 .definitions
                 .contains_key("chaffra.startup.total_duration_ms")
         );
+    }
+
+    /// Build a snapshot that contains both user-facing and operator-only
+    /// data so projection can be checked exhaustively.
+    fn snapshot_with_mixed_metrics() -> TelemetrySnapshot {
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(7);
+        // Operator-only metrics (call duration + error).
+        collector.record_module_call("dead-code", 42, true);
+        collector.record_module_startup("dead-code", 5);
+        collector.record_startup_total(120);
+        collector.record_plugin_connect_error("fastapi");
+        collector.record_config_parse_error();
+        // User-facing metrics (findings).
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 2);
+        collector.record_module_findings("dead-code", 2, &sev);
+        collector.record_module_summary_metric("dead-code", "unused_functions", 3.0);
+        // Operator-only parse-cache metric (memory/eviction pressure).
+        collector.record_data_point(MetricDataPoint {
+            name: metric_names::PARSE_CACHE_SIZE_BYTES.to_owned(),
+            value: 4096.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        collector.record_span(SpanData {
+            name: "dead-code.analyze".to_owned(),
+            trace_id: "t".to_owned(),
+            span_id: "s".to_owned(),
+            parent_span_id: String::new(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            attributes: HashMap::new(),
+            status: "ok".to_owned(),
+        });
+        collector.snapshot()
+    }
+
+    #[test]
+    fn test_projection_on_keeps_everything() {
+        let snap = snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::On);
+        assert!(!snap.operator_summary.module_call_durations.is_empty());
+        assert_eq!(snap.user_summary.files_total, 7);
+        assert!(!snap.spans.is_empty());
+        assert!(!snap.definitions.is_empty());
+        // Both an operator metric and a user metric survive.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == metric_names::MODULE_CALL_DURATION_MS)
+        );
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.analysis.findings_total")
+        );
+        // Both an operator definition and a user definition survive.
+        assert!(
+            snap.definitions
+                .contains_key(metric_names::MODULE_ERROR_TOTAL)
+        );
+        assert!(
+            snap.definitions
+                .contains_key("chaffra.analysis.findings_total")
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_drops_operator() {
+        let snap = snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::UserOnly);
+        // Operator summary is wiped.
+        assert!(snap.operator_summary.module_call_durations.is_empty());
+        assert!(snap.operator_summary.module_error_counts.is_empty());
+        // User summary survives.
+        assert_eq!(snap.user_summary.files_total, 7);
+        // Spans are operator-scoped (module traces): none may cross the boundary.
+        assert!(
+            snap.spans.is_empty(),
+            "operator-scoped spans leaked under user-only projection"
+        );
+        // No operator-only data point may cross the boundary, including the
+        // parse-cache pressure metric.
+        for dp in &snap.data_points {
+            assert!(
+                !metric_names::is_operator(&dp.name),
+                "operator metric {} leaked under user-only projection",
+                dp.name
+            );
+        }
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == metric_names::PARSE_CACHE_SIZE_BYTES),
+            "parse-cache metric must be withheld under user-only"
+        );
+        // Operator metric DEFINITIONS must not be disclosed either...
+        for op in metric_names::OPERATOR {
+            assert!(
+                !snap.definitions.contains_key(*op),
+                "operator definition {op} leaked under user-only projection"
+            );
+        }
+        // ...while user-facing data points and definitions remain.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.analysis.findings_total")
+        );
+        assert!(
+            snap.definitions
+                .contains_key("chaffra.analysis.findings_total")
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_scrubs_module_timing_from_user_summary() {
+        // Operator per-module timing also rides inside `user_summary` via
+        // `module_summaries[*].duration_ms` (the same value as
+        // `operator_summary.module_call_durations`, an OPERATOR metric). Under
+        // user-only that timing must be scrubbed to 0, while the user-facing
+        // finding_count and module metrics (e.g. health_score) survive. This test
+        // inspects `user_summary.module_summaries` directly — the residual leak
+        // round-2 missed because it only checked `operator_summary` and data points.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("complexity", 73, false);
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 4);
+        collector.record_module_findings("complexity", 4, &sev);
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        let raw = collector.snapshot();
+        // Sanity: the raw snapshot carries the per-module timing.
+        assert_eq!(
+            raw.user_summary.module_summaries["complexity"].duration_ms,
+            73
+        );
+        let top_duration = raw.user_summary.analysis_duration_ms;
+
+        let snap = raw.project_for_audience(TelemetryAudience::UserOnly);
+        let summary = &snap.user_summary.module_summaries["complexity"];
+        // Operator-derived per-module timing is scrubbed...
+        assert_eq!(
+            summary.duration_ms, 0,
+            "operator per-module timing leaked via user_summary under user-only"
+        );
+        // ...but the user-facing finding count and module metric survive.
+        assert_eq!(summary.finding_count, 4);
+        assert!((summary.metrics["health_score"] - 88.0).abs() < f64::EPSILON);
+        // ...and the top-level user headline duration is preserved.
+        assert_eq!(snap.user_summary.analysis_duration_ms, top_duration);
+    }
+
+    #[test]
+    fn test_projection_user_only_prunes_payload_empty_module_entries() {
+        // 1B: `module_summaries` KEYS disclose the executed-module set — that's
+        // operator-scope pipeline composition information. After the timing
+        // scrub, an entry like `{duration_ms: 0, finding_count: 0, metrics: {}}`
+        // still leaks the module name. Under user-only, drop entries that have
+        // no user-facing signal (no findings AND no metrics); keep entries that
+        // do (findings or per-module metrics).
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        // `security` ran but produced ZERO findings and no per-module metrics.
+        collector.record_module_call("security", 12, false);
+        // `complexity` ran and emitted a user-facing per-module metric, but no findings.
+        collector.record_module_call("complexity", 17, false);
+        collector.record_module_summary_metric("complexity", "health_score", 92.0);
+        // `dead-code` ran and produced a finding.
+        collector.record_module_call("dead-code", 9, false);
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev);
+
+        let raw = collector.snapshot();
+        // Sanity: all three modules are in the raw map.
+        assert!(raw.user_summary.module_summaries.contains_key("security"));
+        assert!(raw.user_summary.module_summaries.contains_key("complexity"));
+        assert!(raw.user_summary.module_summaries.contains_key("dead-code"));
+
+        let user_only = raw.project_for_audience(TelemetryAudience::UserOnly);
+        // The payload-empty `security` entry is dropped — its key would leak the
+        // executed-module set otherwise.
+        assert!(
+            !user_only
+                .user_summary
+                .module_summaries
+                .contains_key("security"),
+            "payload-empty module entry leaked the executed-module set under user-only"
+        );
+        // `complexity` survives (has a per-module metric), with timing scrubbed.
+        let complexity = &user_only.user_summary.module_summaries["complexity"];
+        assert_eq!(complexity.duration_ms, 0);
+        assert!((complexity.metrics["health_score"] - 92.0).abs() < f64::EPSILON);
+        // `dead-code` survives (has findings), with timing scrubbed.
+        let dc = &user_only.user_summary.module_summaries["dead-code"];
+        assert_eq!(dc.duration_ms, 0);
+        assert_eq!(dc.finding_count, 1);
+    }
+
+    #[test]
+    fn test_projection_on_and_operator_only_preserve_module_summaries_keys() {
+        // 1B: under On (operator scope enabled), the payload-empty entry must be
+        // preserved verbatim — pruning is strictly a user-only privacy step.
+        // Under OperatorOnly the user summary is wiped wholesale (existing
+        // behaviour), so the pruning rule is irrelevant there; we assert both.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("security", 12, false);
+        collector.record_module_call("complexity", 17, false);
+        collector.record_module_summary_metric("complexity", "health_score", 92.0);
+
+        let on = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::On);
+        // Payload-empty entry preserved when the operator scope is enabled.
+        let sec = &on.user_summary.module_summaries["security"];
+        assert_eq!(sec.duration_ms, 12);
+        assert_eq!(sec.finding_count, 0);
+        assert!(sec.metrics.is_empty());
+
+        let op_only = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::OperatorOnly);
+        // OperatorOnly wipes the user summary wholesale; no module_summaries.
+        assert!(op_only.user_summary.module_summaries.is_empty());
+    }
+
+    #[test]
+    fn test_projection_operator_scopes_preserve_module_timing() {
+        // Under On and operator-only the per-module timing inside the user
+        // summary is preserved (operator scope is enabled). operator-only wipes
+        // the user summary wholesale, so only On retains a populated user summary.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("complexity", 73, false);
+        let on = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::On);
+        assert_eq!(
+            on.user_summary.module_summaries["complexity"].duration_ms, 73,
+            "On must preserve per-module timing in the user summary"
+        );
+    }
+
+    #[test]
+    fn test_projection_operator_only_drops_user_summary() {
+        let snap =
+            snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::OperatorOnly);
+        // User summary is wiped...
+        assert_eq!(snap.user_summary.files_total, 0);
+        assert!(snap.user_summary.findings_by_module.is_empty());
+        // ...but operator data survives, including spans and operator definitions.
+        assert!(!snap.operator_summary.module_call_durations.is_empty());
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == metric_names::MODULE_CALL_DURATION_MS)
+        );
+        assert!(
+            !snap.spans.is_empty(),
+            "operator-scoped spans must survive under operator-only"
+        );
+        assert!(
+            snap.definitions
+                .contains_key(metric_names::MODULE_ERROR_TOTAL)
+        );
+    }
+
+    #[test]
+    fn test_projection_off_drops_everything() {
+        let snap = snapshot_with_mixed_metrics().project_for_audience(TelemetryAudience::Off);
+        assert!(snap.data_points.is_empty());
+        assert!(snap.spans.is_empty());
+        assert!(snap.definitions.is_empty());
+        assert_eq!(snap.user_summary.files_total, 0);
+        assert!(snap.operator_summary.module_call_durations.is_empty());
+    }
+
+    /// Classify a REGISTERED metric definition name into a known scope by
+    /// EXACT membership of the two explicit sets. Returns `false` for a name
+    /// that is in neither — i.e. an unclassified metric that would either leak
+    /// (under the previous fail-open) or be silently dropped (under the new
+    /// fail-closed projection). Pattern matching is intentionally omitted at
+    /// the DEFINITIONS layer: a `chaffra.module.<x>.<y>`-shaped operator
+    /// metric must be classified by adding it to `metric_names::OPERATOR`,
+    /// not by passing through the per-module shape match. Per-module summary
+    /// RUNTIME data points are admitted by shape in `is_known_user` (and
+    /// gated by provenance in the projection), but they are never registered
+    /// as DEFINITIONS, so this completeness guard does not see them.
+    fn metric_is_classified(name: &str) -> bool {
+        metric_names::is_operator(name) || metric_names::KNOWN_USER.contains(&name)
+    }
+
+    #[test]
+    fn test_every_core_metric_is_classified() {
+        // P2 completeness guard (fail-open mitigation): register the core metric
+        // definitions and assert EVERY registered name lands in a known scope.
+        // A future operator metric added to `register_core_metrics` but NOT to
+        // `metric_names::OPERATOR` (and not a known-user name) would be silently
+        // classified user-facing and leak under user-only — this test turns that
+        // omission into a CI failure instead.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        let snap = collector.snapshot();
+        assert!(
+            !snap.definitions.is_empty(),
+            "register_core_metrics produced no definitions"
+        );
+        for name in snap.definitions.keys() {
+            assert!(
+                metric_is_classified(name),
+                "registered metric {name:?} is unclassified: it is in neither \
+                 metric_names::OPERATOR nor KNOWN_USER_METRICS. Add it to \
+                 OPERATOR (operator-scoped) or to KNOWN_USER_METRICS (user-facing) \
+                 so it cannot leak under user-only."
+            );
+        }
+    }
+
+    #[test]
+    fn test_completeness_guard_rejects_unclassified_metric() {
+        // The guard must actually FAIL for an unknown metric, otherwise it would
+        // pass vacuously and provide no protection.
+        assert!(!metric_is_classified("chaffra.future.unregistered_metric"));
+        // And it must still accept the two known scopes by exact name.
+        assert!(metric_is_classified(metric_names::MODULE_CALL_DURATION_MS));
+        assert!(metric_is_classified("chaffra.analysis.findings_total"));
+    }
+
+    #[test]
+    fn test_completeness_guard_rejects_per_module_pattern_metric() {
+        // 1A: a future operator-shaped name like `chaffra.module.host.dispatch_latency_ms`
+        // — which matches the per-module summary shape `chaffra.module.<id>.<key>`
+        // — must NOT be silently admitted as user-facing. Round-2 used a
+        // permissive pattern (`starts_with("chaffra.module.") && >=3 dots`) that
+        // would pass this name through; the round-3 fix removes that branch so
+        // the operator-shaped name lands in neither set and the guard rejects it.
+        let candidate = "chaffra.module.host.dispatch_latency_ms";
+        assert!(
+            !metric_is_classified(candidate),
+            "operator-shaped per-module metric {candidate:?} must NOT be admitted \
+             via a pattern; it has to be added to metric_names::OPERATOR explicitly. \
+             A pattern-based fallback re-introduces the silent-acceptance failure \
+             this test is here to prevent."
+        );
+
+        // And the same guard, exercised end-to-end against the registered set:
+        // injecting such a name into the registered definitions makes the
+        // completeness loop fail. We assert that on a synthetic snapshot built
+        // by hand (no need to mutate the producer) — the snapshot path mirrors
+        // exactly what `test_every_core_metric_is_classified` does.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector
+            .register_metrics(
+                "test",
+                vec![MetricDefinition {
+                    name: candidate.to_owned(),
+                    kind: MetricKind::Histogram,
+                    description: "fictitious operator metric".to_owned(),
+                    unit: "ms".to_owned(),
+                }],
+            )
+            .unwrap();
+        let snap = collector.snapshot();
+        let unclassified: Vec<&String> = snap
+            .definitions
+            .keys()
+            .filter(|n| !metric_is_classified(n))
+            .collect();
+        assert_eq!(
+            unclassified.len(),
+            1,
+            "exactly one unclassified name expected, got {unclassified:?}"
+        );
+        assert_eq!(unclassified[0], candidate);
+    }
+
+    #[test]
+    fn test_projection_user_only_drops_unclassified_data_point() {
+        // Fail-closed: a runtime data point whose name is in NEITHER
+        // `metric_names::OPERATOR` NOR `metric_names::KNOWN_USER` (nor the
+        // per-module summary shape) must not cross the user-only boundary.
+        // Previously such a name was admitted by the `else => keep_user`
+        // branch, leaking arbitrary external-plugin metrics under user-only.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        // Unclassified: not in OPERATOR, not in KNOWN_USER, not per-module
+        // summary shaped. A plugin or future producer could legitimately emit
+        // this; the classifier has no scope tag for it.
+        collector.record_data_point(MetricDataPoint {
+            name: "external.plugin.custom_metric".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        // A user-facing classified metric (control) — survives under user-only.
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev);
+
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == "external.plugin.custom_metric"),
+            "unclassified data point leaked under user-only (fail-open regression)"
+        );
+        // The classified user-facing metric is preserved.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.analysis.findings_total"),
+            "classified user-facing metric was dropped"
+        );
+    }
+
+    #[test]
+    fn test_projection_operator_only_drops_unclassified_data_point() {
+        // Symmetric fail-closed at the operator boundary: an unclassified
+        // metric is not implicitly operator-scoped either. Only `On` (both
+        // scopes enabled) admits unclassified.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_data_point(MetricDataPoint {
+            name: "external.plugin.custom_metric".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        collector.record_module_call("dead-code", 7, false); // OPERATOR metric
+
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::OperatorOnly);
+        assert!(
+            !snap
+                .data_points
+                .iter()
+                .any(|p| p.name == "external.plugin.custom_metric"),
+            "unclassified data point leaked under operator-only"
+        );
+        // The classified operator metric is preserved.
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == metric_names::MODULE_CALL_DURATION_MS),
+            "classified operator metric was dropped"
+        );
+    }
+
+    #[test]
+    fn test_projection_on_admits_unclassified_data_point() {
+        // `On` is the only audience that admits an unclassified metric:
+        // BOTH scopes are enabled, so the "needs explicit scope" rule does
+        // not gate. This keeps `On` as the genuine no-projection audience
+        // for operators who want raw passthrough.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_data_point(MetricDataPoint {
+            name: "external.plugin.custom_metric".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 1,
+        });
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::On);
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "external.plugin.custom_metric"),
+            "On audience dropped an unclassified metric — On must pass everything"
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_drops_unclassified_definition() {
+        // The same fail-closed rule covers DEFINITIONS: an unclassified
+        // definition (one a plugin registers without listing in OPERATOR or
+        // KNOWN_USER) must not appear in a user-only catalogue, otherwise
+        // the catalogue itself discloses which unclassified metrics exist.
+        let collector = TelemetryCollector::with_defaults();
+        collector
+            .register_metrics(
+                "external-plugin",
+                vec![MetricDefinition {
+                    name: "external.plugin.unclassified_def".to_owned(),
+                    kind: MetricKind::Counter,
+                    description: "unclassified".to_owned(),
+                    unit: "count".to_owned(),
+                }],
+            )
+            .unwrap();
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            !snap
+                .definitions
+                .contains_key("external.plugin.unclassified_def"),
+            "unclassified definition leaked under user-only"
+        );
+    }
+
+    #[test]
+    fn test_projection_user_only_admits_per_module_summary_runtime_metric() {
+        // Per-module summary RUNTIME data points (`chaffra.module.<id>.<key>`)
+        // are produced by the TRUSTED in-process `record_module_summary_metric`
+        // — they carry user-facing analysis output (health_score, clone_count,
+        // etc.) and classify as user-facing by shape in `is_known_user`. They
+        // are NOT in `untrusted_runtime`, so the projection trusts the name.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::UserOnly);
+        assert!(
+            snap.data_points
+                .iter()
+                .any(|p| p.name == "chaffra.module.complexity.health_score"),
+            "per-module summary metric was dropped under user-only"
+        );
+    }
+
+    #[test]
+    fn test_projection_provenance_overrides_name_for_spoofed_metrics() {
+        // R3 fail-closed invariant: PROVENANCE overrides NAME. A point that
+        // arrives on the untrusted external gRPC ingress
+        // (`record_untrusted_data_points`, what the `record_metrics` handler
+        // calls) must fail closed at every restricted boundary REGARDLESS of
+        // how its name classifies — whether it spoofs a per-module summary
+        // shape OR an exact `KNOWN_USER` name. Trusted in-process producers
+        // pass by name.
+        //
+        // Cross-checked against all four audiences:
+        // - On            → everything admitted (unrestricted)
+        // - UserOnly      → only the trusted point (privacy boundary)
+        // - OperatorOnly  → nothing user-facing (trusted user point dropped,
+        //                   untrusted forced unclassified → user scope off)
+        // - Off           → nothing
+        let make_snapshot = || {
+            let collector = TelemetryCollector::with_defaults();
+            // Trusted: emitted via the in-process producer.
+            collector.record_module_summary_metric("complexity", "health_score", 88.0);
+            // Untrusted spoofs via the external gRPC ingress. Both a
+            // per-module shape AND an exact KNOWN_USER name — the R2 fix only
+            // closed the former; provenance closes both.
+            collector.record_untrusted_data_points(vec![
+                MetricDataPoint {
+                    name: "chaffra.module.plugin.cache_size_bytes".to_owned(),
+                    value: 1024.0,
+                    labels: HashMap::new(),
+                    timestamp_ms: 0,
+                },
+                MetricDataPoint {
+                    // Exact KNOWN_USER name — the explicit-set spoof.
+                    name: "chaffra.analysis.findings_total".to_owned(),
+                    value: 999.0,
+                    labels: HashMap::new(),
+                    timestamp_ms: 0,
+                },
+            ]);
+            collector.snapshot()
+        };
+
+        let trusted = "chaffra.module.complexity.health_score";
+        let spoofed_shape = "chaffra.module.plugin.cache_size_bytes";
+        let spoofed_known = "chaffra.analysis.findings_total";
+
+        // (audience, trusted, spoofed_shape, spoofed_known)
+        let cases = [
+            (TelemetryAudience::On, true, true, true),
+            (TelemetryAudience::UserOnly, true, false, false),
+            (TelemetryAudience::OperatorOnly, false, false, false),
+            (TelemetryAudience::Off, false, false, false),
+        ];
+        for (audience, want_trusted, want_shape, want_known) in cases {
+            let snap = make_snapshot().project_for_audience(audience);
+            let has = |n: &str| snap.data_points.iter().any(|p| p.name == n);
+            assert_eq!(
+                has(trusted),
+                want_trusted,
+                "{audience:?}: trusted per-module metric admit mismatch"
+            );
+            assert_eq!(
+                has(spoofed_shape),
+                want_shape,
+                "{audience:?}: untrusted per-module-shaped spoof admit mismatch \
+                 (true at a restricted boundary = fail-open)"
+            );
+            assert_eq!(
+                has(spoofed_known),
+                want_known,
+                "{audience:?}: untrusted exact-KNOWN_USER-name spoof admit mismatch \
+                 (true under user-only = the R2 residual fail-open)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_summary_metrics_map_excludes_untrusted_spoof() {
+        // The user_summary.module_summaries[*].metrics map is built by
+        // prefix-matching data point names — a parallel path to the top-level
+        // data_points list. An untrusted plugin spoofing
+        // `chaffra.module.complexity.<key>` must NOT inject a value into the
+        // user-facing metrics map for the `complexity` module, even though a
+        // (trusted) `record_module_call("complexity", ...)` gave that module a
+        // module_summaries entry.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_module_call("complexity", 5, false);
+        collector.record_module_summary_metric("complexity", "health_score", 88.0);
+        collector.record_untrusted_data_points(vec![MetricDataPoint {
+            name: "chaffra.module.complexity.spoofed_field".to_owned(),
+            value: 42.0,
+            labels: HashMap::new(),
+            timestamp_ms: 0,
+        }]);
+
+        let snap = collector.snapshot();
+        let metrics = &snap.user_summary.module_summaries["complexity"].metrics;
+        assert_eq!(
+            metrics.get("health_score"),
+            Some(&88.0),
+            "trusted per-module metric missing from user summary"
+        );
+        assert!(
+            !metrics.contains_key("spoofed_field"),
+            "untrusted spoof leaked into user_summary.module_summaries metrics map"
+        );
+    }
+
+    #[test]
+    fn test_projection_drops_untrusted_definition_with_known_user_name() {
+        // R4-2: external `register_metrics` submissions are untrusted. A plugin
+        // must NOT be able to register a definition with an exact `KNOWN_USER`
+        // or `OPERATOR` name (attacker-controlled `description`/`unit`/`kind`)
+        // and have it survive any restricted audience boundary solely because
+        // the name classifies as user-facing. `register_untrusted_metrics`
+        // records the name in `untrusted_runtime`, and the projection's
+        // `admit` closure forces the definition to the unclassified branch
+        // regardless of what `metric_names` says about its name.
+        let collector = TelemetryCollector::with_defaults();
+        // Trusted: in-process registration (built-in modules) classifies by
+        // name as usual.
+        collector
+            .register_metrics(
+                "trusted",
+                vec![MetricDefinition {
+                    name: "chaffra.analysis.findings_total".to_owned(),
+                    kind: MetricKind::Counter,
+                    description: "trusted".to_owned(),
+                    unit: "count".to_owned(),
+                }],
+            )
+            .unwrap();
+        // Untrusted: external plugin spoofs the same KNOWN_USER name with
+        // attacker-controlled metadata. Same name, different provenance.
+        // (We use a different name for the spoof so we can observe both
+        // outcomes in the same snapshot — name-collision would mask the
+        // distinction with the HashMap's last-write-wins.)
+        collector
+            .register_untrusted_metrics(
+                "plugin",
+                vec![MetricDefinition {
+                    name: "chaffra.findings.churn_rate".to_owned(),
+                    kind: MetricKind::Gauge,
+                    description: "<plugin-controlled description>".to_owned(),
+                    unit: "<plugin-controlled unit>".to_owned(),
+                }],
+            )
+            .unwrap();
+
+        let trusted = "chaffra.analysis.findings_total";
+        let spoofed = "chaffra.findings.churn_rate";
+
+        // (audience, trusted_def, spoofed_def)
+        let cases = [
+            (TelemetryAudience::On, true, true),
+            (TelemetryAudience::UserOnly, true, false),
+            (TelemetryAudience::OperatorOnly, false, false),
+            (TelemetryAudience::Off, false, false),
+        ];
+        for (audience, want_trusted, want_spoofed) in cases {
+            let snap = collector.snapshot().project_for_audience(audience);
+            assert_eq!(
+                snap.definitions.contains_key(trusted),
+                want_trusted,
+                "{audience:?}: trusted KNOWN_USER definition admit mismatch"
+            );
+            assert_eq!(
+                snap.definitions.contains_key(spoofed),
+                want_spoofed,
+                "{audience:?}: untrusted KNOWN_USER-named definition admit mismatch \
+                 (true under user-only = the R4-2 fail-open)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_projection_drops_untrusted_span_under_restricted_audiences() {
+        // R5-1: external `record_span` submissions are untrusted. The gate is
+        // a no-op while `is_operator_span` is uniformly `true` (every trusted
+        // span is operator-scoped and dropped under `UserOnly`/`Off`), but it
+        // must already close the seam under `OperatorOnly` so an untrusted
+        // span cannot surface there solely by spoofing a trusted name —
+        // precisely the case the proto-wire span-scope change (#45) will
+        // make load-bearing when trusted spans can be user-facing.
+        let collector = TelemetryCollector::with_defaults();
+        // Trusted: in-process module span (currently classifies as operator).
+        collector.record_span(SpanData {
+            name: "trusted.module.span".to_owned(),
+            trace_id: "t1".to_owned(),
+            span_id: "s1".to_owned(),
+            parent_span_id: String::new(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            attributes: HashMap::new(),
+            status: "ok".to_owned(),
+        });
+        // Untrusted: arrived on the external gRPC ingress.
+        collector.record_untrusted_spans(vec![SpanData {
+            name: "plugin.spoofed.span".to_owned(),
+            trace_id: "t2".to_owned(),
+            span_id: "s2".to_owned(),
+            parent_span_id: String::new(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            attributes: HashMap::new(),
+            status: "ok".to_owned(),
+        }]);
+
+        let trusted = "trusted.module.span";
+        let untrusted = "plugin.spoofed.span";
+        // (audience, want_trusted, want_untrusted)
+        let cases = [
+            (TelemetryAudience::On, true, true),
+            (TelemetryAudience::UserOnly, false, false),
+            // OperatorOnly: trusted operator span survives, untrusted span
+            // does NOT (forced unclassified, admit needs BOTH scopes).
+            (TelemetryAudience::OperatorOnly, true, false),
+            (TelemetryAudience::Off, false, false),
+        ];
+        for (audience, want_trusted, want_untrusted) in cases {
+            let snap = collector.snapshot().project_for_audience(audience);
+            let has = |n: &str| snap.spans.iter().any(|s| s.name == n);
+            assert_eq!(
+                has(trusted),
+                want_trusted,
+                "{audience:?}: trusted span admit mismatch"
+            );
+            assert_eq!(
+                has(untrusted),
+                want_untrusted,
+                "{audience:?}: untrusted span admit mismatch \
+                 (true under OperatorOnly = the R5-1 fail-open)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_untrusted_runtime_is_never_serialized() {
+        // `untrusted_runtime` is `#[serde(skip)]` — it is internal projection
+        // metadata (which external names were seen) and must never appear in
+        // the on-disk snapshot, under any audience.
+        let collector = TelemetryCollector::with_defaults();
+        collector.record_untrusted_data_points(vec![MetricDataPoint {
+            name: "chaffra.module.plugin.secret_name".to_owned(),
+            value: 1.0,
+            labels: HashMap::new(),
+            timestamp_ms: 0,
+        }]);
+        let snap = collector
+            .snapshot()
+            .project_for_audience(TelemetryAudience::OperatorOnly);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("untrusted_runtime"),
+            "untrusted_runtime field leaked into serialized snapshot"
+        );
+        assert!(
+            !json.contains("secret_name"),
+            "untrusted external metric name leaked into serialized snapshot"
+        );
+    }
+
+    #[test]
+    fn test_is_operator_metric_classification() {
+        // The full operator set, including the parse-cache family, classifies
+        // as operator.
+        for name in metric_names::OPERATOR {
+            assert!(
+                metric_names::is_operator(name),
+                "{name} should be operator-only"
+            );
+        }
+        // User-facing metrics — and the collision case: a per-module summary
+        // metric whose module id matches an operator name must NOT be misclassified.
+        for name in [
+            "chaffra.analysis.findings_total",
+            "chaffra.analysis.findings_by_severity",
+            "chaffra.findings.churn_rate",
+            "chaffra.module.dead-code.unused_functions",
+            "chaffra.module.error_total.health_score",
+        ] {
+            assert!(
+                !metric_names::is_operator(name),
+                "{name} should be user-facing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_operator_span_all_spans_operator_scoped() {
+        let span = SpanData {
+            name: "dead-code.analyze".to_owned(),
+            trace_id: "t".to_owned(),
+            span_id: "s".to_owned(),
+            parent_span_id: String::new(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            attributes: HashMap::new(),
+            status: "ok".to_owned(),
+        };
+        assert!(is_operator_span(&span));
     }
 
     #[test]

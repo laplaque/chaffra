@@ -1,7 +1,7 @@
 //! JSON file backend: writes telemetry snapshot to a JSON file after each run.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::ProjectedSnapshot;
 use crate::error::Result;
 
 /// Writes telemetry to a JSON file on disk.
@@ -26,7 +26,7 @@ impl TelemetryBackend for JsonFileBackend {
         "json-file"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
         let json = serde_json::to_string_pretty(snapshot)?;
         std::fs::write(&self.path, json)?;
         Ok(())
@@ -46,7 +46,7 @@ impl TelemetryBackend for JsonFileBackend {
         Ok(format!("will write to {}", self.path))
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
         Ok(serde_json::to_string_pretty(snapshot)?)
     }
 }
@@ -64,7 +64,9 @@ mod tests {
 
         let collector = TelemetryCollector::with_defaults();
         collector.set_files_total(5);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         backend.flush(&snapshot).unwrap();
 
@@ -87,7 +89,9 @@ mod tests {
     fn test_json_file_backend_inspect() {
         let backend = JsonFileBackend::new("test.json".to_owned());
         let collector = TelemetryCollector::with_defaults();
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();

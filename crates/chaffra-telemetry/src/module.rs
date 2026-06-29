@@ -6,7 +6,7 @@
 
 use crate::backends::{self, BackendStatus};
 use crate::collector::TelemetryCollector;
-use crate::config::TelemetryConfig;
+use crate::config::{TelemetryAudience, TelemetryConfig};
 use chaffra_core::diagnostic::{
     AnalysisResult, FileInfo, Finding, FixResult, Location, ModuleInfo, ModuleMetrics, Rule,
     RuleExplanation, Severity,
@@ -42,8 +42,10 @@ impl TelemetryModule {
             .unwrap_or_else(TelemetryCollector::with_defaults)
     }
 
-    fn get_config(&self, config: &HashMap<String, String>) -> TelemetryConfig {
-        TelemetryConfig::from_module_config(config)
+    fn get_config(&self, config: &HashMap<String, String>) -> Result<TelemetryConfig> {
+        // Preserve the typed config error (fail closed) rather than coercing an
+        // invalid audience to a default that would widen emission.
+        TelemetryConfig::from_module_config(config).map_err(|e| ChaffraError::Config(e.to_string()))
     }
 }
 
@@ -105,7 +107,7 @@ impl AnalysisModule for TelemetryModule {
         _files: &[FileInfo],
         config: &HashMap<String, String>,
     ) -> Result<AnalysisResult> {
-        let tel_config = self.get_config(config);
+        let tel_config = self.get_config(config)?;
         let collector = self.get_collector();
 
         // Create backends and check status.
@@ -113,23 +115,48 @@ impl AnalysisModule for TelemetryModule {
 
         let mut findings = Vec::new();
 
-        // Emit a finding per backend with its status.
-        for status in &statuses {
-            findings.push(backend_status_finding(status));
+        // Emit a finding per backend with its status, gated on the operator
+        // scope. The backend-status finding discloses the backend kind
+        // (`JsonFile`, `Otlp`, ...), endpoint/path, and connectivity state —
+        // all operator-shaped data exactly like `OperatorSummary`. R4 fail-
+        // closed: emit ONLY when the resolved audience includes the operator
+        // scope (`On` / `OperatorOnly`); under `UserOnly` and `Off` the
+        // backend-status finding is withheld. (`metric-summary` below still
+        // emits — its payload is built from a projected snapshot so it carries
+        // only what the audience permits.)
+        if tel_config.audience.operator_enabled() {
+            for status in &statuses {
+                findings.push(backend_status_finding(status));
+            }
         }
 
-        // Emit a summary finding with the current snapshot.
-        let snapshot = collector.snapshot();
-        let summary_json = serde_json::to_string_pretty(&snapshot.user_summary)
+        // Apply audience projection BEFORE deriving anything user-visible from
+        // the snapshot — the returned `metric-summary` finding is a user-facing
+        // output boundary just like a backend flush, so it must see only the
+        // fields the resolved audience permits. Previously the message and
+        // `summary` metadata were built from the raw snapshot's
+        // `user_summary` / `data_points` / `spans` before projection, which
+        // could disclose under `user-only`:
+        //   * per-module timing via `user_summary.module_summaries[*].duration_ms`
+        //     (an operator-derived field scrubbed by `project_for_audience`);
+        //   * operator-only data point and span counts in the message text and
+        //     `files_total: 0` confusion under `operator-only` / `off`.
+        // Project once and derive every finding-facing value from the projected
+        // snapshot so a single boundary covers both the module output and the
+        // backend flush below.
+        let projected = collector
+            .snapshot()
+            .project_for_audience(tel_config.audience);
+        let summary_json = serde_json::to_string_pretty(&projected.user_summary)
             .unwrap_or_else(|_| "{}".to_owned());
 
         findings.push(Finding {
             rule_id: "metric-summary".to_owned(),
             message: format!(
                 "Telemetry: {} files, {} data points, {} spans",
-                snapshot.user_summary.files_total,
-                snapshot.data_points.len(),
-                snapshot.spans.len(),
+                projected.user_summary.files_total,
+                projected.data_points.len(),
+                projected.spans.len(),
             ),
             severity: Severity::Info,
             location: Location {
@@ -148,13 +175,29 @@ impl AnalysisModule for TelemetryModule {
             },
         });
 
-        // Flush to backends if operator telemetry is enabled.
-        if tel_config.audience.operator_enabled() {
+        // Flush to backends whenever telemetry is not fully disabled. The
+        // snapshot has already been projected above, so we reuse it directly:
+        // the projection boundary is defined once for both the module output
+        // and the backend write, and the two paths cannot drift.
+        //
+        // The projection boundary is shared with the CLI `run_with_telemetry`
+        // paths, but the EMISSION rule is not identical: the CLI success path
+        // additionally gates the flush on `SamplingDecision::Emit` (rate /
+        // on-change sampling), whereas this module path flushes on every non-Off
+        // run. Sampling is applied only on the CLI success path; here the rule is
+        // simply project-then-flush whenever the audience is not `Off`.
+        if !matches!(tel_config.audience, TelemetryAudience::Off) {
             let (active_backends, _) = backends::create_backends(&tel_config.backends);
             for backend in &active_backends {
-                if let Err(e) = backend.flush(&snapshot) {
-                    eprintln!("[telemetry] backend '{}' flush error: {e}", backend.name());
-                }
+                // Swallow flush errors here, matching the CLI `flush_projected`
+                // sibling that shares this projection boundary. Reporting WHICH
+                // backend failed (`backend.name()` is the operator-shaped kind)
+                // or THAT one failed (connectivity state) would disclose
+                // operator-shaped backend metadata on stderr under a non-operator
+                // audience like `user-only` — the R9-F1 class, one call up the
+                // stack. Backend error diagnostics stay on the operator-gated
+                // `telemetry test` / `status` surfaces.
+                let _ = backend.flush(&projected);
             }
         }
 
@@ -186,8 +229,8 @@ impl AnalysisModule for TelemetryModule {
             "metric-summary" => Ok(RuleExplanation {
                 rule_id: "metric-summary".to_owned(),
                 name: "Metric summary".to_owned(),
-                description: "Summarizes the telemetry collected during the current analysis run, including file counts, finding counts, per-module durations, and span data.".to_owned(),
-                rationale: "Provides a single finding that aggregates the full telemetry state for inspection or logging.".to_owned(),
+                description: "Summarizes the telemetry collected during the current analysis run (file counts, finding counts, and other user-facing summary fields). The finding is built from the audience-PROJECTED snapshot, so operator-scoped detail (per-module durations, operator data-point/span counts) is included only when the resolved audience permits it and is withheld under `user-only`.".to_owned(),
+                rationale: "Provides a single finding that aggregates the audience-projected telemetry state for inspection or logging.".to_owned(),
                 default_severity: Severity::Info,
                 suppression_syntax: "// chaffra:ignore metric-summary".to_owned(),
                 examples: vec![
@@ -268,6 +311,93 @@ fn backend_status_finding(status: &BackendStatus) -> Finding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::metric_names;
+
+    /// Run the telemetry module's `analyze` for a given audience with a single
+    /// JSON-file backend at `path`, against a collector carrying both a
+    /// user-facing finding metric and operator-only metrics. Returns the parsed
+    /// flushed JSON, or `None` when nothing was flushed (file absent).
+    fn module_flush_for_audience(
+        audience: &str,
+        path: &std::path::Path,
+    ) -> Option<serde_json::Value> {
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(3);
+        collector.record_module_call("dead-code", 7, false); // operator metric
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev); // user metric
+
+        let module = TelemetryModule::with_collector(collector);
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), audience.to_owned());
+        config.insert("backend".to_owned(), "json-file".to_owned());
+        config.insert("path".to_owned(), path.to_str().unwrap().to_owned());
+
+        module.analyze(&[], &config).unwrap();
+
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|c| serde_json::from_str(&c).unwrap())
+    }
+
+    #[test]
+    fn test_module_flush_rule_matches_projection_each_audience() {
+        // 1B: the module flush path uses the SAME rule as the CLI paths —
+        // flush the projected snapshot whenever audience != Off — so its
+        // behaviour is identical to `project_for_audience` for every audience.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // user-only: flushes user data, NO operator data.
+        let p = dir.path().join("user.json");
+        let v = module_flush_for_audience("user-only", &p).expect("user-only must flush");
+        assert_eq!(v["user_summary"]["files_total"], 3);
+        assert!(
+            v["operator_summary"]["module_call_durations"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "operator data leaked under user-only module flush"
+        );
+        for dp in v["data_points"].as_array().unwrap() {
+            assert!(
+                !metric_names::is_operator(dp["name"].as_str().unwrap()),
+                "operator metric leaked under user-only module flush"
+            );
+        }
+
+        // operator-only: flushes operator data, NO user summary.
+        let p = dir.path().join("op.json");
+        let v = module_flush_for_audience("operator-only", &p).expect("operator-only must flush");
+        assert_eq!(v["user_summary"]["files_total"], 0);
+        assert!(
+            v["data_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|dp| dp["name"] == metric_names::MODULE_CALL_DURATION_MS)
+        );
+
+        // on: flushes everything.
+        let p = dir.path().join("on.json");
+        let v = module_flush_for_audience("on", &p).expect("on must flush");
+        assert_eq!(v["user_summary"]["files_total"], 3);
+        assert!(
+            v["data_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|dp| dp["name"] == metric_names::MODULE_CALL_DURATION_MS)
+        );
+
+        // off: flushes NOTHING (no file written).
+        let p = dir.path().join("off.json");
+        assert!(
+            module_flush_for_audience("off", &p).is_none(),
+            "off audience must not flush anything"
+        );
+    }
 
     #[test]
     fn test_module_describe() {
@@ -280,16 +410,20 @@ mod tests {
 
     #[test]
     fn test_module_analyze_default() {
+        // Default `TelemetryConfig` resolves to `user-only` (Phase 15a.1
+        // privacy default), which gates `backend-status` off (R4-1) — the
+        // backend kind / endpoint / connectivity state are operator-disclosing
+        // and must not cross the user-facing boundary. `metric-summary` is
+        // still emitted (projected payload).
         let module = TelemetryModule::new();
         let config = HashMap::new();
         let result = module.analyze(&[], &config).unwrap();
-        // Should have at least one backend-status finding and one metric-summary finding.
-        assert!(result.findings.len() >= 2);
         assert!(
-            result
+            !result
                 .findings
                 .iter()
-                .any(|f| f.rule_id == "backend-status")
+                .any(|f| f.rule_id == "backend-status"),
+            "backend-status finding leaked under default (user-only) audience"
         );
         assert!(
             result
@@ -297,6 +431,33 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "metric-summary")
         );
+    }
+
+    #[test]
+    fn test_backend_status_finding_gated_by_audience() {
+        // R4-1: `backend-status` discloses backend kind/endpoint/connectivity
+        // (operator-shaped data). It must surface ONLY when the resolved
+        // audience includes the operator scope (`On` / `OperatorOnly`) and
+        // must be withheld under `UserOnly` and `Off`.
+        let module = TelemetryModule::new();
+        for (label, audience, want_backend_status) in [
+            ("on", "on", true),
+            ("operator-only", "operator-only", true),
+            ("user-only", "user-only", false),
+            ("off", "off", false),
+        ] {
+            let mut config = HashMap::new();
+            config.insert("audience".to_owned(), audience.to_owned());
+            let result = module.analyze(&[], &config).unwrap();
+            let has = result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "backend-status");
+            assert_eq!(
+                has, want_backend_status,
+                "audience {label}: backend-status expected={want_backend_status}, was {has}"
+            );
+        }
     }
 
     #[test]
@@ -373,6 +534,160 @@ mod tests {
         let finding = backend_status_finding(&status);
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.message.contains("connected"));
+    }
+
+    #[test]
+    fn test_get_config_invalid_audience_is_error() {
+        let module = TelemetryModule::new();
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), "everyone".to_owned());
+        let err = module.analyze(&[], &config).unwrap_err();
+        assert!(
+            matches!(err, ChaffraError::Config(ref m) if m.contains("invalid telemetry audience")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_audience_flush_is_projected_user_only() {
+        // 1B: under the unified rule the module flushes for any non-Off audience.
+        // With no `audience` key the default (user-only) applies, so the flush
+        // DOES run but the projected payload carries NO operator data — exactly
+        // like the CLI `run_with_telemetry` user-only path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("telemetry.json");
+        let collector = TelemetryCollector::with_defaults();
+        collector.set_files_total(4);
+        collector.record_module_call("dead-code", 10, false); // operator metric
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev); // user metric
+        let module = TelemetryModule::with_collector(collector);
+
+        let mut config = HashMap::new();
+        config.insert("backend".to_owned(), "json-file".to_owned());
+        config.insert("path".to_owned(), path.to_str().unwrap().to_owned());
+        // No audience key -> default user-only.
+
+        let result = module.analyze(&[], &config).unwrap();
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "metric-summary")
+        );
+        assert!(
+            path.exists(),
+            "user-only audience must flush projected user data"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // User data present, operator data projected out.
+        assert_eq!(parsed["user_summary"]["files_total"], 4);
+        assert!(
+            parsed["operator_summary"]["module_call_durations"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "operator data leaked into a user-only module flush"
+        );
+        for dp in parsed["data_points"].as_array().unwrap() {
+            assert!(
+                !metric_names::is_operator(dp["name"].as_str().unwrap()),
+                "operator metric leaked into a user-only module flush"
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_only_flush_is_projected_before_emission() {
+        // Operator-only: the flushed payload must contain operator data but
+        // NOT the user summary (projection happens before the backend write).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("telemetry.json");
+        let collector = TelemetryCollector::with_defaults();
+        collector.set_files_total(9);
+        collector.record_module_call("dead-code", 10, false);
+        let module = TelemetryModule::with_collector(collector);
+
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), "operator-only".to_owned());
+        config.insert("backend".to_owned(), "json-file".to_owned());
+        config.insert("path".to_owned(), path.to_str().unwrap().to_owned());
+
+        module.analyze(&[], &config).unwrap();
+        assert!(path.exists(), "operator-only audience should flush");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // Operator data present.
+        assert!(
+            !parsed["operator_summary"]["module_call_durations"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        // User summary projected out.
+        assert_eq!(parsed["user_summary"]["files_total"], 0);
+    }
+
+    #[test]
+    fn test_user_only_metric_summary_finding_is_projected() {
+        // The `metric-summary` finding is a user-facing output boundary —
+        // building it from the RAW snapshot would leak operator data even
+        // when the backend flush is correctly projected. Under `user-only`:
+        //   * per-module timing in `user_summary.module_summaries[*].duration_ms`
+        //     must be scrubbed (the operator-derived field), and the
+        //     payload-empty entry pruned;
+        //   * the `data_points` / `spans` counts in the message must reflect
+        //     ONLY user-facing/non-operator items.
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(4);
+        collector.record_module_call("dead-code", 73, false); // operator timing
+        let mut sev = HashMap::new();
+        sev.insert("warning".to_owned(), 1);
+        collector.record_module_findings("dead-code", 1, &sev);
+
+        let module = TelemetryModule::with_collector(collector);
+        let mut config = HashMap::new();
+        config.insert("audience".to_owned(), "user-only".to_owned());
+        // Use a non-flushing backend kind so the test exercises only the
+        // finding-construction path. (`backend = "none"` -> empty backends).
+        let result = module.analyze(&[], &config).unwrap();
+
+        let summary = result
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "metric-summary")
+            .expect("metric-summary finding missing");
+        let json: serde_json::Value =
+            serde_json::from_str(summary.metadata.get("summary").unwrap()).unwrap();
+        // Top-level user headline preserved.
+        assert_eq!(json["files_total"], 4);
+        // Per-module timing leaked through the user_summary metadata under the
+        // PREVIOUS unprojected path; with projection applied here it is scrubbed
+        // and the payload-empty entry is pruned. The `dead-code` entry has a
+        // finding so it survives the payload-empty pruning — assert directly
+        // (not `if let Some`) so the trust-boundary coverage check sees both
+        // branches of the lookup as exercised.
+        let mods = json["module_summaries"].as_object().unwrap();
+        let entry = mods
+            .get("dead-code")
+            .expect("dead-code module summary should survive pruning (has a finding)");
+        assert_eq!(
+            entry["duration_ms"], 0,
+            "operator timing leaked through metric-summary metadata"
+        );
+        assert_eq!(entry["finding_count"], 1);
+        // The OPERATOR data-point (`chaffra.module.call_duration_ms`) recorded
+        // by `record_module_call` would inflate the displayed data_points count
+        // unless projection ran first; assert the projected count is reflected
+        // in the message instead of the raw collector total.
+        assert!(
+            summary.message.contains("4 files"),
+            "files headline missing: {}",
+            summary.message
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! writes the exposition text to a file or returns it for inspection.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::{ProjectedSnapshot, TelemetrySnapshot};
 use crate::error::Result;
 use crate::metrics::MetricKind;
 
@@ -62,6 +62,13 @@ impl PrometheusBackend {
 
         output
     }
+
+    /// Audience-neutral flush log line (R9-F1): omits the operator-shaped
+    /// `port`, since the live flush path runs under `user-only` too. The port
+    /// stays on the operator-gated `test_connection` / `inspect` surfaces.
+    fn flush_log_line(byte_len: usize) -> String {
+        format!("[prometheus] exposition ready ({byte_len} bytes)")
+    }
 }
 
 impl TelemetryBackend for PrometheusBackend {
@@ -69,16 +76,13 @@ impl TelemetryBackend for PrometheusBackend {
         "prometheus"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
+        let snapshot = snapshot.inner();
         // In a full implementation this would update an in-memory registry
         // served by the HTTP endpoint. For now, we log the exposition text
         // to signal readiness.
         let text = self.render_exposition(snapshot);
-        eprintln!(
-            "[prometheus] exposition ready ({} bytes, port {})",
-            text.len(),
-            self.port
-        );
+        eprintln!("{}", Self::flush_log_line(text.len()));
         Ok(())
     }
 
@@ -89,7 +93,8 @@ impl TelemetryBackend for PrometheusBackend {
         ))
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
+        let snapshot = snapshot.inner();
         Ok(self.render_exposition(snapshot))
     }
 }
@@ -107,7 +112,9 @@ mod tests {
         collector.set_files_total(10);
         collector.record_module_call("dead-code", 42, false);
 
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
         let text = backend.render_exposition(&snapshot);
 
         assert!(text.contains("# HELP"));
@@ -120,7 +127,9 @@ mod tests {
         let backend = PrometheusBackend::new(9090);
         let collector = TelemetryCollector::with_defaults();
         collector.register_core_metrics();
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         assert!(output.contains("# HELP"));
@@ -131,5 +140,31 @@ mod tests {
         let backend = PrometheusBackend::new(9090);
         let result = backend.test_connection().unwrap();
         assert!(result.contains("9090"));
+    }
+
+    #[test]
+    fn test_prometheus_backend_flush_ok() {
+        // R5-Structural coverage: exercise the `flush()` entry point with a
+        // `ProjectedSnapshot`. The Prometheus exposition flush logs the
+        // generated text size to stderr; assert Ok.
+        let backend = PrometheusBackend::new(9090);
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.set_files_total(10);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn test_prometheus_flush_log_omits_port() {
+        // R9-F1: the operator-shaped port must not appear in the live flush log.
+        let backend = PrometheusBackend::new(59090);
+        let line = PrometheusBackend::flush_log_line(123);
+        assert!(
+            !line.contains(&backend.port.to_string()),
+            "flush log leaked the Prometheus port: {line}"
+        );
     }
 }

@@ -237,12 +237,25 @@ impl ChaffraConfig {
     }
 
     /// Load configuration from the given directory, looking for `.chaffra.toml`.
+    ///
+    /// Implicit-file discovery is fail-closed on read/metadata failure:
+    /// `Path::try_exists` is used (NOT the infallible `Path::exists`, which
+    /// collapses every non-`NotFound` error to `false`). Only a true absence
+    /// (`Ok(false)`) yields the default config; permission denied, an
+    /// unreadable parent directory, a broken symlink, or any other IO error
+    /// propagates as a typed `ChaffraError::Config` so the strict loader in
+    /// the CLI actually fails closed instead of silently defaulting an
+    /// inaccessible `.chaffra.toml` to the empty config.
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
         let config_path = dir.join(CONFIG_FILE_NAME);
-        if config_path.exists() {
-            Self::load(&config_path)
-        } else {
-            Ok(Self::default())
+        match config_path.try_exists() {
+            Ok(true) => Self::load(&config_path),
+            Ok(false) => Ok(Self::default()),
+            Err(e) => Err(ChaffraError::Config(format!(
+                "failed to probe {}: {}",
+                config_path.display(),
+                e
+            ))),
         }
     }
 
@@ -354,6 +367,63 @@ threshold = "10"
         let config = ChaffraConfig::load_from_dir(&dir).unwrap();
         assert_eq!(config.health.max_cyclomatic, 25);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_from_dir_missing_returns_default() {
+        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No .chaffra.toml — load_from_dir must return the default.
+        let config = ChaffraConfig::load_from_dir(&dir).unwrap();
+        assert_eq!(config.health.max_cyclomatic, 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_dir_propagates_metadata_error() {
+        // The strict loader must distinguish "file does not exist" (return
+        // default) from "file exists but cannot be probed" (propagate). The
+        // old `Path::exists()` collapsed both cases to "treat as absent" and
+        // silently defaulted on permission/IO errors. Verify the new
+        // `try_exists()` path propagates a typed error instead.
+        //
+        // Trigger a non-`NotFound` failure with a symlink loop at the
+        // `.chaffra.toml` path: `Path::try_exists` traverses symlinks and
+        // returns `Err(ELOOP)`. The kernel enforces the loop regardless of
+        // UID, so this assertion is reachable on the CI runners (which run
+        // as root) and on a developer laptop alike — unlike a `chmod 0000`
+        // approach, which root bypasses and leaves the branch uncovered
+        // (caught by the trust-boundary coverage gate at 100% changed).
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("chaffra_test_load_from_dir_symlink_loop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(CONFIG_FILE_NAME);
+        // The link target points back at itself: `try_exists` follows it,
+        // loops, and returns `Err(ELOOP)`.
+        symlink(&cfg_path, &cfg_path).unwrap();
+
+        let result = ChaffraConfig::load_from_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = result.expect_err("symlink loop must fail closed (not default)");
+        // Assert the TYPED variant, not just the message substring: the CLI
+        // strict loader and callers pattern-match on `ChaffraError::Config`,
+        // so a future refactor that returned a different variant with a
+        // similar message must fail this test. `matches!` keeps the negative
+        // arm on a single executed line — a multi-line `_ => panic!()` arm
+        // would be an uncovered changed line in this trust-boundary file.
+        assert!(
+            matches!(err, ChaffraError::Config(_)),
+            "expected ChaffraError::Config, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("failed to probe"),
+            "expected probe-error message, got: {err}"
+        );
     }
 
     #[test]

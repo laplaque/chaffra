@@ -21,7 +21,7 @@ Embedded web UI (HTML/JS served from the binary, no external dependencies):
 - Current module status: registered, healthy, error
 - Last run summary: health score, finding counts by category, duration
 - Finding churn: new, resolved, unchanged since last run
-- Active telemetry backends and connection status
+- Active telemetry backends and connection status (operator audience only; withheld under the default `user-only`)
 - Active config: loaded modules, enabled rules, thresholds
 - Auto-refreshes every 10 seconds
 
@@ -31,10 +31,32 @@ Embedded web UI (HTML/JS served from the binary, no external dependencies):
 
 Current metric values.
 
+This response is **audience-projected** (via the same `project_for_audience`
+guard the CLI/MCP/backend-flush paths use). Under the default `user-only` the
+`data_points` array contains only user-facing metrics (e.g. finding totals);
+operator metrics such as `chaffra.module.call_duration_ms` and
+`chaffra.module.error_total` are scrubbed. The `backends` array is operator-shaped
+status metadata (backend kind / endpoint / connectivity) and is likewise withheld
+— **empty** — under `user-only` (and under `off`). The management collector is
+built from the CLI telemetry config, so a default `chaffra management` run
+discloses no operator metrics or backend metadata.
+
 ```json
 {
   "files_total": 42,
   "analysis_duration_ms": 1500,
+  "data_points": [
+    { "name": "chaffra.findings.new", "value": 3.0, "labels": {} }
+  ],
+  "backends": []
+}
+```
+
+Under an operator-enabled audience (`on` / `operator-only`) operator data points
+and the `backends` array are populated, e.g.:
+
+```json
+{
   "data_points": [
     { "name": "chaffra.module.call_duration_ms", "value": 150.0, "labels": { "module": "dead-code" } }
   ],
@@ -59,12 +81,34 @@ Current metric values.
 
 ### `GET /api/v1/modules`
 
-Registered modules, status, capabilities.
+Registered modules, status, capabilities. Audience-projected. The module list is
+built from the **user** summary, and `duration_ms` (the operator metric
+`chaffra.module.call_duration_ms`) and `status` (derived from operator error
+counts) are operator-shaped. The disclosure therefore depends on the resolved
+audience:
+
+- **`user-only`** (default): module rows are listed (finding counts are
+  user-facing), but `duration_ms` is `0` and `status` is `healthy` — operator
+  timing and error state are withheld; modules whose only contribution was
+  operator timing are omitted entirely.
+- **`on`**: full disclosure — real `duration_ms` and an `"error"` status when the
+  module recorded errors.
+- **`operator-only`**: this endpoint is sourced from the user summary, which the
+  projection drops when the user scope is off, so the module list is **empty**.
+  Operator-only opts out of user-scoped views; the raw operator metrics remain
+  available via `GET /api/v1/metrics` `data_points`. (Driving `/modules` and
+  `/health` from the operator summary under operator-only is deferred to Stage
+  15a.3 alongside the co-located integration.)
+- **`off`**: all telemetry is disabled — neither scope is enabled, so the
+  projection drops the user summary entirely and the module list is **empty**
+  (same as `operator-only` for this user-sourced endpoint).
+
+`finding_count` is user-facing and reported whenever the user scope is on.
 
 ```json
 {
   "modules": [
-    { "id": "dead-code", "status": "healthy", "finding_count": 5, "duration_ms": 150, "capabilities": ["analyze", "explain"] }
+    { "id": "dead-code", "status": "healthy", "finding_count": 5, "duration_ms": 0, "capabilities": ["analyze", "explain"] }
   ]
 }
 ```
@@ -96,7 +140,13 @@ New, resolved, and unchanged findings since last run.
 
 ### `GET /api/v1/health`
 
-Health score, grade, and per-file breakdown.
+Health score, grade, and per-file breakdown. Audience-projected. Health scores
+come from the user-facing `chaffra.module.<id>.health_score` data points
+(`KNOWN_USER`), so they are reported under `user-only` and `on`. Under
+`operator-only` **and `off`** the user scope is off and these points are dropped,
+so `score` is `null` and `grade` is `—` (same user-scoped-view caveat as
+`/modules`; the operator-only case is revisited in Stage 15a.3, and `off` simply
+disables all telemetry).
 
 ```json
 {
@@ -110,6 +160,32 @@ Health score, grade, and per-file breakdown.
 
 Active configuration (redacted secrets).
 
+The default audience is `UserOnly`. The `audience` value (always reported, since
+it is the user-facing mode) is the `TelemetryAudience` enum variant name (the API
+serializes it with its Rust debug representation), distinct from the kebab-case
+spelling accepted on input (`[modules.telemetry] audience = "user-only"`,
+`--telemetry user-only`).
+
+The `backends` array (backend kinds) **and** the sampling configuration
+(`sampling_rate`, `sampling_strategy`) are operator-shaped metadata: they
+describe the operator-telemetry emission policy (where operator metrics go and
+how often they are flushed). They are disclosed only under an operator-enabled
+audience (`on` / `operator-only`). Under the default `user-only` (and under
+`off`) the `backends` array is **empty** and `sampling_rate` / `sampling_strategy`
+are **`null`** (withheld), matching the `GET /api/v1/metrics` backend gating.
+
+```json
+{
+  "audience": "UserOnly",
+  "sampling_rate": null,
+  "sampling_strategy": null,
+  "backends": []
+}
+```
+
+Under an operator audience the sampling fields and `backends` array are
+populated, e.g.:
+
 ```json
 {
   "audience": "On",
@@ -121,8 +197,8 @@ Active configuration (redacted secrets).
 
 ## Lifecycle
 
-- **Standalone mode** (`chaffra management`): starts an empty collector with core metric definitions registered. Useful for verifying the dashboard UI, API shape, and backend connectivity. Does not contain analysis data.
-- **Co-located mode** (watch/MCP/LSP): the management server shares the live `TelemetryCollector` used by analysis, exposing real-time metrics, findings, and churn data. Wiring into these modes is planned for a future phase.
+- **Standalone mode** (`chaffra management`): starts an empty collector with core metric definitions registered. Useful for verifying the dashboard UI and API shape. Backend status (kind/connectivity) is operator-shaped and is shown only when started with an operator audience (`--telemetry on|operator-only`); a default (user-only) run returns an empty backends list. Does not contain analysis data.
+- **Co-located mode** (watch/MCP/LSP): the management server shares the live `TelemetryCollector` used by analysis, exposing real-time metrics, findings, and churn data. All responses are audience-projected, as in standalone mode. Wiring into these modes is planned for a future phase (Stage 15a.3).
 - Clean shutdown on Ctrl+C
 - Binds to `127.0.0.1` only (localhost)
 

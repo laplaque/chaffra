@@ -3,7 +3,7 @@
 //! Sends metrics as StatsD-formatted datagrams over UDP.
 
 use super::TelemetryBackend;
-use crate::collector::TelemetrySnapshot;
+use crate::collector::{ProjectedSnapshot, TelemetrySnapshot};
 use crate::error::{Result, TelemetryError};
 use crate::metrics::MetricKind;
 
@@ -60,7 +60,8 @@ impl TelemetryBackend for StatsdBackend {
         "statsd"
     }
 
-    fn flush(&self, snapshot: &TelemetrySnapshot) -> Result<()> {
+    fn flush(&self, snapshot: &ProjectedSnapshot) -> Result<()> {
+        let snapshot = snapshot.inner();
         let lines = self.format_lines(snapshot);
         if lines.is_empty() {
             return Ok(());
@@ -85,7 +86,8 @@ impl TelemetryBackend for StatsdBackend {
         Ok(format!("StatsD endpoint configured: {}", self.endpoint))
     }
 
-    fn inspect(&self, snapshot: &TelemetrySnapshot) -> Result<String> {
+    fn inspect(&self, snapshot: &ProjectedSnapshot) -> Result<String> {
+        let snapshot = snapshot.inner();
         let lines = self.format_lines(snapshot);
         Ok(lines.join("\n"))
     }
@@ -102,7 +104,9 @@ mod tests {
         let collector = TelemetryCollector::with_defaults();
         collector.register_core_metrics();
         collector.record_module_call("dead-code", 42, false);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let lines = backend.format_lines(&snapshot);
         assert!(!lines.is_empty());
@@ -116,7 +120,9 @@ mod tests {
         let backend = StatsdBackend::new("127.0.0.1:8125".to_owned());
         let collector = TelemetryCollector::with_defaults();
         collector.record_module_call("test", 10, false);
-        let snapshot = collector.snapshot();
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
 
         let output = backend.inspect(&snapshot).unwrap();
         assert!(!output.is_empty());
@@ -127,5 +133,23 @@ mod tests {
         let backend = StatsdBackend::new("127.0.0.1:8125".to_owned());
         let result = backend.test_connection().unwrap();
         assert!(result.contains("StatsD"));
+    }
+
+    #[test]
+    fn test_statsd_backend_flush_ok() {
+        // R5-Structural coverage: exercise the `flush()` entry point with a
+        // `ProjectedSnapshot`. The StatsD flush binds a UDP socket and emits
+        // datagrams to the configured endpoint; binding 0.0.0.0:0 doesn't
+        // need network access and send_to errors are logged-not-returned, so
+        // the test asserts Ok regardless of whether anything listens on the
+        // localhost port.
+        let backend = StatsdBackend::new("127.0.0.1:8125".to_owned());
+        let collector = TelemetryCollector::with_defaults();
+        collector.register_core_metrics();
+        collector.record_module_call("dead-code", 42, false);
+        let snapshot = collector
+            .snapshot()
+            .project_for_audience(crate::config::TelemetryAudience::On);
+        backend.flush(&snapshot).unwrap();
     }
 }

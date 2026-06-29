@@ -255,7 +255,8 @@ async function showDetail(endpoint,title){
     }else if(endpoint==='/config'){
       const[cfg,metrics]=await Promise.all([fetchJSON('/config'),fetchJSON('/metrics')]);
       html+=hdr('Telemetry Configuration');
-      html+=renderTable(['Setting','Value'],[['Audience',cfg.audience],['Sampling Rate',cfg.sampling_rate],['Sampling Strategy',cfg.sampling_strategy],['Backends',cfg.backends.join(', ')||'—']]);
+      const withheld='withheld (operator audience only)';
+      html+=renderTable(['Setting','Value'],[['Audience',cfg.audience],['Sampling Rate',cfg.sampling_rate==null?withheld:cfg.sampling_rate],['Sampling Strategy',cfg.sampling_strategy==null?withheld:cfg.sampling_strategy],['Backends',cfg.backends.join(', ')||'—']]);
       html+=hdr('Collection Summary');
       const metricNames=new Set(metrics.data_points.map(p=>p.name));
       html+=renderTable(['Metric','Value'],[
@@ -263,7 +264,7 @@ async function showDetail(endpoint,title){
         ['Total data points',metrics.data_points.length],
         ['Connected backends',(metrics.backends||[]).filter(b=>b.connected).length+' / '+(metrics.backends||[]).length]
       ]);
-      if(cfg.sampling_rate<1.0)html+=insight('Sampling rate is '+(cfg.sampling_rate*100).toFixed(0)+'% — operator metrics are emitted on ~1 in '+Math.round(1/cfg.sampling_rate)+' runs.');
+      if(cfg.sampling_rate!=null&&cfg.sampling_rate<1.0)html+=insight('Sampling rate is '+(cfg.sampling_rate*100).toFixed(0)+'% — operator metrics are emitted on ~1 in '+Math.round(1/cfg.sampling_rate)+' runs.');
     }else{
       const data=await fetchJSON(endpoint);
       html='<pre>'+JSON.stringify(data,null,2).replace(/</g,'&lt;')+'</pre>';
@@ -308,7 +309,8 @@ async function refresh(){
     cc+=card('Resolved',churn.resolved_count!=null?churn.resolved_count:'0','green','/findings/churn');
     cc+=card('Unchanged',churn.unchanged_count!=null?churn.unchanged_count:'0','','/findings/churn');
     el('churn-cards').innerHTML=cc;
-    el('config-summary').innerHTML=`<table><tr><td>Audience</td><td>${config.audience}</td></tr><tr><td>Sampling</td><td>${config.sampling_rate} (${config.sampling_strategy})</td></tr><tr><td>Backends</td><td>${config.backends.join(', ')||'—'}</td></tr></table>`;
+    const samplingText=config.sampling_rate==null?'withheld (operator audience only)':`${config.sampling_rate} (${config.sampling_strategy})`;
+    el('config-summary').innerHTML=`<table><tr><td>Audience</td><td>${config.audience}</td></tr><tr><td>Sampling</td><td>${samplingText}</td></tr><tr><td>Backends</td><td>${config.backends.join(', ')||'—'}</td></tr></table>`;
   }catch(e){
     el('error-banner').textContent='Connection error: '+e.message;
     el('error-banner').style.display='block';

@@ -3,6 +3,219 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Canonical names of the metrics chaffra produces, split by audience scope.
+///
+/// These constants are the single source of truth for metric naming: every
+/// producer (the collector, the parse-cache flush, the core definition
+/// registry) names its data points and definitions from here, and the audience
+/// classifier in [`crate::collector`] decides operator-vs-user scope from the
+/// same set.
+///
+/// Two distinct failure modes, two distinct guards:
+/// - A **rename** of an operator metric is a compile error, because producer
+///   and classifier share the same `const` symbol — they cannot desynchronise.
+/// - A newly **added** operator metric that the author forgets to list in
+///   [`metric_names::OPERATOR`] would silently classify as user-facing and leak
+///   under user-only. Name matching alone cannot catch that. The completeness
+///   test in [`crate::collector`] (`test_every_core_metric_is_classified`)
+///   closes the gap: it registers the core metrics and fails CI if any
+///   registered metric name is neither in `OPERATOR` nor in the explicit
+///   known-user set/pattern. (The real fix — source-tagging each metric at the
+///   producer — is deferred to a proto-wire change.)
+pub mod metric_names {
+    /// Operator-scoped metric names: process- and environment-shaped telemetry
+    /// (call latencies, error/connection/startup counters, cache pressure) that
+    /// is withheld from any audience without the operator scope.
+    ///
+    /// Matching is by EXACT name, not prefix: each of these is a complete metric
+    /// name whose dimensional variation lives in labels, never in a name suffix.
+    /// Exact matching prevents a per-module summary metric such as
+    /// `chaffra.module.<id>.<key>` (e.g. a module whose id is `error_total`)
+    /// from colliding with an operator name like `chaffra.module.error_total`.
+    pub const OPERATOR: &[&str] = &[
+        MODULE_CALL_DURATION_MS,
+        MODULE_ERROR_TOTAL,
+        MODULE_STARTUP_DURATION_MS,
+        MODULE_LOAD_ERROR_TOTAL,
+        STARTUP_TOTAL_DURATION_MS,
+        PLUGIN_CONNECT_ERROR_TOTAL,
+        CONFIG_PARSE_ERROR_TOTAL,
+        PARSE_CACHE_HITS,
+        PARSE_CACHE_MISSES,
+        PARSE_CACHE_HIT_RATE,
+        PARSE_CACHE_SIZE_BYTES,
+        PARSE_CACHE_EVICTIONS,
+    ];
+
+    pub const MODULE_CALL_DURATION_MS: &str = "chaffra.module.call_duration_ms";
+    pub const MODULE_ERROR_TOTAL: &str = "chaffra.module.error_total";
+    pub const MODULE_STARTUP_DURATION_MS: &str = "chaffra.module.startup_duration_ms";
+    pub const MODULE_LOAD_ERROR_TOTAL: &str = "chaffra.module.load_error_total";
+    pub const STARTUP_TOTAL_DURATION_MS: &str = "chaffra.startup.total_duration_ms";
+    pub const PLUGIN_CONNECT_ERROR_TOTAL: &str = "chaffra.plugin.connect_error_total";
+    pub const CONFIG_PARSE_ERROR_TOTAL: &str = "chaffra.config.parse_error_total";
+    pub const PARSE_CACHE_HITS: &str = "chaffra.parse.cache_hits";
+    pub const PARSE_CACHE_MISSES: &str = "chaffra.parse.cache_misses";
+    pub const PARSE_CACHE_HIT_RATE: &str = "chaffra.parse.cache_hit_rate";
+    pub const PARSE_CACHE_SIZE_BYTES: &str = "chaffra.parse.cache_size_bytes";
+    pub const PARSE_CACHE_EVICTIONS: &str = "chaffra.parse.cache_evictions";
+
+    /// User-facing metric names: counts and rates the user is owed in the
+    /// analysis output (file/finding totals, churn). Matched by EXACT name for
+    /// the same reason `OPERATOR` is: a `chaffra.module.<id>.<key>` runtime
+    /// metric whose `<id>` happens to spell one of these names must not
+    /// collide and admit an unknown shape past the classifier.
+    ///
+    /// This set is the OTHER half of the audience classification. Every metric
+    /// chaffra produces is classified by exact membership in `OPERATOR` (block
+    /// from user-only) or `KNOWN_USER` (allow through user-only); a name in
+    /// NEITHER set is unclassified and the projection drops it under
+    /// `user-only` / `operator-only` (fail closed). Adding a new metric without
+    /// listing it here is caught at registration time by the
+    /// `test_every_core_metric_is_classified` completeness test in
+    /// `crate::collector`.
+    pub const KNOWN_USER: &[&str] = &[
+        "chaffra.analysis.duration_ms",
+        "chaffra.analysis.files_total",
+        "chaffra.analysis.findings_total",
+        "chaffra.analysis.findings_by_severity",
+        "chaffra.findings.new",
+        "chaffra.findings.resolved",
+        "chaffra.findings.unchanged",
+        "chaffra.findings.churn_rate",
+    ];
+
+    /// Whether a metric NAME is operator-scoped (exact match against
+    /// [`OPERATOR`]).
+    #[must_use]
+    pub fn is_operator(name: &str) -> bool {
+        OPERATOR.contains(&name)
+    }
+
+    /// Whether a metric NAME classifies as user-facing: EXACT membership in
+    /// [`KNOWN_USER`], OR the runtime per-module summary shape
+    /// `chaffra.module.<id>.<key>` produced by
+    /// `record_module_summary_metric` (e.g. `chaffra.module.complexity.health_score`).
+    ///
+    /// NAME alone is not a trust decision. This predicate answers "does this
+    /// name denote a user-facing metric *when produced by a trusted
+    /// in-process producer*". The provenance check is separate and lives in
+    /// the projection: [`crate::collector::TelemetrySnapshot::project_for_audience`]
+    /// forces every data point whose name arrived on the UNTRUSTED gRPC
+    /// ingestion path (tracked in `TelemetrySnapshot::untrusted_runtime`) to
+    /// the unclassified branch — admitted only under `On` — REGARDLESS of
+    /// what this predicate says about its name. So an external plugin
+    /// spoofing either a `chaffra.module.<id>.<key>` shape OR an exact
+    /// [`KNOWN_USER`] name (e.g. `chaffra.analysis.findings_total`) still
+    /// fails closed under `user-only` and `operator-only`. That is why the
+    /// shape match is safe to keep here: trusted producers pass by name, and
+    /// the untrusted seam is closed by provenance, not by withholding the
+    /// shape.
+    ///
+    /// TODO(#45): the provenance set is the bounded mitigation pending the
+    /// proto-wire change that adds an `audience` field to `MetricDefinition`
+    /// and derives scope server-side at gRPC ingestion from a trusted
+    /// `(module_id, name)` registry. Until then a name shared by a trusted
+    /// producer and an adversarial plugin in the same run fails closed (the
+    /// safe direction): the projection cannot tell the two points apart by
+    /// name, so it drops both at any restricted boundary.
+    ///
+    /// The completeness guard on registered DEFINITIONS deliberately does NOT
+    /// pattern-admit (see `metric_is_classified` in `crate::collector`): a
+    /// registered operator definition of the per-module shape must still be
+    /// listed in [`OPERATOR`] explicitly.
+    #[must_use]
+    pub fn is_known_user(name: &str) -> bool {
+        if is_operator(name) {
+            return false;
+        }
+        if KNOWN_USER.contains(&name) {
+            return true;
+        }
+        is_per_module_summary_shape(name)
+    }
+
+    /// Match the runtime per-module summary shape `chaffra.module.<id>.<key>`:
+    /// the prefix `chaffra.module.` followed by at least two non-empty
+    /// dot-separated segments (id + key, or id + compound key). Used only by
+    /// [`is_known_user`]; the `is_operator` short-circuit at the top of that
+    /// function still wins for any operator name that happens to match the
+    /// shape (e.g. `chaffra.module.error_total`).
+    fn is_per_module_summary_shape(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix("chaffra.module.") else {
+            return false;
+        };
+        let segments: Vec<&str> = rest.split('.').collect();
+        segments.len() >= 2 && segments.iter().all(|s| !s.is_empty())
+    }
+
+    #[cfg(test)]
+    mod scope_tests {
+        use super::*;
+
+        #[test]
+        fn known_user_set_and_operator_set_are_disjoint() {
+            for op in OPERATOR {
+                assert!(!KNOWN_USER.contains(op), "{op} is in both sets");
+            }
+        }
+
+        #[test]
+        fn is_known_user_matches_explicit_user_set() {
+            for u in KNOWN_USER {
+                assert!(is_known_user(u), "{u} should be known-user");
+            }
+        }
+
+        #[test]
+        fn is_known_user_matches_per_module_summary_shape_by_name() {
+            // NAME-level classification admits the per-module summary shape:
+            // a trusted in-process producer's `chaffra.module.<id>.<key>`
+            // point is user-facing. This is NOT a trust decision — provenance
+            // is enforced separately in `project_for_audience`, which forces
+            // any name arriving on the UNTRUSTED gRPC ingress
+            // (`untrusted_runtime`) to the unclassified branch regardless of
+            // what this predicate returns. See the collector projection tests
+            // (`test_projection_user_only_drops_plugin_spoofed_*`) for the
+            // end-to-end provenance behaviour.
+            assert!(is_known_user("chaffra.module.complexity.health_score"));
+            assert!(is_known_user("chaffra.module.dead-code.unused_functions"));
+            // Compound key (id + multi-segment key) still admits by name.
+            assert!(is_known_user("chaffra.module.foo.bar.baz"));
+        }
+
+        #[test]
+        fn is_known_user_rejects_operator_metrics() {
+            for op in OPERATOR {
+                assert!(!is_known_user(op), "{op} must NOT classify as user");
+            }
+        }
+
+        #[test]
+        fn is_known_user_rejects_malformed_and_unclassified_names() {
+            // A runtime metric name that is not in KNOWN_USER, not OPERATOR,
+            // and not a well-formed per-module shape is unclassified so the
+            // projection fails closed under user-only.
+            assert!(!is_known_user("chaffra.future.unregistered_metric"));
+            assert!(!is_known_user("chaffra.module.")); // no segments
+            assert!(!is_known_user("chaffra.module.only_id")); // id but no key
+            assert!(!is_known_user("custom.user.metric"));
+        }
+
+        #[test]
+        fn is_known_user_does_not_admit_operator_shaped_per_module_name() {
+            // An operator metric named with the per-module shape must still
+            // classify as OPERATOR via exact match (the `is_operator` short
+            // circuit at the top of `is_known_user`). The previous pattern
+            // admission did not regress this case (`is_operator` ran first),
+            // but the assertion is preserved because the contract is the
+            // critical one: a name in OPERATOR is NEVER user-facing.
+            assert!(is_operator(MODULE_CALL_DURATION_MS));
+            assert!(!is_known_user(MODULE_CALL_DURATION_MS));
+        }
+    }
+}
+
 /// Kind of metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -136,6 +349,56 @@ pub fn span_to_proto(s: &SpanData) -> chaffra_proto::proto::SpanData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metric_names_operator_set_exact_match() {
+        // Every name in the OPERATOR set classifies as operator.
+        for name in metric_names::OPERATOR {
+            assert!(
+                metric_names::is_operator(name),
+                "{name} should be operator-scoped"
+            );
+        }
+        // The full parse-cache family is now covered.
+        for name in [
+            metric_names::PARSE_CACHE_HITS,
+            metric_names::PARSE_CACHE_MISSES,
+            metric_names::PARSE_CACHE_HIT_RATE,
+            metric_names::PARSE_CACHE_SIZE_BYTES,
+            metric_names::PARSE_CACHE_EVICTIONS,
+        ] {
+            assert!(metric_names::is_operator(name), "{name} should be operator");
+        }
+    }
+
+    #[test]
+    fn test_metric_names_user_facing_not_operator() {
+        for name in [
+            "chaffra.analysis.findings_total",
+            "chaffra.analysis.findings_by_severity",
+            "chaffra.findings.churn_rate",
+            "chaffra.module.dead-code.unused_functions",
+        ] {
+            assert!(
+                !metric_names::is_operator(name),
+                "{name} should be user-facing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metric_names_no_prefix_collision() {
+        // A module whose id collides with an operator metric name produces a
+        // per-module summary metric `chaffra.module.<id>.<key>`. Exact matching
+        // must NOT misclassify it as the operator metric `chaffra.module.error_total`.
+        assert!(metric_names::is_operator(metric_names::MODULE_ERROR_TOTAL));
+        assert!(!metric_names::is_operator(
+            "chaffra.module.error_total.health_score"
+        ));
+        assert!(!metric_names::is_operator(
+            "chaffra.startup.total_duration_ms.extra"
+        ));
+    }
 
     #[test]
     fn test_span_duration() {

@@ -85,7 +85,11 @@ fn test_json_file_backend_output() {
     sev.insert("error".to_owned(), 2);
     collector.record_module_findings("dead-code", 7, &sev);
 
-    let snapshot = collector.snapshot();
+    // R5-Structural: backends accept only `ProjectedSnapshot`, so projection
+    // is required at the type level. The audience here is `On`, so the
+    // projection is a no-op on data; passing the raw snapshot would not
+    // compile.
+    let snapshot = collector.snapshot().project_for_audience(config.audience);
 
     // Flush to JSON file backend.
     let (backends, statuses) = chaffra_telemetry::backends::create_backends(&config.backends);
@@ -118,10 +122,17 @@ fn test_telemetry_module_in_grpc_host() {
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].id, "telemetry");
 
-    let config = ChaffraConfig::default();
+    // Pin `audience = "on"` so this gRPC-host wiring test sees the
+    // module's full output surface — both `backend-status` (operator-gated
+    // since R4-1) and `metric-summary` (always emitted, payload projected).
+    // The default audience is `user-only` (Phase 15a.1 privacy default), under
+    // which `backend-status` is intentionally withheld; this test is about
+    // gRPC plumbing, not the audience semantics, so we don't want it
+    // accidentally drifting whenever the default changes.
+    let config = ChaffraConfig::parse("[modules.telemetry]\naudience = \"on\"\n")
+        .expect("parse inline config");
     let result = host.analyze("telemetry", &[], &config).unwrap();
 
-    // Should have backend-status and metric-summary findings.
     assert!(result.findings.len() >= 2);
     let rule_ids: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
     assert!(rule_ids.contains(&"backend-status"));
@@ -203,7 +214,9 @@ fn test_prometheus_exposition_format() {
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
     collector.register_core_metrics();
     collector.record_module_call("test", 42, false);
-    let snapshot = collector.snapshot();
+    // R5-Structural: backends accept only `ProjectedSnapshot` — projection
+    // required at the type level.
+    let snapshot = collector.snapshot().project_for_audience(config.audience);
 
     let (backends, _) = chaffra_telemetry::backends::create_backends(&config.backends);
     let output = backends[0].inspect(&snapshot).unwrap();
@@ -230,7 +243,9 @@ fn test_otlp_payload_format() {
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
     collector.register_core_metrics();
     collector.record_module_call("security", 100, false);
-    let snapshot = collector.snapshot();
+    // R5-Structural: backends accept only `ProjectedSnapshot` — projection
+    // required at the type level.
+    let snapshot = collector.snapshot().project_for_audience(config.audience);
 
     let (backends, _) = chaffra_telemetry::backends::create_backends(&config.backends);
     let output = backends[0].inspect(&snapshot).unwrap();
@@ -258,7 +273,9 @@ fn test_statsd_line_format() {
     let collector = chaffra_telemetry::TelemetryCollector::new(config.clone());
     collector.register_core_metrics();
     collector.record_module_call("hotspot", 30, false);
-    let snapshot = collector.snapshot();
+    // R5-Structural: backends accept only `ProjectedSnapshot` — projection
+    // required at the type level.
+    let snapshot = collector.snapshot().project_for_audience(config.audience);
 
     let (backends, _) = chaffra_telemetry::backends::create_backends(&config.backends);
     let output = backends[0].inspect(&snapshot).unwrap();
